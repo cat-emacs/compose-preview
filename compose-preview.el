@@ -2,7 +2,7 @@
 
 ;; Version: 0.1.0
 ;; Package-Requires: ((emacs "28.1"))
-;; URL: https://github.com/chuxubank/emacs-android
+;; URL: https://github.com/chuxubank/emacs-studio
 ;; Keywords: tools android kotlin compose
 
 ;;; Commentary:

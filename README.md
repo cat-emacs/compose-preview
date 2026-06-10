@@ -13,7 +13,7 @@ With `use-package` and `package-vc`:
 
 ```elisp
 (use-package compose-preview
-  :vc (compose-preview :url "https://github.com/chuxubank/emacs-android"
+  :vc (compose-preview :url "https://github.com/chuxubank/emacs-studio"
                        :lisp-dir "compose-preview/")
   :commands (compose-preview-refresh
              compose-preview-record
@@ -25,8 +25,8 @@ With `use-package` and `package-vc`:
 From a local checkout:
 
 ```elisp
-(add-to-list 'load-path "/path/to/emacs-android/android-mode")
-(add-to-list 'load-path "/path/to/emacs-android/compose-preview")
+(add-to-list 'load-path "/path/to/emacs-studio/android-mode")
+(add-to-list 'load-path "/path/to/emacs-studio/compose-preview")
 (require 'compose-preview)
 ```
 
