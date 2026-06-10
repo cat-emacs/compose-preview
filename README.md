@@ -7,6 +7,32 @@ an emulator. The Emacs experience is centered on refreshing and viewing previews
 not on running UI tests. Snapshot record/verify commands remain available as
 secondary Paparazzi utilities.
 
+## Installation
+
+With `use-package` and `package-vc`:
+
+```elisp
+(use-package compose-preview
+  :vc (compose-preview :url "https://github.com/chuxubank/emacs-android"
+                       :lisp-dir "compose-preview/")
+  :commands (compose-preview-refresh
+             compose-preview-record
+             compose-preview-verify
+             compose-preview-open-results
+             compose-preview-set-variant))
+```
+
+From a local checkout:
+
+```elisp
+(add-to-list 'load-path "/path/to/emacs-android/android-mode")
+(add-to-list 'load-path "/path/to/emacs-android/compose-preview")
+(require 'compose-preview)
+```
+
+`compose-preview` can run without `android-mode`, but it reuses android-mode's
+module and variant discovery when `android-mode` is available.
+
 ## Commands
 
 - `M-x compose-preview-refresh`
@@ -86,3 +112,14 @@ preview build.
   reads Paparazzi's HTML report images. It does not record golden snapshots.
 - `compose-preview-record` still uses `recordPaparazzi<Variant>`, so recorded
   golden snapshots use Paparazzi's normal `src/test/snapshots` location.
+
+## Development
+
+Run package checks from this directory:
+
+```sh
+make install-deps
+make lint
+make build
+make test
+```
