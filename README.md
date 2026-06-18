@@ -36,9 +36,9 @@ module and variant discovery when `android-mode` is available.
 ## Commands
 
 - `M-x compose-preview-refresh`
-  - refreshes previews for the current Android module in a visible Gradle log
-    buffer and opens the
-    image gallery for the current Kotlin buffer's `@Preview` functions.
+  - refreshes previews in the background for the current Android module, writes
+    Gradle output to `*compose-preview-log*`, and opens the image gallery for
+    the current Kotlin buffer's `@Preview` functions.
 - `C-u M-x compose-preview-refresh`
   - prompts for module and variant using android-mode's cached flavor data.
 - `M-x compose-preview-open-results`
@@ -57,8 +57,9 @@ module and variant discovery when `android-mode` is available.
 script. The script injects Paparazzi into the current Android module, generates a
 temporary scanner-backed preview runner, runs `test<Variant>UnitTest`, and
 opens the resulting PNGs in an Emacs gallery buffer. Build output stays in
-the visible `*compose-preview*` compilation buffer so Gradle progress and
-errors are available while the command runs.
+`*compose-preview-log*`; failed refreshes display that buffer automatically.
+`compose-preview-record` and `compose-preview-verify` use the visible
+`*compose-preview*` compilation buffer.
 
 The gallery is source-focused: when refresh is launched from a Kotlin file, it
 shows only previews declared in that buffer and labels each section with the

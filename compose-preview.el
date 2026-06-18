@@ -80,6 +80,8 @@ This is slower, but can be useful when a project has stale generated state."
 (defvar-local compose-preview--last-source-previews nil)
 
 (defvar compose-preview-results-buffer-name "*compose-preview-results*")
+(defvar compose-preview-log-buffer-name "*compose-preview-log*"
+  "Buffer name used for background compose-preview Gradle output.")
 (defvar compose-preview--target-cache nil
   "Project-level target cache.
 Each entry is (PROJECT-ROOT . TARGET), where TARGET is a plist containing
@@ -87,7 +89,13 @@ Each entry is (PROJECT-ROOT . TARGET), where TARGET is a plist containing
 
 (defun compose-preview--log (format-string &rest args)
   "Log compose-preview message FORMAT-STRING with ARGS."
-  (apply #'message (concat "compose-preview: " format-string) args))
+  (let ((line (apply #'format (concat "compose-preview: " format-string) args)))
+    (message "%s" line)
+    (when-let ((buffer (get-buffer compose-preview-log-buffer-name)))
+      (with-current-buffer buffer
+        (let ((inhibit-read-only t))
+          (goto-char (point-max))
+          (insert line "\n"))))))
 
 (cl-defstruct compose-preview-item
   id
@@ -542,6 +550,57 @@ ACTION is `preview', `record' or `verify' and is used for completion handling."
     (compose-preview--log "Gradle command: %s" (plist-get context :command))
     buffer))
 
+(defun compose-preview--run-gradle-silent (task variant &optional action target)
+  "Run Paparazzi Gradle TASK for VARIANT in the background.
+Output and compose-preview log messages are written to
+`compose-preview-log-buffer-name'."
+  (let* ((context (compose-preview--gradle-context task variant target))
+         (project-root (plist-get context :project-root))
+         (module-root (plist-get context :module-root))
+         (module-path (plist-get context :module-path))
+         (source-file (plist-get target :source-file))
+         (buffer (get-buffer-create compose-preview-log-buffer-name))
+         (default-directory project-root)
+         (process-environment
+          (append (plist-get context :env) process-environment)))
+    (with-current-buffer buffer
+      (let ((inhibit-read-only t))
+        (erase-buffer)
+        (insert (format "$ %s\n\n" (plist-get context :command))))
+      (setq-local default-directory project-root)
+      (setq-local compose-preview--last-module-root module-root)
+      (setq-local compose-preview--last-module-path module-path)
+      (setq-local compose-preview--last-project-root project-root)
+      (setq-local compose-preview--last-action action)
+      (setq-local compose-preview--last-variant variant)
+      (setq-local compose-preview--last-source-file source-file)
+      (setq-local compose-preview--last-source-previews nil))
+    (compose-preview--log "running Gradle in background action=%s task=%s module=%s variant=%s root=%s"
+                          action
+                          (plist-get context :task-path)
+                          module-path
+                          variant
+                          project-root)
+    (make-process
+     :name "compose-preview-refresh"
+     :buffer buffer
+     :command (plist-get context :args)
+     :noquery t
+     :sentinel
+     (lambda (proc _event)
+       (when (memq (process-status proc) '(exit signal))
+         (with-current-buffer (process-buffer proc)
+           (compose-preview--process-finish
+            (process-buffer proc)
+            (format "process %s %s"
+                    (process-name proc)
+                    (if (zerop (process-exit-status proc))
+                        "finished"
+                      (format "exited abnormally with code %s"
+                              (process-exit-status proc))))
+            t)))))
+    buffer))
+
 (defun compose-preview--image-files (module-root)
   "Return Paparazzi PNG files under MODULE-ROOT."
   (let* ((roots (list (expand-file-name "src/test/snapshots" module-root)
@@ -608,10 +667,17 @@ ACTION is `preview', `record' or `verify' and is used for completion handling."
                           :variant variant
                           :source-file compose-preview--last-source-file)))
         (compose-preview--cache-target target)
-        (compose-preview--run-gradle task variant action target)))))
+        (if (eq action 'preview)
+            (compose-preview--run-gradle-silent task variant action target)
+          (compose-preview--run-gradle task variant action target))))))
 
 (defun compose-preview--compilation-finish (buffer message)
   "Handle preview completion for BUFFER using compilation MESSAGE."
+  (compose-preview--process-finish buffer message nil))
+
+(defun compose-preview--process-finish (buffer message silent)
+  "Handle preview completion for BUFFER using MESSAGE.
+When SILENT is non-nil, only display the log buffer on failure."
   (with-current-buffer buffer
     (let ((ambiguous-task-p (save-excursion
                               (goto-char (point-min))
@@ -624,6 +690,8 @@ ACTION is `preview', `record' or `verify' and is used for completion handling."
       (cond
        (ambiguous-task-p
         (compose-preview--log "Gradle task is ambiguous; prompting for a full variant")
+        (unless silent
+          (display-buffer buffer))
         (compose-preview--retry-ambiguous-variant))
        ((and (or (eq compose-preview--last-action 'preview)
                  compose-preview-open-results-after-record)
@@ -640,6 +708,8 @@ ACTION is `preview', `record' or `verify' and is used for completion handling."
             (ignore-errors (compose-preview--target))))
          compose-preview--last-source-file))
        ((not success-p)
+        (when silent
+          (display-buffer buffer))
         (compose-preview--log "Gradle failed; see buffer %s" (buffer-name buffer)))))))
 
 (defun compose-preview--insert-image (file)
@@ -749,7 +819,7 @@ and variant using android-mode's flavor data when available."
     (compose-preview--log "refresh requested variant=%s source=%s"
                           variant
                           (or source-file "<none>"))
-    (compose-preview--run-gradle task variant 'preview target)))
+    (compose-preview--run-gradle-silent task variant 'preview target)))
 
 ;;;###autoload
 (defun compose-preview-record (&optional variant)
