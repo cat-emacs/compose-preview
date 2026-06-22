@@ -32,13 +32,18 @@ From a local checkout:
 
 `compose-preview` can run without `android-mode`, but it reuses android-mode's
 module and variant discovery when `android-mode` is available.
+That discovery follows Android Studio's model more closely: it uses the Gradle
+project path, Android Components variants, and source-set roots reported by
+Gradle. This lets Kotlin Multiplatform files under source sets such as
+`src/commonMain/kotlin` map back to the Android module that owns the preview.
 
 ## Commands
 
 - `M-x compose-preview-refresh`
   - refreshes previews in the background for the current Android module, writes
     Gradle output to `*compose-preview-log*`, and opens the image gallery for
-    the current Kotlin buffer's `@Preview` functions.
+    the current Kotlin buffer's `@Preview` functions. When point is inside a
+    `@Preview` function, only that preview function is rendered.
 - `C-u M-x compose-preview-refresh`
   - prompts for module and variant using android-mode's cached flavor data.
 - `M-x compose-preview-open-results`
@@ -64,6 +69,10 @@ opens the resulting PNGs in an Emacs gallery buffer. Build output stays in
 The gallery is source-focused: when refresh is launched from a Kotlin file, it
 shows only previews declared in that buffer and labels each section with the
 preview display name rather than the Paparazzi PNG filename.
+If point is inside a function directly annotated with `@Preview`, refresh is
+further narrowed to that function. This mirrors Android Studio's run
+configuration behavior, where a preview run is produced from the containing
+preview function instead of the whole file.
 Preview metadata comes from `AndroidComposablePreviewScanner`, not Emacs-side
 annotation parsing, so custom multipreview annotations such as `@DevicePreview`,
 `@PreviewBackground`, and AndroidX templates like `@PreviewScreenSizes` follow
@@ -76,7 +85,8 @@ The generated runner uses `AndroidComposablePreviewScanner`,
 `TestParameterInjector`, and `AndroidPreviewScreenshotIdBuilder`, so preview
 discovery is closer to Android Studio than a hand-written regex. Refresh passes
 the current Kotlin file to the runner, so it scans with the same scanner path but
-renders only previews attributed to that file.
+renders only previews attributed to that file or, when a direct `@Preview`
+function is selected, that function.
 
 ## Configuration
 

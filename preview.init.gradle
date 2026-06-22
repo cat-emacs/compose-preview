@@ -11,6 +11,7 @@ def selectedPath = System.getenv("COMPOSE_PREVIEW_MODULE_PATH")
 def selectedVariant = System.getenv("COMPOSE_PREVIEW_VARIANT") ?: "debug"
 def selectedVariantName = selectedVariant.capitalize()
 def selectedSourceFile = System.getenv("COMPOSE_PREVIEW_SOURCE_FILE") ?: ""
+def selectedPreviewMethod = System.getenv("COMPOSE_PREVIEW_METHOD") ?: ""
 def generatedRoot = System.getenv("COMPOSE_PREVIEW_GENERATED_DIR")
 def className = "ComposePreviewPaparazziTest"
 def providerName = "ComposablePreviewProvider"
@@ -219,6 +220,7 @@ def generateTestSource = { Project project, File outputDir, List<String> current
     .replace("__SCAN_PACKAGE__", scanPackage)
     .replace("__MANIFEST_FILE__", manifestFile(project).path.replace("\\", "\\\\"))
     .replace("__SOURCE_FILE__", selectedSourceFile.replace("\\", "\\\\").replace("\"", "\\\""))
+    .replace("__PREVIEW_METHOD__", selectedPreviewMethod.replace("\\", "\\\\").replace("\"", "\\\""))
     .replace("__SOURCE_ROOTS__", kotlinStringList(currentSourceRoots))
   def file = new File(outputDir, packageName.replace(".", "/") + "/${className}.kt")
   file.parentFile.mkdirs()

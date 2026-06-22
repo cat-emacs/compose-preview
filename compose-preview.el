@@ -20,6 +20,7 @@
 
 (declare-function android--flavor-variants "android-mode" (module))
 (declare-function android--select-module "android-mode" ())
+(declare-function android--target-for-source-file "android-mode" (file project-root))
 
 (defgroup compose-preview nil
   "Preview Jetpack Compose @Preview functions with Paparazzi."
@@ -45,7 +46,7 @@ Recent KSP releases no longer support KSP1, so this is disabled by default."
 (defcustom compose-preview-use-legacy-android-dsl t
   "Whether to pass -Pandroid.newDsl=false to the preview Gradle build.
 Paparazzi 2.0.0-alpha02 still expects AGP's legacy Android extension when
-creating resource preparation tasks. Disable this only when Paparazzi supports
+creating resource preparation tasks.  Disable this only when Paparazzi supports
 AGP's new DSL in the target project."
   :type 'boolean
   :group 'compose-preview)
@@ -77,6 +78,7 @@ This is slower, but can be useful when a project has stale generated state."
 (defvar-local compose-preview--last-action nil)
 (defvar-local compose-preview--last-variant nil)
 (defvar-local compose-preview--last-source-file nil)
+(defvar-local compose-preview--last-preview-method nil)
 (defvar-local compose-preview--last-source-previews nil)
 
 (defvar compose-preview-results-buffer-name "*compose-preview-results*")
@@ -128,7 +130,7 @@ Each entry is (PROJECT-ROOT . TARGET), where TARGET is a plist containing
     (file-name-as-directory (expand-file-name root))))
 
 (defun compose-preview--gradle-build-file-p (dir)
-  "Return non-nil when DIR contains a Gradle build file."
+  "Return non-nil when DIR has a Gradle build file."
   (or (file-exists-p (expand-file-name "build.gradle" dir))
       (file-exists-p (expand-file-name "build.gradle.kts" dir))))
 
@@ -158,6 +160,20 @@ Each entry is (PROJECT-ROOT . TARGET), where TARGET is a plist containing
    (expand-file-name
     (replace-regexp-in-string ":" "/" module-name)
     project-root)))
+
+(defun compose-preview--target-from-android-mode (project-root)
+  "Return current source target from android-mode metadata under PROJECT-ROOT."
+  (when (and compose-preview-use-android-mode-flavors
+             buffer-file-name
+             (fboundp 'android--target-for-source-file))
+    (when-let ((target (ignore-errors
+                         (android--target-for-source-file
+                          buffer-file-name project-root))))
+      (list :project-root project-root
+            :module-root (file-name-as-directory
+                          (plist-get target :module-root))
+            :module-path (plist-get target :module-path)
+            :variant (plist-get target :variant)))))
 
 (defun compose-preview--sanitize (value)
   "Return Gradle-side sanitized VALUE."
@@ -237,6 +253,47 @@ Each entry is (PROJECT-ROOT . TARGET), where TARGET is a plist containing
       (insert-file-contents file)
       (setq-local buffer-file-name file)
       (compose-preview--current-buffer-class-prefix))))
+
+(defun compose-preview--looking-at-preview-annotation-p ()
+  "Return non-nil when point is at a Compose @Preview annotation."
+  (looking-at-p
+   "[[:space:]]*@\\(?:[A-Za-z_][A-Za-z0-9_.]*\\.\\)?Preview\\(?:[[:space:]]*(\\|\\_>\\)"))
+
+(defconst compose-preview--kotlin-function-regexp
+  "^[[:space:]]*\\(?:\\(?:private\\|internal\\|public\\)[[:space:]]+\\)?fun[[:space:]]+\\([A-Za-z_][A-Za-z0-9_]*\\)[[:space:]]*("
+  "Regexp matching a Kotlin function declaration.")
+
+(defun compose-preview--function-has-preview-annotation-p (function-start)
+  "Return non-nil when FUNCTION-START is preceded by @Preview."
+  (save-excursion
+    (goto-char function-start)
+    (let ((continue t)
+          found)
+      (while continue
+        (forward-line -1)
+        (cond
+         ((compose-preview--looking-at-preview-annotation-p)
+          (setq found t
+                continue nil))
+         ((looking-at-p "[[:space:]]*@")
+          nil)
+         ((looking-at-p "[[:space:]]*$")
+          nil)
+         (t
+          (setq continue nil))))
+      found)))
+
+(defun compose-preview--current-preview-method ()
+  "Return the containing Compose @Preview function name at point."
+  (when (and buffer-file-name (string-match-p "\\.kt\\'" buffer-file-name))
+    (save-excursion
+      (end-of-line)
+      (when (re-search-backward compose-preview--kotlin-function-regexp nil t)
+        (let ((function-start (point))
+              (name (match-string-no-properties 1)))
+          (when (compose-preview--function-has-preview-annotation-p
+                 function-start)
+            name))))))
 
 (defun compose-preview--manifest-file (target)
   "Return scanner manifest file path for TARGET."
@@ -351,7 +408,7 @@ Each entry is (PROJECT-ROOT . TARGET), where TARGET is a plist containing
       (match-string-no-properties 1))))
 
 (defun compose-preview--report-image-index (module-root)
-  "Return hash table from preview keys to report PNG files."
+  "Return hash table from preview keys to report PNG files in MODULE-ROOT."
   (let ((index (make-hash-table :test #'equal)))
     (dolist (run-file (compose-preview--report-run-files module-root))
       (with-temp-buffer
@@ -452,8 +509,6 @@ When FORCE-PROMPT is non-nil, prompt with android-mode when possible."
 When FORCE-PROMPT is non-nil, prompt for module and variant via android-mode."
   (let* ((project-root (or (compose-preview--find-project-root)
                            (user-error "Could not find project root: no gradlew")))
-         (module-root (or (compose-preview--find-module-root)
-                          (user-error "Could not find module root: no build.gradle(.kts)")))
          (cached (compose-preview--cached-target project-root)))
     (if (and cached (not force-prompt))
         (progn
@@ -462,19 +517,33 @@ When FORCE-PROMPT is non-nil, prompt for module and variant via android-mode."
                                 (plist-get cached :variant)
                                 project-root)
           cached)
-      (let* ((module-path (compose-preview--module-path project-root module-root))
-             (module-name (compose-preview--module-name module-path)))
-        (when (and force-prompt (compose-preview--android-flavors-available-p))
-          (setq module-name (android--select-module)
-                module-path (concat ":" module-name)
-                module-root (compose-preview--module-root-from-name project-root module-name)))
-        (compose-preview--log "selected target module=%s module-root=%s project-root=%s"
-                              module-path module-root project-root)
-        (compose-preview--cache-target
-         (list :project-root project-root
-               :module-root module-root
-               :module-path module-path
-               :variant (compose-preview--read-variant-for-module module-name force-prompt)))))))
+      (or (and (not force-prompt)
+               (when-let ((target (compose-preview--target-from-android-mode
+                                   project-root)))
+                 (compose-preview--log
+                  "selected target from android-mode module=%s variant=%s module-root=%s project-root=%s"
+                  (plist-get target :module-path)
+                  (plist-get target :variant)
+                  (plist-get target :module-root)
+                  project-root)
+                 (compose-preview--cache-target target)))
+          (let* ((module-root (or (compose-preview--find-module-root)
+                                  (user-error "Could not find module root: no build.gradle(.kts)")))
+                 (module-path (compose-preview--module-path project-root module-root))
+                 (module-name (compose-preview--module-name module-path)))
+            (when (and force-prompt (compose-preview--android-flavors-available-p))
+              (setq module-name (android--select-module)
+                    module-path (concat ":" module-name)
+                    module-root (compose-preview--module-root-from-name
+                                 project-root module-name)))
+            (compose-preview--log "selected target module=%s module-root=%s project-root=%s"
+                                  module-path module-root project-root)
+            (compose-preview--cache-target
+             (list :project-root project-root
+                   :module-root module-root
+                   :module-path module-path
+                   :variant (compose-preview--read-variant-for-module
+                             module-name force-prompt))))))))
 
 (defun compose-preview--gradle-context (task variant target)
   "Return plist for running Gradle TASK for VARIANT and TARGET."
@@ -504,6 +573,8 @@ When FORCE-PROMPT is non-nil, prompt for module and variant via android-mode."
                     (concat "COMPOSE_PREVIEW_VARIANT=" variant)
                     (concat "COMPOSE_PREVIEW_SOURCE_FILE="
                             (or (plist-get target :source-file) ""))
+                    (concat "COMPOSE_PREVIEW_METHOD="
+                            (or (plist-get target :preview-method) ""))
                     (concat "COMPOSE_PREVIEW_TEMPLATE_FILE="
                             (expand-file-name
                              "compose-preview-paparazzi-test.template.kt"
@@ -521,7 +592,8 @@ When FORCE-PROMPT is non-nil, prompt for module and variant via android-mode."
 
 (defun compose-preview--run-gradle (task variant &optional action target)
   "Run Paparazzi Gradle TASK for VARIANT visibly in a compilation buffer.
-ACTION is `preview', `record' or `verify' and is used for completion handling."
+ACTION is `preview', `record' or `verify' and is used for completion handling.
+TARGET describes the Gradle project, module, source file, and preview method."
   (let* ((context (compose-preview--gradle-context task variant target))
          (project-root (plist-get context :project-root))
          (module-root (plist-get context :module-root))
@@ -542,6 +614,8 @@ ACTION is `preview', `record' or `verify' and is used for completion handling."
       (setq-local compose-preview--last-action action)
       (setq-local compose-preview--last-variant variant)
       (setq-local compose-preview--last-source-file source-file)
+      (setq-local compose-preview--last-preview-method
+                  (plist-get target :preview-method))
       (setq-local compose-preview--last-source-previews nil)
       (add-hook 'compilation-finish-functions
                 #'compose-preview--compilation-finish nil t))
@@ -552,6 +626,8 @@ ACTION is `preview', `record' or `verify' and is used for completion handling."
 
 (defun compose-preview--run-gradle-silent (task variant &optional action target)
   "Run Paparazzi Gradle TASK for VARIANT in the background.
+ACTION is `preview', `record' or `verify' and is used for completion handling.
+TARGET describes the Gradle project, module, source file, and preview method.
 Output and compose-preview log messages are written to
 `compose-preview-log-buffer-name'."
   (let* ((context (compose-preview--gradle-context task variant target))
@@ -574,6 +650,8 @@ Output and compose-preview log messages are written to
       (setq-local compose-preview--last-action action)
       (setq-local compose-preview--last-variant variant)
       (setq-local compose-preview--last-source-file source-file)
+      (setq-local compose-preview--last-preview-method
+                  (plist-get target :preview-method))
       (setq-local compose-preview--last-source-previews nil))
     (compose-preview--log "running Gradle in background action=%s task=%s module=%s variant=%s root=%s"
                           action
@@ -665,7 +743,8 @@ Output and compose-preview log messages are written to
                           :module-root module-root
                           :module-path module-path
                           :variant variant
-                          :source-file compose-preview--last-source-file)))
+                          :source-file compose-preview--last-source-file
+                          :preview-method compose-preview--last-preview-method)))
         (compose-preview--cache-target target)
         (if (eq action 'preview)
             (compose-preview--run-gradle-silent task variant action target)
@@ -762,6 +841,8 @@ When PREVIEWS is non-nil, render by preview display name instead of file name."
 
 (defun compose-preview-open-results (&optional module-root previews source-file)
   "Open generated Paparazzi preview images for MODULE-ROOT.
+PREVIEWS can provide scanner metadata used to label and filter images.
+SOURCE-FILE narrows the gallery to previews attributed to that Kotlin file.
 When called interactively, use the current Gradle module."
   (interactive)
   (let* ((root (file-name-as-directory
@@ -810,15 +891,18 @@ and variant using android-mode's flavor data when available."
   (let* ((target (compose-preview--target current-prefix-arg))
          (variant (or variant (plist-get target :variant)))
          (source-file buffer-file-name)
+         (preview-method (compose-preview--current-preview-method))
          (task (concat "test"
                        (compose-preview--capitalize-variant variant)
                        "UnitTest")))
     (setq target (compose-preview--cache-target
                   (plist-put target :variant variant)))
     (setq target (plist-put target :source-file source-file))
-    (compose-preview--log "refresh requested variant=%s source=%s"
+    (setq target (plist-put target :preview-method preview-method))
+    (compose-preview--log "refresh requested variant=%s source=%s preview=%s"
                           variant
-                          (or source-file "<none>"))
+                          (or source-file "<none>")
+                          (or preview-method "<all-in-file>"))
     (compose-preview--run-gradle-silent task variant 'preview target)))
 
 ;;;###autoload
@@ -853,7 +937,7 @@ VARIANT defaults to `compose-preview-default-variant'."
 
 ;;;###autoload
 (defun compose-preview-set-variant (variant)
-  "Set `compose-preview-default-variant' to VARIANT for future preview runs."
+  "Make VARIANT the default for future preview refreshes."
   (interactive
    (list (plist-get (compose-preview--target t) :variant)))
   (setq compose-preview-default-variant variant)

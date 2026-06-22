@@ -17,6 +17,7 @@ import java.io.File
 
 private const val COMPOSE_PREVIEW_MANIFEST_FILE = "__MANIFEST_FILE__"
 private const val COMPOSE_PREVIEW_SOURCE_FILE = "__SOURCE_FILE__"
+private const val COMPOSE_PREVIEW_METHOD = "__PREVIEW_METHOD__"
 private val COMPOSE_PREVIEW_SOURCE_ROOTS = __SOURCE_ROOTS__
 
 private data class SourceIndex(
@@ -37,9 +38,11 @@ object __PROVIDER_NAME__ : TestParameterValuesProvider() {
             }
 
     private fun List<ComposablePreview<AndroidPreviewInfo>>.filterForSourceFile(): List<ComposablePreview<AndroidPreviewInfo>> {
-        if (COMPOSE_PREVIEW_SOURCE_FILE.isBlank()) return this
+        if (COMPOSE_PREVIEW_SOURCE_FILE.isBlank() && COMPOSE_PREVIEW_METHOD.isBlank()) return this
         return filter { preview ->
-            File(sourceFile(preview)).normalize() == File(COMPOSE_PREVIEW_SOURCE_FILE).normalize()
+            (COMPOSE_PREVIEW_SOURCE_FILE.isBlank() ||
+                File(sourceFile(preview)).normalize() == File(COMPOSE_PREVIEW_SOURCE_FILE).normalize()) &&
+                (COMPOSE_PREVIEW_METHOD.isBlank() || preview.methodName == COMPOSE_PREVIEW_METHOD)
         }
     }
 
