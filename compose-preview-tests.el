@@ -119,6 +119,38 @@
               :variant "androidMain"
               :preview-task "assembleAndroidMain"))))))
 
+(ert-deftest compose-preview-cached-target-upgrades-to-android-mode-variant ()
+  "Cached module targets should use android-mode's real variant metadata."
+  (cl-letf (((symbol-function 'compose-preview--find-project-root)
+             (lambda () "/tmp/project/"))
+            ((symbol-function 'compose-preview--android-flavors-available-p)
+             (lambda () t))
+            ((symbol-function 'android--get-flavors)
+             (lambda (&optional _refresh)
+               (list
+                (list :module-path ":composeApp"
+                      :module-name "composeApp"
+                      :module-root "/tmp/project/composeApp"
+                      :variant "androidMain"
+                      :application-id "com.example"
+                      :source-roots '("src/commonMain/kotlin")
+                      :preview-task "assembleAndroidMain")))))
+    (let ((compose-preview--target-cache
+           (list (cons "/tmp/project"
+                       (list :project-root "/tmp/project/"
+                             :module-root "/tmp/project/composeApp/"
+                             :module-path ":composeApp"
+                             :variant "debug"))))
+          (buffer-file-name nil))
+      (should
+       (equal
+        (compose-preview--target)
+        (list :project-root "/tmp/project/"
+              :module-root "/tmp/project/composeApp/"
+              :module-path ":composeApp"
+              :variant "androidMain"
+              :preview-task "assembleAndroidMain"))))))
+
 (ert-deftest compose-preview-force-prompt-uses-android-mode-module-root ()
   "Prompted android-mode modules keep their Gradle metadata module root."
   (cl-letf (((symbol-function 'compose-preview--find-project-root)

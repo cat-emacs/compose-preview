@@ -488,22 +488,26 @@ Each entry is (PROJECT-ROOT . TARGET), where TARGET is a plist containing
   "Return android-mode target metadata for PROJECT-ROOT, MODULE and VARIANT."
   (when (and (compose-preview--android-flavors-available-p)
              (fboundp 'android--get-flavors))
-    (when-let ((entry (seq-find
-                       (lambda (candidate)
-                         (and (keywordp (car-safe candidate))
-                              (string= (plist-get candidate :module-name)
-                                       module)
-                              (string= (plist-get candidate :variant)
-                                       variant)))
-                       (ignore-errors
-                         (let ((default-directory project-root))
-                           (android--get-flavors))))))
-      (list :project-root project-root
-            :module-root (file-name-as-directory
-                          (plist-get entry :module-root))
-            :module-path (plist-get entry :module-path)
-            :variant (plist-get entry :variant)
-            :preview-task (plist-get entry :preview-task)))))
+    (let* ((entries (ignore-errors
+                      (let ((default-directory project-root))
+                        (android--get-flavors))))
+           (module-entries
+            (seq-filter
+             (lambda (candidate)
+               (and (keywordp (car-safe candidate))
+                    (string= (plist-get candidate :module-name) module)))
+             entries)))
+      (when-let ((entry (or (seq-find
+                             (lambda (candidate)
+                               (string= (plist-get candidate :variant) variant))
+                             module-entries)
+                            (car module-entries))))
+        (list :project-root project-root
+              :module-root (file-name-as-directory
+                            (plist-get entry :module-root))
+              :module-path (plist-get entry :module-path)
+              :variant (plist-get entry :variant)
+              :preview-task (plist-get entry :preview-task))))))
 
 (defun compose-preview--read-variant-for-module (module force-prompt)
   "Return a variant for MODULE.
@@ -545,12 +549,25 @@ When FORCE-PROMPT is non-nil, prompt for module and variant via android-mode."
            project-root)
           (compose-preview--cache-target metadata-target))
       (if (and cached (not force-prompt))
-        (progn
-          (compose-preview--log "using cached target module=%s variant=%s root=%s"
-                                (plist-get cached :module-path)
-                                (plist-get cached :variant)
-                                project-root)
-          cached)
+          (let* ((module-name (compose-preview--module-name
+                               (plist-get cached :module-path)))
+                 (android-target
+                  (compose-preview--android-target-for-module
+                   project-root module-name (plist-get cached :variant))))
+            (if android-target
+                (progn
+                  (compose-preview--log
+                   "using android-mode target module=%s variant=%s module-root=%s root=%s"
+                   (plist-get android-target :module-path)
+                   (plist-get android-target :variant)
+                   (plist-get android-target :module-root)
+                   project-root)
+                  (compose-preview--cache-target android-target))
+              (compose-preview--log "using cached target module=%s variant=%s root=%s"
+                                    (plist-get cached :module-path)
+                                    (plist-get cached :variant)
+                                    project-root)
+              cached))
         (let* ((module-root (or (compose-preview--find-module-root)
                                 (user-error "Could not find module root: no build.gradle(.kts)")))
                (module-path (compose-preview--module-path project-root module-root))
