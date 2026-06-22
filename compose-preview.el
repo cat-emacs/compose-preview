@@ -510,41 +510,43 @@ When FORCE-PROMPT is non-nil, prompt with android-mode when possible."
 When FORCE-PROMPT is non-nil, prompt for module and variant via android-mode."
   (let* ((project-root (or (compose-preview--find-project-root)
                            (user-error "Could not find project root: no gradlew")))
+         (metadata-target (and (not force-prompt)
+                               (compose-preview--target-from-android-mode
+                                project-root)))
          (cached (compose-preview--cached-target project-root)))
-    (if (and cached (not force-prompt))
+    (if metadata-target
+        (progn
+          (compose-preview--log
+           "selected target from android-mode module=%s variant=%s module-root=%s project-root=%s"
+           (plist-get metadata-target :module-path)
+           (plist-get metadata-target :variant)
+           (plist-get metadata-target :module-root)
+           project-root)
+          (compose-preview--cache-target metadata-target))
+      (if (and cached (not force-prompt))
         (progn
           (compose-preview--log "using cached target module=%s variant=%s root=%s"
                                 (plist-get cached :module-path)
                                 (plist-get cached :variant)
                                 project-root)
           cached)
-      (or (and (not force-prompt)
-               (when-let ((target (compose-preview--target-from-android-mode
-                                   project-root)))
-                 (compose-preview--log
-                  "selected target from android-mode module=%s variant=%s module-root=%s project-root=%s"
-                  (plist-get target :module-path)
-                  (plist-get target :variant)
-                  (plist-get target :module-root)
-                  project-root)
-                 (compose-preview--cache-target target)))
-          (let* ((module-root (or (compose-preview--find-module-root)
-                                  (user-error "Could not find module root: no build.gradle(.kts)")))
-                 (module-path (compose-preview--module-path project-root module-root))
-                 (module-name (compose-preview--module-name module-path)))
-            (when (and force-prompt (compose-preview--android-flavors-available-p))
-              (setq module-name (android--select-module)
-                    module-path (concat ":" module-name)
-                    module-root (compose-preview--module-root-from-name
-                                 project-root module-name)))
-            (compose-preview--log "selected target module=%s module-root=%s project-root=%s"
-                                  module-path module-root project-root)
-            (compose-preview--cache-target
-             (list :project-root project-root
-                   :module-root module-root
-                   :module-path module-path
-                   :variant (compose-preview--read-variant-for-module
-                             module-name force-prompt))))))))
+        (let* ((module-root (or (compose-preview--find-module-root)
+                                (user-error "Could not find module root: no build.gradle(.kts)")))
+               (module-path (compose-preview--module-path project-root module-root))
+               (module-name (compose-preview--module-name module-path)))
+          (when (and force-prompt (compose-preview--android-flavors-available-p))
+            (setq module-name (android--select-module)
+                  module-path (concat ":" module-name)
+                  module-root (compose-preview--module-root-from-name
+                               project-root module-name)))
+          (compose-preview--log "selected target module=%s module-root=%s project-root=%s"
+                                module-path module-root project-root)
+          (compose-preview--cache-target
+           (list :project-root project-root
+                 :module-root module-root
+                 :module-path module-path
+                 :variant (compose-preview--read-variant-for-module
+                           module-name force-prompt))))))))
 
 (defun compose-preview--preview-task (variant target)
   "Return refresh task for VARIANT and TARGET."
