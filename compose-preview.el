@@ -173,7 +173,8 @@ Each entry is (PROJECT-ROOT . TARGET), where TARGET is a plist containing
             :module-root (file-name-as-directory
                           (plist-get target :module-root))
             :module-path (plist-get target :module-path)
-            :variant (plist-get target :variant)))))
+            :variant (plist-get target :variant)
+            :preview-task (plist-get target :preview-task)))))
 
 (defun compose-preview--sanitize (value)
   "Return Gradle-side sanitized VALUE."
@@ -545,6 +546,17 @@ When FORCE-PROMPT is non-nil, prompt for module and variant via android-mode."
                    :variant (compose-preview--read-variant-for-module
                              module-name force-prompt))))))))
 
+(defun compose-preview--preview-task (variant target)
+  "Return refresh task for VARIANT and TARGET."
+  (or (and-let* ((task (plist-get target :preview-task))
+                 ((not (string-empty-p task))))
+        task)
+      (when (string= variant "androidMain")
+        "assembleAndroidMain")
+      (concat "test"
+              (compose-preview--capitalize-variant variant)
+              "UnitTest")))
+
 (defun compose-preview--gradle-context (task variant target)
   "Return plist for running Gradle TASK for VARIANT and TARGET."
   (let* ((target (or target (compose-preview--target)))
@@ -733,22 +745,22 @@ Output and compose-preview log messages are written to
                           ('preview "test")
                           ('record "recordPaparazzi")
                           ('verify "verifyPaparazzi")))
-           (task (concat task-prefix
-                         (compose-preview--capitalize-variant variant)
-                         (when (eq action 'preview)
-                           "UnitTest"))))
+           (target (list :project-root project-root
+                         :module-root module-root
+                         :module-path module-path
+                         :variant variant
+                         :source-file compose-preview--last-source-file
+                         :preview-method compose-preview--last-preview-method))
+           (task (if (eq action 'preview)
+                     (compose-preview--preview-task variant target)
+                   (concat task-prefix
+                           (compose-preview--capitalize-variant variant)))))
       (setq compose-preview-default-variant variant)
       (compose-preview--log "retrying with variant %s" variant)
-      (let ((target (list :project-root project-root
-                          :module-root module-root
-                          :module-path module-path
-                          :variant variant
-                          :source-file compose-preview--last-source-file
-                          :preview-method compose-preview--last-preview-method)))
-        (compose-preview--cache-target target)
-        (if (eq action 'preview)
-            (compose-preview--run-gradle-silent task variant action target)
-          (compose-preview--run-gradle task variant action target))))))
+      (compose-preview--cache-target target)
+      (if (eq action 'preview)
+          (compose-preview--run-gradle-silent task variant action target)
+        (compose-preview--run-gradle task variant action target)))))
 
 (defun compose-preview--compilation-finish (buffer message)
   "Handle preview completion for BUFFER using compilation MESSAGE."
@@ -892,9 +904,7 @@ and variant using android-mode's flavor data when available."
          (variant (or variant (plist-get target :variant)))
          (source-file buffer-file-name)
          (preview-method (compose-preview--current-preview-method))
-         (task (concat "test"
-                       (compose-preview--capitalize-variant variant)
-                       "UnitTest")))
+         (task (compose-preview--preview-task variant target)))
     (setq target (compose-preview--cache-target
                   (plist-put target :variant variant)))
     (setq target (plist-put target :source-file source-file))

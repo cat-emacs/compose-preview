@@ -73,9 +73,10 @@
                (list :module-path ":composeApp"
                      :module-name "composeApp"
                      :module-root "/tmp/project/composeApp"
-                     :variant "demoDebug"
+                     :variant "androidMain"
                      :application-id "com.example"
-                     :source-roots '("src/commonMain/kotlin")))))
+                     :source-roots '("src/commonMain/kotlin")
+                     :preview-task "assembleAndroidMain"))))
     (let ((compose-preview--target-cache nil)
           (buffer-file-name
            "/tmp/project/composeApp/src/commonMain/kotlin/example/Foo.kt"))
@@ -85,7 +86,39 @@
         (list :project-root "/tmp/project/"
               :module-root "/tmp/project/composeApp/"
               :module-path ":composeApp"
-              :variant "demoDebug"))))))
+              :variant "androidMain"
+              :preview-task "assembleAndroidMain"))))))
+
+(ert-deftest compose-preview-preview-task-falls-back-for-kmp-android-main ()
+  "KMP AndroidMain variants use assemble fallback instead of UnitTest tasks."
+  (should (equal (compose-preview--preview-task
+                  "androidMain"
+                  (list :variant "androidMain"))
+                 "assembleAndroidMain"))
+  (should (equal (compose-preview--preview-task
+                  "debug"
+                  (list :variant "debug"))
+                 "testDebugUnitTest"))
+  (should (equal (compose-preview--preview-task
+                  "androidMain"
+                  (list :variant "androidMain"
+                        :preview-task "compileAndroidMain"))
+                 "compileAndroidMain")))
+
+(ert-deftest compose-preview-preview-task-ignores-empty-metadata ()
+  "Missing preview task metadata should fall back to the variant task shape."
+  (should (equal (compose-preview--preview-task
+                  "debug"
+                  (list :variant "debug"
+                        :preview-task ""))
+                 "testDebugUnitTest")))
+
+(ert-deftest compose-preview-init-script-keeps-kmp-off-classic-paparazzi-path ()
+  "AGP KMP Android modules do not expose classic test configurations."
+  (with-temp-buffer
+    (insert-file-contents (expand-file-name "preview.init.gradle"))
+    (should-not (string-match-p "com.android.kotlin.multiplatform.library"
+                                (buffer-string)))))
 
 (provide 'compose-preview-tests)
 
