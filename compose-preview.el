@@ -484,6 +484,27 @@ Each entry is (PROJECT-ROOT . TARGET), where TARGET is a plist containing
     (ignore-errors
       (android--flavor-variants module))))
 
+(defun compose-preview--android-target-for-module (project-root module variant)
+  "Return android-mode target metadata for PROJECT-ROOT, MODULE and VARIANT."
+  (when (and (compose-preview--android-flavors-available-p)
+             (fboundp 'android--get-flavors))
+    (when-let ((entry (seq-find
+                       (lambda (candidate)
+                         (and (keywordp (car-safe candidate))
+                              (string= (plist-get candidate :module-name)
+                                       module)
+                              (string= (plist-get candidate :variant)
+                                       variant)))
+                       (ignore-errors
+                         (let ((default-directory project-root))
+                           (android--get-flavors))))))
+      (list :project-root project-root
+            :module-root (file-name-as-directory
+                          (plist-get entry :module-root))
+            :module-path (plist-get entry :module-path)
+            :variant (plist-get entry :variant)
+            :preview-task (plist-get entry :preview-task)))))
+
 (defun compose-preview--read-variant-for-module (module force-prompt)
   "Return a variant for MODULE.
 When FORCE-PROMPT is non-nil, prompt with android-mode when possible."
@@ -533,20 +554,34 @@ When FORCE-PROMPT is non-nil, prompt for module and variant via android-mode."
         (let* ((module-root (or (compose-preview--find-module-root)
                                 (user-error "Could not find module root: no build.gradle(.kts)")))
                (module-path (compose-preview--module-path project-root module-root))
-               (module-name (compose-preview--module-name module-path)))
+               (module-name (compose-preview--module-name module-path))
+               variant)
           (when (and force-prompt (compose-preview--android-flavors-available-p))
             (setq module-name (android--select-module)
-                  module-path (concat ":" module-name)
-                  module-root (compose-preview--module-root-from-name
-                               project-root module-name)))
-          (compose-preview--log "selected target module=%s module-root=%s project-root=%s"
-                                module-path module-root project-root)
-          (compose-preview--cache-target
-           (list :project-root project-root
-                 :module-root module-root
-                 :module-path module-path
-                 :variant (compose-preview--read-variant-for-module
-                           module-name force-prompt))))))))
+                  module-path (concat ":" module-name)))
+          (setq variant (compose-preview--read-variant-for-module
+                         module-name force-prompt))
+          (or (when-let ((android-target
+                          (compose-preview--android-target-for-module
+                           project-root module-name variant)))
+                (compose-preview--log
+                 "selected target from android-mode module=%s variant=%s module-root=%s project-root=%s"
+                 (plist-get android-target :module-path)
+                 (plist-get android-target :variant)
+                 (plist-get android-target :module-root)
+                 project-root)
+                (compose-preview--cache-target android-target))
+              (progn
+                (when force-prompt
+                  (setq module-root (compose-preview--module-root-from-name
+                                     project-root module-name)))
+                (compose-preview--log "selected target module=%s module-root=%s project-root=%s"
+                                      module-path module-root project-root)
+                (compose-preview--cache-target
+                 (list :project-root project-root
+                       :module-root module-root
+                       :module-path module-path
+                       :variant variant)))))))))
 
 (defun compose-preview--preview-task (variant target)
   "Return refresh task for VARIANT and TARGET."

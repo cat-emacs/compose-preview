@@ -119,6 +119,39 @@
               :variant "androidMain"
               :preview-task "assembleAndroidMain"))))))
 
+(ert-deftest compose-preview-force-prompt-uses-android-mode-module-root ()
+  "Prompted android-mode modules keep their Gradle metadata module root."
+  (cl-letf (((symbol-function 'compose-preview--find-project-root)
+             (lambda () "/tmp/project/"))
+            ((symbol-function 'compose-preview--find-module-root)
+             (lambda () "/tmp/project/current/file/module/"))
+            ((symbol-function 'compose-preview--android-flavors-available-p)
+             (lambda () t))
+            ((symbol-function 'android--select-module)
+             (lambda () "demo-android"))
+            ((symbol-function 'compose-preview--read-variant-for-module)
+             (lambda (_module _force-prompt) "debug"))
+            ((symbol-function 'android--get-flavors)
+             (lambda (&optional _refresh)
+               (list
+                (list :module-path ":demo-android"
+                      :module-name "demo-android"
+                      :module-root "/tmp/project/app/demo-android"
+                      :variant "debug"
+                      :application-id "com.example.demo"
+                      :source-roots '("src/main/java")
+                      :preview-task "testDebugUnitTest")))))
+    (let ((compose-preview--target-cache nil)
+          (buffer-file-name "/tmp/project/composeApp/src/commonMain/kotlin/Foo.kt"))
+      (should
+       (equal
+        (compose-preview--target t)
+        (list :project-root "/tmp/project/"
+              :module-root "/tmp/project/app/demo-android/"
+              :module-path ":demo-android"
+              :variant "debug"
+              :preview-task "testDebugUnitTest"))))))
+
 (ert-deftest compose-preview-preview-task-falls-back-for-kmp-android-main ()
   "KMP AndroidMain variants use assemble fallback instead of UnitTest tasks."
   (should (equal (compose-preview--preview-task
