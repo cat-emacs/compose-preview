@@ -77,6 +77,7 @@ This is slower, but can be useful when a project has stale generated state."
 (defvar-local compose-preview--last-project-root nil)
 (defvar-local compose-preview--last-action nil)
 (defvar-local compose-preview--last-variant nil)
+(defvar-local compose-preview--last-rendering-task nil)
 (defvar-local compose-preview--last-source-file nil)
 (defvar-local compose-preview--last-preview-method nil)
 (defvar-local compose-preview--last-source-previews nil)
@@ -611,6 +612,11 @@ When FORCE-PROMPT is non-nil, prompt for module and variant via android-mode."
               (compose-preview--capitalize-variant variant)
               "UnitTest")))
 
+(defun compose-preview--preview-task-rendering-p (task)
+  "Return non-nil when TASK is expected to render preview screenshots."
+  (or (string-match-p "\\`test.+UnitTest\\'" task)
+      (string= task "desktopTest")))
+
 (defun compose-preview--gradle-context (task variant target)
   "Return plist for running Gradle TASK for VARIANT and TARGET."
   (let* ((target (or target (compose-preview--target)))
@@ -679,6 +685,8 @@ TARGET describes the Gradle project, module, source file, and preview method."
       (setq-local compose-preview--last-project-root project-root)
       (setq-local compose-preview--last-action action)
       (setq-local compose-preview--last-variant variant)
+      (setq-local compose-preview--last-rendering-task
+                  (compose-preview--preview-task-rendering-p task))
       (setq-local compose-preview--last-source-file source-file)
       (setq-local compose-preview--last-preview-method
                   (plist-get target :preview-method))
@@ -715,6 +723,8 @@ Output and compose-preview log messages are written to
       (setq-local compose-preview--last-project-root project-root)
       (setq-local compose-preview--last-action action)
       (setq-local compose-preview--last-variant variant)
+      (setq-local compose-preview--last-rendering-task
+                  (compose-preview--preview-task-rendering-p task))
       (setq-local compose-preview--last-source-file source-file)
       (setq-local compose-preview--last-preview-method
                   (plist-get target :preview-method))
@@ -746,9 +756,10 @@ Output and compose-preview log messages are written to
     buffer))
 
 (defun compose-preview--image-files (module-root)
-  "Return Paparazzi PNG files under MODULE-ROOT."
+  "Return generated preview PNG files under MODULE-ROOT."
   (let* ((roots (list (expand-file-name "src/test/snapshots" module-root)
                       (expand-file-name "build/paparazzi" module-root)
+                      (expand-file-name "build/compose-preview" module-root)
                       (expand-file-name "build/reports/paparazzi" module-root)))
          files)
     (dolist (root roots)
@@ -841,6 +852,7 @@ When SILENT is non-nil, only display the log buffer on failure."
        ((and (or (eq compose-preview--last-action 'preview)
                  compose-preview-open-results-after-record)
              compose-preview--last-module-root
+             compose-preview--last-rendering-task
              (or success-p
                  (compose-preview--image-files compose-preview--last-module-root)))
         (unless success-p
@@ -855,7 +867,12 @@ When SILENT is non-nil, only display the log buffer on failure."
        ((not success-p)
         (when silent
           (display-buffer buffer))
-        (compose-preview--log "Gradle failed; see buffer %s" (buffer-name buffer)))))))
+        (compose-preview--log "Gradle failed; see buffer %s" (buffer-name buffer)))
+       ((and (eq compose-preview--last-action 'preview)
+             (not compose-preview--last-rendering-task))
+        (compose-preview--log
+         "preview task for variant %s only builds the module; no Paparazzi screenshots are generated"
+         compose-preview--last-variant))))))
 
 (defun compose-preview--insert-image (file)
   "Insert FILE as an image preview when Emacs can display it."

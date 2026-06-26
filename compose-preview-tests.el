@@ -184,12 +184,13 @@
               :variant "debug"
               :preview-task "testDebugUnitTest"))))))
 
-(ert-deftest compose-preview-preview-task-falls-back-for-kmp-android-main ()
-  "KMP AndroidMain variants use assemble fallback instead of UnitTest tasks."
+(ert-deftest compose-preview-preview-task-uses-desktop-test-for-kmp ()
+  "KMP AndroidMain variants use a desktop test renderer when available."
   (should (equal (compose-preview--preview-task
                   "androidMain"
-                  (list :variant "androidMain"))
-                 "assembleAndroidMain"))
+                  (list :variant "androidMain"
+                        :preview-task "desktopTest"))
+                 "desktopTest"))
   (should (equal (compose-preview--preview-task
                   "debug"
                   (list :variant "debug"))
@@ -208,12 +209,32 @@
                         :preview-task ""))
                  "testDebugUnitTest")))
 
-(ert-deftest compose-preview-init-script-keeps-kmp-off-classic-paparazzi-path ()
-  "AGP KMP Android modules do not expose classic test configurations."
+(ert-deftest compose-preview-preview-task-rendering-p-detects-test-task ()
+  "Only preview test tasks are expected to produce screenshots."
+  (should (compose-preview--preview-task-rendering-p "testDebugUnitTest"))
+  (should (compose-preview--preview-task-rendering-p "desktopTest"))
+  (should-not (compose-preview--preview-task-rendering-p "assembleAndroidMain"))
+  (should-not (compose-preview--preview-task-rendering-p "compileAndroidMain")))
+
+(ert-deftest compose-preview-image-files-include-kmp-render-output ()
+  "KMP desktop renderer PNGs are discovered with Android outputs."
+  (let* ((root (make-temp-file "compose-preview-module" t))
+         (image (expand-file-name "build/compose-preview/foo.png" root)))
+    (make-directory (file-name-directory image) t)
+    (with-temp-file image
+      (insert "png"))
+    (should (equal (compose-preview--image-files root) (list image)))))
+
+(ert-deftest compose-preview-init-script-configures-kmp-desktop-renderer ()
+  "AGP KMP Android modules render through desktopTest with Roborazzi."
   (with-temp-buffer
     (insert-file-contents (expand-file-name "preview.init.gradle"))
-    (should-not (string-match-p "com.android.kotlin.multiplatform.library"
-                                (buffer-string)))))
+    (let ((script (buffer-string)))
+      (should (string-match-p "com.android.kotlin.multiplatform.library" script))
+      (should (string-match-p "generateComposePreviewDesktopTest" script))
+      (should (string-match-p "roborazzi-compose-desktop" script))
+      (should (string-match-p "runDesktopComposeUiTest" script))
+      (should-not (string-match-p "ImageComposeScene" script)))))
 
 (provide 'compose-preview-tests)
 

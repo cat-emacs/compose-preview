@@ -14,8 +14,10 @@ def selectedSourceFile = System.getenv("COMPOSE_PREVIEW_SOURCE_FILE") ?: ""
 def selectedPreviewMethod = System.getenv("COMPOSE_PREVIEW_METHOD") ?: ""
 def generatedRoot = System.getenv("COMPOSE_PREVIEW_GENERATED_DIR")
 def className = "ComposePreviewPaparazziTest"
+def desktopClassName = "ComposePreviewDesktopTest"
 def providerName = "ComposablePreviewProvider"
 def paparazziVersion = System.getenv("COMPOSE_PREVIEW_PAPARAZZI_VERSION") ?: "2.0.0-alpha02"
+def roborazziVersion = System.getenv("COMPOSE_PREVIEW_ROBORAZZI_VERSION") ?: "1.50.0"
 def previewScannerVersion = System.getenv("COMPOSE_PREVIEW_SCANNER_VERSION") ?: "0.9.0"
 def testParameterInjectorVersion = System.getenv("COMPOSE_PREVIEW_TEST_PARAMETER_INJECTOR_VERSION") ?: "1.20"
 def junitVintageVersion = System.getenv("COMPOSE_PREVIEW_JUNIT_VINTAGE_VERSION") ?: "6.1.0"
@@ -29,6 +31,7 @@ def androidPluginIds = [
   "com.android.library",
   "com.android.dynamic-feature"
 ]
+def androidKmpPluginId = "com.android.kotlin.multiplatform.library"
 
 def sanitize = { String value ->
   value.replaceAll(/[^A-Za-z0-9_]/, "_")
@@ -68,11 +71,19 @@ def generatedTestClassName = { Project project ->
   "${generatedPackageName(project)}.${className}"
 }
 
+def generatedDesktopTestClassName = { Project project ->
+  "${generatedPackageName(project)}.${desktopClassName}"
+}
+
 def manifestFile = { Project project ->
   new File(
     project.rootProject.projectDir,
     ".gradle/compose-preview/${sanitize(project.path)}/${selectedVariant}/previews.tsv"
   )
+}
+
+def previewOutputDir = { Project project ->
+  new File(project.buildDir, "compose-preview/${selectedVariant}")
 }
 
 def kotlinString = { String value ->
@@ -94,6 +105,30 @@ def sourceRoots = { Project project ->
     "src/${selectedVariant}/kotlin",
     "src/${selectedVariant}/java"
   ].each { path -> roots.add(new File(project.projectDir, path)) }
+  roots
+    .findAll { it.isDirectory() }
+    .collect { it.absolutePath }
+}
+
+def kotlinMultiplatformSourceRoots = { Project project ->
+  def roots = new LinkedHashSet<File>()
+  def kotlin = project.extensions.findByName("kotlin")
+  if (kotlin == null || !kotlin.hasProperty("targets")) {
+    return []
+  }
+  kotlin.targets.matching { target ->
+    def platformType = target.hasProperty("platformType") ? target.platformType?.name : null
+    target.name == "desktop" || platformType == "jvm" || platformType == "androidJvm" || platformType == "android"
+  }.each { target ->
+    target.compilations?.each { compilation ->
+      if (["main", "test", selectedVariant, "${selectedVariant}Test"].contains(compilation.name)) {
+        compilation.allKotlinSourceSets?.each { sourceSet ->
+          sourceSet.kotlin?.srcDirs?.each { roots.add(it) }
+        }
+        compilation.defaultSourceSet?.kotlin?.srcDirs?.each { roots.add(it) }
+      }
+    }
+  }
   roots
     .findAll { it.isDirectory() }
     .collect { it.absolutePath }
@@ -228,6 +263,152 @@ def generateTestSource = { Project project, File outputDir, List<String> current
   project.logger.lifecycle("compose-preview: generated scanner-backed Paparazzi source for ${scanPackage} at ${file}")
 }
 
+def generateDesktopTestSource = { Project project, File outputDir, List<String> currentSourceRoots ->
+  def namespace = project.extensions.findByName("android")?.namespace ?: project.group?.toString()
+  def scanPackage = namespace ?: ""
+  def packageName = generatedPackageName(project)
+  def manifestPath = manifestFile(project).path.replace("\\", "\\\\")
+  def outputPath = previewOutputDir(project).path.replace("\\", "\\\\")
+  def sourceFile = selectedSourceFile.replace("\\", "\\\\").replace("\"", "\\\"")
+  def previewMethod = selectedPreviewMethod.replace("\\", "\\\\").replace("\"", "\\\"")
+  def source = """
+@file:Suppress("FunctionName", "INVISIBLE_MEMBER", "INVISIBLE_REFERENCE")
+
+package ${packageName}
+
+import androidx.compose.ui.test.ExperimentalTestApi
+import androidx.compose.ui.test.junit4.runDesktopComposeUiTest
+import androidx.compose.ui.test.onRoot
+import io.github.takahirom.roborazzi.captureRoboImage
+import org.junit.Test
+import sergio.sastre.composable.preview.scanner.android.AndroidComposablePreviewScanner
+import sergio.sastre.composable.preview.scanner.android.AndroidPreviewInfo
+import sergio.sastre.composable.preview.scanner.android.screenshotid.AndroidPreviewScreenshotIdBuilder
+import sergio.sastre.composable.preview.scanner.core.preview.ComposablePreview
+import java.io.File
+
+private const val COMPOSE_PREVIEW_MANIFEST_FILE = "${manifestPath}"
+private const val COMPOSE_PREVIEW_OUTPUT_DIR = "${outputPath}"
+private const val COMPOSE_PREVIEW_SOURCE_FILE = "${sourceFile}"
+private const val COMPOSE_PREVIEW_METHOD = "${previewMethod}"
+private val COMPOSE_PREVIEW_SOURCE_ROOTS = ${kotlinStringList(currentSourceRoots)}
+
+private data class SourceIndex(
+    val classes: Map<String, String>,
+    val topLevelFunctions: Map<String, String>,
+)
+
+class ${desktopClassName} {
+    @OptIn(ExperimentalTestApi::class)
+    @Test
+    fun renderPreviews() = runDesktopComposeUiTest {
+        val previews = AndroidComposablePreviewScanner()
+            .scanPackageTrees("${scanPackage}")
+            .includePrivatePreviews()
+            .getPreviews()
+            .filterForSourceFile()
+        writeManifest(previews)
+        val outputDir = File(COMPOSE_PREVIEW_OUTPUT_DIR)
+        outputDir.deleteRecursively()
+        outputDir.mkdirs()
+        previews.forEach { preview ->
+            setContent {
+                preview()
+            }
+            val file = File(outputDir, screenshotId(preview) + ".png")
+            onRoot().captureRoboImage(file = file)
+        }
+        println("compose-preview: desktop renderer wrote \${previews.size} preview(s) to \${outputDir}")
+    }
+
+    private fun List<ComposablePreview<AndroidPreviewInfo>>.filterForSourceFile(): List<ComposablePreview<AndroidPreviewInfo>> {
+        if (COMPOSE_PREVIEW_SOURCE_FILE.isBlank() && COMPOSE_PREVIEW_METHOD.isBlank()) return this
+        return filter { preview ->
+            (COMPOSE_PREVIEW_SOURCE_FILE.isBlank() ||
+                File(sourceFile(preview)).normalize() == File(COMPOSE_PREVIEW_SOURCE_FILE).normalize()) &&
+                (COMPOSE_PREVIEW_METHOD.isBlank() || preview.methodName == COMPOSE_PREVIEW_METHOD)
+        }
+    }
+
+    private fun writeManifest(previews: List<ComposablePreview<AndroidPreviewInfo>>) {
+        val manifest = File(COMPOSE_PREVIEW_MANIFEST_FILE)
+        manifest.parentFile?.mkdirs()
+        manifest.writeText(
+            previews.joinToString(separator = "\\n") { preview ->
+                listOf(
+                    screenshotId(preview),
+                    displayName(preview),
+                    preview.declaringClass,
+                    preview.methodName,
+                    preview.previewInfo.name,
+                    preview.previewInfo.group,
+                    sourceFile(preview),
+                ).joinToString(separator = "\\t", transform = ::escape)
+            },
+        )
+    }
+
+    private fun screenshotId(preview: ComposablePreview<AndroidPreviewInfo>): String =
+        AndroidPreviewScreenshotIdBuilder(preview)
+            .ignoreClassName()
+            .ignoreMethodName()
+            .build()
+
+    private fun displayName(preview: ComposablePreview<AndroidPreviewInfo>): String =
+        preview.previewInfo.name.ifBlank { preview.methodName }
+
+    private fun sourceFile(preview: ComposablePreview<AndroidPreviewInfo>): String {
+        val index = sourceIndex
+        val declaringClass = preview.declaringClass
+        val methodKey = "\$declaringClass#\${preview.methodName}"
+        val outerClass = declaringClass.substringBefore('\$')
+        return index.topLevelFunctions[methodKey]
+            ?: index.classes[declaringClass]
+            ?: index.classes[outerClass]
+            ?: ""
+    }
+
+    private val sourceIndex: SourceIndex by lazy {
+        val classes = linkedMapOf<String, String>()
+        val topLevelFunctions = linkedMapOf<String, String>()
+        COMPOSE_PREVIEW_SOURCE_ROOTS
+            .map(::File)
+            .filter { it.isDirectory }
+            .flatMap { root -> root.walkTopDown().filter { it.isFile && it.extension == "kt" } }
+            .forEach { file ->
+                val text = file.readText()
+                val packageName = packageRegex.find(text)?.groupValues?.get(1).orEmpty()
+                val prefix = packageName.takeIf { it.isNotBlank() }?.let { "\$it." }.orEmpty()
+                val path = file.absolutePath
+                classRegex.findAll(text).forEach { match ->
+                    classes.putIfAbsent(prefix + match.groupValues[1], path)
+                }
+                val facade = prefix + file.nameWithoutExtension + "Kt"
+                functionRegex.findAll(text).forEach { match ->
+                    topLevelFunctions.putIfAbsent("\$facade#\${match.groupValues[1]}", path)
+                }
+            }
+        SourceIndex(classes, topLevelFunctions)
+    }
+
+    private val packageRegex = Regex(\"\"\"(?m)^\\s*package\\s+([A-Za-z_][A-Za-z0-9_.]*)\"\"\")
+    private val classRegex = Regex(\"\"\"(?m)^\\s*(?:private\\s+|internal\\s+|public\\s+)?(?:data\\s+|sealed\\s+|value\\s+|enum\\s+|annotation\\s+)*(?:class|object|interface)\\s+([A-Za-z_][A-Za-z0-9_]*)\"\"\")
+    private val functionRegex = Regex(\"\"\"(?m)^\\s*(?:private\\s+|internal\\s+|public\\s+)?(?:@[A-Za-z_][A-Za-z0-9_.]*(?:\\([^)]*\\))?\\s*)*fun\\s+([A-Za-z_][A-Za-z0-9_]*)\\s*\\(\"\"\")
+
+    private fun escape(value: String): String =
+        value
+            .replace("\\\\", "\\\\\\\\")
+            .replace("\\t", "\\\\t")
+            .replace("\\n", "\\\\n")
+            .replace("\\r", "\\\\r")
+}
+"""
+  def file = new File(outputDir, packageName.replace(".", "/") + "/${desktopClassName}.kt")
+  file.parentFile.mkdirs()
+  file.text = source
+  project.logger.lifecycle("compose-preview: generated scanner-backed desktop source for ${scanPackage} at ${file}")
+}
+
 gradle.beforeProject { project ->
   if (!selectedPath || project.path == selectedPath) {
     project.buildscript.repositories {
@@ -244,6 +425,68 @@ gradle.beforeProject { project ->
 allprojects { project ->
   if (selectedPath && project.path != selectedPath) {
     return
+  }
+
+  project.plugins.withId(androidKmpPluginId) {
+    def sourceDir = generatedRoot
+      ? new File(new File(generatedRoot, sanitize(project.path)), "src/desktopTest/kotlin")
+      : new File(project.rootProject.projectDir, ".gradle/compose-preview/generated/${sanitize(project.path)}/src/desktopTest/kotlin")
+    def currentSourceRoots = kotlinMultiplatformSourceRoots(project)
+
+    project.afterEvaluate {
+      def kotlin = project.extensions.findByName("kotlin")
+      def sourceSets = kotlin?.sourceSets
+      def desktopTestSourceSet = sourceSets?.findByName("desktopTest")
+      if (desktopTestSourceSet == null) {
+        throw new GradleException(
+          "compose-preview: ${project.path} uses ${androidKmpPluginId}, but no desktopTest source set exists. " +
+          "Add a Kotlin JVM desktop target so compose-preview can render KMP previews."
+        )
+      }
+
+      desktopTestSourceSet.kotlin.srcDir(sourceDir)
+      project.dependencies.add(
+        "desktopTestImplementation",
+        "io.github.sergio-sastre.ComposablePreviewScanner:android:${previewScannerVersion}"
+      )
+      project.dependencies.add(
+        "desktopTestImplementation",
+        "io.github.takahirom.roborazzi:roborazzi-compose-desktop:${roborazziVersion}"
+      )
+      project.dependencies.add("desktopTestImplementation", "junit:junit:${junit4Version}")
+
+      def generateTask = project.tasks.register("generateComposePreviewDesktopTest") {
+        inputs.property("composePreviewPackageName", generatedPackageName(project))
+        inputs.property("composePreviewSourceFile", selectedSourceFile)
+        inputs.property("composePreviewSourceRoots", currentSourceRoots.join(File.pathSeparator))
+        outputs.dir(sourceDir)
+        doLast {
+          project.delete(sourceDir)
+          generateDesktopTestSource(project, sourceDir, currentSourceRoots)
+        }
+      }
+
+      project.tasks.matching { it.name == "desktopTest" }.configureEach { task ->
+        dependsOn(generateTask)
+        outputs.upToDateWhen { false }
+        if (task.hasProperty("filter")) {
+          task.filter {
+            includeTestsMatching(generatedDesktopTestClassName(project))
+          }
+        }
+      }
+      project.tasks.matching {
+        it.name == "kspTestKotlinDesktop" ||
+          it.name == "compileTestKotlinDesktop" ||
+          it.name == "desktopTestClasses"
+      }.configureEach { task ->
+        dependsOn(generateTask)
+      }
+      project.tasks.matching { it.name == "compileTestKotlinDesktop" }.configureEach { task ->
+        task.setSource(project.files(sourceDir))
+      }
+      project.logger.lifecycle("compose-preview: generated KMP desktop sources will be written to ${sourceDir}")
+    }
   }
 
   androidPluginIds.each { pluginId ->
