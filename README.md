@@ -13,7 +13,7 @@ With `use-package` and `package-vc`:
 
 ```elisp
 (use-package compose-preview
-  :vc (compose-preview :url "https://github.com/chuxubank/emacs-studio"
+  :vc (compose-preview :url "https://github.com/cat-emacs/emacs-studio"
                        :lisp-dir "compose-preview/")
   :commands (compose-preview-refresh
              compose-preview-record
