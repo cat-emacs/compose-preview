@@ -13,8 +13,7 @@ With `use-package` and `package-vc`:
 
 ```elisp
 (use-package compose-preview
-  :vc (compose-preview :url "https://github.com/cat-emacs/emacs-studio"
-                       :lisp-dir "compose-preview/")
+  :vc (:url "https://github.com/cat-emacs/compose-preview")
   :commands (compose-preview-refresh
              compose-preview-record
              compose-preview-verify
@@ -25,8 +24,8 @@ With `use-package` and `package-vc`:
 From a local checkout:
 
 ```elisp
-(add-to-list 'load-path "/path/to/emacs-studio/android-mode")
-(add-to-list 'load-path "/path/to/emacs-studio/compose-preview")
+(add-to-list 'load-path "/path/to/android-mode")
+(add-to-list 'load-path "/path/to/compose-preview")
 (require 'compose-preview)
 ```
 
@@ -136,3 +135,8 @@ make lint
 make build
 make test
 ```
+
+`make install-deps` checks out `android-mode` as a test dependency. It remains
+an optional runtime integration.
+
+Licensed under GPL-3.0-or-later.

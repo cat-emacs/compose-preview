@@ -2,7 +2,7 @@
 
 ;; Version: 0.1.0
 ;; Package-Requires: ((emacs "28.1"))
-;; URL: https://github.com/cat-emacs/emacs-studio
+;; URL: https://github.com/cat-emacs/compose-preview
 ;; Keywords: tools android kotlin compose
 
 ;;; Commentary:

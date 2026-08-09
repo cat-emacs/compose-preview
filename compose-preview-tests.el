@@ -51,7 +51,7 @@
 (ert-deftest compose-preview-gradle-context-includes-preview-method ()
   "Gradle context exports a selected preview method when the target has one."
   (cl-letf (((symbol-function 'compose-preview--get-init-script)
-             (lambda () "/tmp/emacs-studio/compose-preview/preview.init.gradle"))
+             (lambda () "/tmp/compose-preview/preview.init.gradle"))
             ((symbol-function 'compose-preview--gradle-executable)
              (lambda (_project-root) "/tmp/project/gradlew")))
     (let* ((target (list :project-root "/tmp/project/"
