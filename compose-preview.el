@@ -90,6 +90,9 @@ This is slower, but can be useful when a project has stale generated state."
 Each entry is (PROJECT-ROOT . TARGET), where TARGET is a plist containing
 :project-root, :module-root, :module-path and :variant.")
 
+(defvar compose-preview--metadata-refresh-roots nil
+  "Project roots whose stale Android preview metadata was refreshed.")
+
 (defun compose-preview--log (format-string &rest args)
   "Log compose-preview message FORMAT-STRING with ARGS."
   (let ((line (apply #'format (concat "compose-preview: " format-string) args)))
@@ -176,6 +179,23 @@ Each entry is (PROJECT-ROOT . TARGET), where TARGET is a plist containing
             :module-path (plist-get target :module-path)
             :variant (plist-get target :variant)
             :preview-task (plist-get target :preview-task)))))
+
+(defun compose-preview--refresh-stale-kmp-target (project-root target)
+  "Refresh stale Android KMP TARGET metadata under PROJECT-ROOT once."
+  (if (and target
+           (string= (plist-get target :variant) "androidMain")
+           (not (string= (plist-get target :preview-task) "desktopTest"))
+           (fboundp 'android--get-flavors)
+           (not (member project-root compose-preview--metadata-refresh-roots)))
+      (progn
+        (push project-root compose-preview--metadata-refresh-roots)
+        (compose-preview--log
+         "refreshing stale Android KMP preview metadata for %s" project-root)
+        (ignore-errors
+          (let ((default-directory project-root))
+            (android--get-flavors t)))
+        (or (compose-preview--target-from-android-mode project-root) target))
+    target))
 
 (defun compose-preview--sanitize (value)
   "Return Gradle-side sanitized VALUE."
@@ -536,9 +556,11 @@ When FORCE-PROMPT is non-nil, prompt with android-mode when possible."
 When FORCE-PROMPT is non-nil, prompt for module and variant via android-mode."
   (let* ((project-root (or (compose-preview--find-project-root)
                            (user-error "Could not find project root: no gradlew")))
-         (metadata-target (and (not force-prompt)
-                               (compose-preview--target-from-android-mode
-                                project-root)))
+         (metadata-target
+          (and (not force-prompt)
+               (compose-preview--refresh-stale-kmp-target
+                project-root
+                (compose-preview--target-from-android-mode project-root))))
          (cached (compose-preview--cached-target project-root)))
     (if metadata-target
         (progn

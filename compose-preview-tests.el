@@ -89,6 +89,33 @@
               :variant "androidMain"
               :preview-task "assembleAndroidMain"))))))
 
+(ert-deftest compose-preview-target-refreshes-non-rendering-kmp-metadata ()
+  "Stale Android KMP metadata is refreshed before selecting a preview task."
+  (let ((refreshed nil))
+    (cl-letf (((symbol-function 'compose-preview--find-project-root)
+               (lambda () "/tmp/project/"))
+              ((symbol-function 'android--get-flavors)
+               (lambda (&optional refresh)
+                 (setq refreshed refresh)))
+              ((symbol-function 'android--target-for-source-file)
+               (lambda (_file _project-root)
+                 (list :module-path ":composeApp"
+                       :module-name "composeApp"
+                       :module-root "/tmp/project/composeApp"
+                       :variant "androidMain"
+                       :application-id "com.example"
+                       :source-roots '("src/commonMain/kotlin")
+                       :preview-task (if refreshed
+                                         "desktopTest"
+                                       "assembleAndroidMain")))))
+      (let ((compose-preview--target-cache nil)
+            (compose-preview--metadata-refresh-roots nil)
+            (buffer-file-name
+             "/tmp/project/composeApp/src/commonMain/kotlin/example/Foo.kt"))
+        (should (equal (plist-get (compose-preview--target) :preview-task)
+                       "desktopTest"))
+        (should refreshed)))))
+
 (ert-deftest compose-preview-target-refreshes-stale-cache-from-android-mode ()
   "Android-mode source metadata should replace stale in-memory targets."
   (cl-letf (((symbol-function 'compose-preview--find-project-root)
