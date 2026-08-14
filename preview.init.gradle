@@ -436,24 +436,38 @@ allprojects { project ->
     project.afterEvaluate {
       def kotlin = project.extensions.findByName("kotlin")
       def sourceSets = kotlin?.sourceSets
-      def desktopTestSourceSet = sourceSets?.findByName("desktopTest")
-      if (desktopTestSourceSet == null) {
+      def jvmTarget = kotlin?.targets?.find { target ->
+        def platformType = target.hasProperty("platformType") ? target.platformType?.name : null
+        platformType == "jvm"
+      }
+      def jvmTestSourceSetName = jvmTarget == null ? null : "${jvmTarget.name}Test"
+      def jvmTestSourceSet = jvmTestSourceSetName == null
+        ? null
+        : sourceSets?.findByName(jvmTestSourceSetName)
+      if (jvmTestSourceSet == null) {
         throw new GradleException(
-          "compose-preview: ${project.path} uses ${androidKmpPluginId}, but no desktopTest source set exists. " +
-          "Add a Kotlin JVM desktop target so compose-preview can render KMP previews."
+          "compose-preview: ${project.path} uses ${androidKmpPluginId}, but no Kotlin JVM test source set exists. " +
+          "Add a Kotlin JVM target so compose-preview can render KMP previews."
         )
       }
+      def jvmTargetName = jvmTarget.name
+      def jvmTargetNameCapitalized = jvmTargetName.capitalize()
+      def actualJvmTestTaskName = "${jvmTargetName}Test"
+      def jvmTestImplementation = "${jvmTestSourceSetName}Implementation"
+      def compileJvmTestTaskName = "compileTestKotlin${jvmTargetNameCapitalized}"
+      def jvmTestClassesTaskName = "${jvmTargetName}TestClasses"
+      def kspJvmTestTaskName = "kspTestKotlin${jvmTargetNameCapitalized}"
 
-      desktopTestSourceSet.kotlin.srcDir(sourceDir)
+      jvmTestSourceSet.kotlin.srcDir(sourceDir)
       project.dependencies.add(
-        "desktopTestImplementation",
+        jvmTestImplementation,
         "io.github.sergio-sastre.ComposablePreviewScanner:android:${previewScannerVersion}"
       )
       project.dependencies.add(
-        "desktopTestImplementation",
+        jvmTestImplementation,
         "io.github.takahirom.roborazzi:roborazzi-compose-desktop:${roborazziVersion}"
       )
-      project.dependencies.add("desktopTestImplementation", "junit:junit:${junit4Version}")
+      project.dependencies.add(jvmTestImplementation, "junit:junit:${junit4Version}")
 
       def generateTask = project.tasks.register("generateComposePreviewDesktopTest") {
         inputs.property("composePreviewPackageName", generatedPackageName(project))
@@ -466,7 +480,7 @@ allprojects { project ->
         }
       }
 
-      project.tasks.matching { it.name == "desktopTest" }.configureEach { task ->
+      project.tasks.matching { it.name == actualJvmTestTaskName }.configureEach { task ->
         dependsOn(generateTask)
         outputs.upToDateWhen { false }
         if (task.hasProperty("filter")) {
@@ -476,16 +490,25 @@ allprojects { project ->
         }
       }
       project.tasks.matching {
-        it.name == "kspTestKotlinDesktop" ||
-          it.name == "compileTestKotlinDesktop" ||
-          it.name == "desktopTestClasses"
+        it.name == kspJvmTestTaskName ||
+          it.name == compileJvmTestTaskName ||
+          it.name == jvmTestClassesTaskName
       }.configureEach { task ->
         dependsOn(generateTask)
       }
-      project.tasks.matching { it.name == "compileTestKotlinDesktop" }.configureEach { task ->
+      project.tasks.matching { it.name == compileJvmTestTaskName }.configureEach { task ->
         task.setSource(project.files(sourceDir))
       }
-      project.logger.lifecycle("compose-preview: generated KMP desktop sources will be written to ${sourceDir}")
+      if (actualJvmTestTaskName != "desktopTest") {
+        project.tasks.register("desktopTest") { task ->
+          task.group = "verification"
+          task.description = "Renders Compose previews using the ${actualJvmTestTaskName} JVM test task."
+          task.dependsOn(actualJvmTestTaskName)
+        }
+      }
+      project.logger.lifecycle(
+        "compose-preview: generated KMP JVM sources for ${actualJvmTestTaskName} will be written to ${sourceDir}"
+      )
     }
   }
 
