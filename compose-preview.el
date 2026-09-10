@@ -1047,7 +1047,9 @@ VARIANT defaults to `compose-preview-default-variant'."
   (setq compose-preview-default-variant variant)
   (compose-preview--log "default variant set to %s" variant))
 
-;;;###autoload
+;; Autoload a plain command instead of the expanded prefix definition, which
+;; would need `transient-prefix' at autoload evaluation time.
+;;;###autoload (autoload 'compose-preview "compose-preview" nil t)
 (transient-define-prefix compose-preview ()
   "Manage Jetpack Compose previews."
   ["Preview"
