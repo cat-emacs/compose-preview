@@ -1,7 +1,7 @@
 ;;; compose-preview.el --- Paparazzi previews for Jetpack Compose -*- lexical-binding: t; -*-
 
 ;; Version: 0.1.0
-;; Package-Requires: ((emacs "28.1"))
+;; Package-Requires: ((emacs "28.1") (transient "0.3.0"))
 ;; URL: https://github.com/cat-emacs/compose-preview
 ;; Keywords: tools android kotlin compose
 
@@ -16,6 +16,7 @@
 (require 'compile)
 (require 'seq)
 (require 'subr-x)
+(require 'transient)
 (require 'android-mode nil t)
 
 (declare-function android--flavor-variants "android-mode" (module))
@@ -1045,6 +1046,17 @@ VARIANT defaults to `compose-preview-default-variant'."
    (list (plist-get (compose-preview--target t) :variant)))
   (setq compose-preview-default-variant variant)
   (compose-preview--log "default variant set to %s" variant))
+
+;;;###autoload
+(transient-define-prefix compose-preview ()
+  "Manage Jetpack Compose previews."
+  ["Preview"
+   ("p" "Refresh" compose-preview-refresh)
+   ("P" "Open results" compose-preview-open-results)
+   ("v" "Set variant" compose-preview-set-variant)]
+  ["Snapshots"
+   ("s" "Record" compose-preview-record)
+   ("S" "Verify" compose-preview-verify)])
 
 (provide 'compose-preview)
 ;;; compose-preview.el ends here

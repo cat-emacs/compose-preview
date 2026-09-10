@@ -14,7 +14,8 @@ With `use-package` and `package-vc`:
 ```elisp
 (use-package compose-preview
   :vc (:url "https://github.com/cat-emacs/compose-preview")
-  :commands (compose-preview-refresh
+  :commands (compose-preview
+             compose-preview-refresh
              compose-preview-record
              compose-preview-verify
              compose-preview-open-results
@@ -38,6 +39,9 @@ Gradle. This lets Kotlin Multiplatform files under source sets such as
 
 ## Commands
 
+- `M-x compose-preview`
+  - opens a Transient menu for preview refresh, result browsing, variant
+    selection, and snapshot operations.
 - `M-x compose-preview-refresh`
   - refreshes previews in the background for the current Android module, writes
     Gradle output to `*compose-preview-log*`, and opens the image gallery for
