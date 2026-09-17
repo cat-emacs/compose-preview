@@ -23,6 +23,8 @@ import org.gradle.api.tasks.Internal
 import org.gradle.api.tasks.Optional
 import org.gradle.api.tasks.OutputFile
 import org.gradle.api.tasks.TaskAction
+import org.objectweb.asm.ClassReader
+import org.objectweb.asm.tree.ClassNode
 
 import java.lang.reflect.InvocationHandler
 import java.lang.reflect.Method
@@ -30,6 +32,7 @@ import java.lang.reflect.Proxy
 import java.nio.file.Files
 import java.nio.file.Path
 import java.nio.file.StandardCopyOption
+import java.util.zip.ZipFile
 import java.util.zip.ZipInputStream
 
 def layoutlibVersion = System.getenv("COMPOSE_PREVIEW_LAYOUTLIB_VERSION") ?: "16.1.0-jdk17"
@@ -137,9 +140,45 @@ abstract class ComposePreviewModelTask extends DefaultTask {
                     ? text.substring(1, text.length() - 1).replace('/', '.')
                     : text
         }
+        def sourceFileForMethod = { String methodFqn ->
+            def owner = methodFqn.substring(0, methodFqn.lastIndexOf('.'))
+            def entryName = owner.replace('.', '/') + ".class"
+            byte[] bytes = null
+            for (File directory : projectDirFiles) {
+                def classFile = new File(directory, entryName)
+                if (classFile.isFile()) {
+                    bytes = classFile.bytes
+                    break
+                }
+            }
+            if (bytes == null) {
+                for (File jar : projectJarFiles) {
+                    if (!jar.isFile()) {
+                        continue
+                    }
+                    new ZipFile(jar).withCloseable { zip ->
+                        def entry = zip.getEntry(entryName)
+                        if (entry != null) {
+                            bytes = zip.getInputStream(entry).withCloseable { it.bytes }
+                        }
+                    }
+                    if (bytes != null) {
+                        break
+                    }
+                }
+            }
+            if (bytes == null) {
+                return null
+            }
+            def node = new ClassNode()
+            new ClassReader(bytes).accept(node,
+                    ClassReader.SKIP_CODE | ClassReader.SKIP_FRAMES)
+            return node.sourceFile
+        }
         def previews = finder.findAllPreviewMethods().collect { preview ->
             [
                     methodFQN      : preview.method.methodFqn,
+                    sourceFile     : sourceFileForMethod(preview.method.methodFqn),
                     previewWrapperFQN: preview.method.previewWrapperFqn,
                     // One entry per @PreviewParameter parameter, carrying that
                     // annotation's attributes (provider, limit). The renderer
@@ -304,6 +343,17 @@ def variantSuffix = targetVariant.substring(0, 1).toUpperCase(Locale.ROOT) + tar
 gradle.beforeProject { project ->
     if (project.path != targetModulePath) {
         return
+    }
+    project.plugins.withId("com.android.kotlin.multiplatform.library") {
+        project.tasks.register("composePreviewModel") {
+            group = "compose preview"
+            description = "Explains why standalone Compose preview is unavailable for Android KMP"
+            doLast {
+                throw new GradleException(
+                        "compose-preview: com.android.kotlin.multiplatform.library is not supported: " +
+                        "AGP does not expose its host-test resource APK and runtime R jar through the public Variant API")
+            }
+        }
     }
     ["com.android.application", "com.android.library", "com.android.dynamic-feature"].each { pluginId ->
         project.plugins.withId(pluginId) {

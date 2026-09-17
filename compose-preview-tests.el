@@ -45,17 +45,51 @@
     (search-forward "Text")
     (should (equal (compose-preview--current-preview-method)
                    "MainPreview"))
+    (should (equal (compose-preview--current-preview-method-fqn)
+                   "com.example.ui.FooKt.MainPreview"))
     (search-forward "Helper")
     (should-not (compose-preview--current-preview-method))))
 
+(ert-deftest compose-preview-current-class-preview-method-fqn ()
+  "Class and nested Preview methods map to their exact JVM owners."
+  (with-temp-buffer
+    (setq-local buffer-file-name "/tmp/project/example/Foo.kt")
+    (insert "package com.example\n"
+            "class First {\n"
+            "  @Preview\n  fun Card() { Text(\"first\") }\n"
+            "}\n"
+            "class Second {\n"
+            "  class Nested {\n"
+            "    @Preview\n    fun Card() { Text(\"nested\") }\n"
+            "  }\n}\n")
+    (goto-char (point-min))
+    (search-forward "Text(\"first\")")
+    (should (equal (compose-preview--current-preview-method-fqn)
+                   "com.example.First.Card"))
+    (search-forward "Text(\"nested\")")
+    (should (equal (compose-preview--current-preview-method-fqn)
+                   "com.example.Second$Nested.Card"))))
+
 (ert-deftest compose-preview-select-model-previews ()
   "Model previews are narrowed to source functions and the selected method."
-  (let* ((source (make-temp-file "compose-preview-source" nil ".kt"))
-         (previews (mapcar (lambda (fqn)
-                             (list (cons "methodFQN" fqn)))
-                           '("com.example.FooKt.First"
-                             "com.example.FooKt.Second"
-                             "com.other.BarKt.First")))
+  (let* ((source (make-temp-file "Foo" nil ".kt"))
+         (source-name (file-name-nondirectory source))
+         (previews
+          (list
+           (list (cons "methodFQN" "com.example.FooKt.First")
+                 (cons "sourceFile" source-name))
+           (list (cons "methodFQN" "com.example.FooKt.Second")
+                 (cons "sourceFile" source-name))
+           (list (cons "methodFQN" "com.example.BarKt.First")
+                 (cons "sourceFile" "Bar.kt"))
+           (list (cons "methodFQN" "com.example.First.First")
+                 (cons "sourceFile" source-name))
+           (list (cons "methodFQN" "com.example.Second.First")
+                 (cons "sourceFile" source-name))
+           (list (cons "methodFQN" "com.example.Outer$Nested.First")
+                 (cons "sourceFile" source-name))
+           (list (cons "methodFQN" "com.other.BazKt.First")
+                 (cons "sourceFile" source-name))))
          (model (list (cons "previews" previews))))
     (unwind-protect
         (progn
@@ -66,7 +100,16 @@
                              (compose-preview--json-get preview "methodFQN"))
                            (compose-preview--select-model-previews
                             model source nil))
-                   '("com.example.FooKt.First")))
+                   '("com.example.FooKt.First"
+                     "com.example.First.First"
+                     "com.example.Second.First"
+                     "com.example.Outer$Nested.First")))
+          (should (equal
+                   (mapcar (lambda (preview)
+                             (compose-preview--json-get preview "methodFQN"))
+                           (compose-preview--select-model-previews
+                            model source "com.example.Second.First"))
+                   '("com.example.Second.First")))
           (should-not (compose-preview--select-model-previews
                        model source "Second")))
       (delete-file source))))
@@ -260,6 +303,9 @@
       (should (string-match-p "compose-preview-renderer" script))
       (should (string-match-p "PreviewMethodFinder" script))
       (should (string-match-p "composePreviewModel" script))
+      (should (string-match-p "sourceFileForMethod" script))
+      (should (string-match-p "com.android.kotlin.multiplatform.library" script))
+      (should (string-match-p "host-test resource APK" script))
       (should (string-match-p "rClassJars" script))
       (should (string-match-p "includeAndroidResources" script))
       (should-not (string-match-p "Paparazzi\\|Roborazzi" script)))))
@@ -315,6 +361,42 @@
           (should all-in-file))
       (when (buffer-live-p source)
         (kill-buffer source)))))
+
+(ert-deftest compose-preview-gradle-failure-prefers-specific-diagnostic ()
+  "Gradle failures surface compose-preview diagnostics in the panel."
+  (with-temp-buffer
+    (insert "* What went wrong:\n"
+            "> compose-preview: Android KMP resources are unavailable\n")
+    (should (equal
+             (compose-preview--gradle-failure-message
+              (list :log-buffer (current-buffer)) 1)
+             "compose-preview: Android KMP resources are unavailable"))))
+
+(ert-deftest compose-preview-launcher-compilation-is-asynchronous ()
+  "A stale launcher cache starts javac without blocking Emacs."
+  (let ((context '(:generation 1
+                   :target (:project-root "/tmp/" :module-root "/tmp/")
+                   :source-buffer nil
+                   :launcher (:javac "/jdk/bin/javac"
+                              :classpath "/renderer.jar"
+                              :directory "/tmp/launcher/"
+                              :source "/package/Launcher.java")
+                   :log-buffer nil))
+        command sentinel)
+      (with-temp-buffer
+        (setf (plist-get context :log-buffer) (current-buffer))
+        (cl-letf (((symbol-function 'make-directory) #'ignore)
+                  ((symbol-function 'make-process)
+                   (lambda (&rest args)
+                     (setq command (plist-get args :command))
+                     'javac-process))
+                  ((symbol-function 'process-put) #'ignore)
+                  ((symbol-function 'set-process-sentinel)
+                   (lambda (_process function) (setq sentinel function)))
+                  ((symbol-function 'compose-preview--panel-status) #'ignore))
+          (compose-preview--compile-launcher context)))
+      (should (equal (car command) "/jdk/bin/javac"))
+      (should (eq sentinel #'compose-preview--launcher-sentinel))))
 
 (provide 'compose-preview-tests)
 

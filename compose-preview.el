@@ -384,6 +384,56 @@ Each entry is (PROJECT-ROOT . TARGET), where TARGET is a plist containing
           (setq continue nil))))
       found)))
 
+(defun compose-preview--kotlin-owner-in-region (start end)
+  "Return Kotlin owner declaration between START and END."
+  (save-excursion
+    (goto-char start)
+    (let (owner)
+      (while (re-search-forward
+              "\\_<\\(companion[[:space:]]+object\\|class\\|interface\\|object\\)\\_>\\(?:[[:space:]]+\\([A-Za-z_][A-Za-z0-9_]*\\)\\)?"
+              end t)
+        (setq owner
+              (if (string= (match-string-no-properties 1) "companion object")
+                  (or (match-string-no-properties 2) "Companion")
+                (match-string-no-properties 2))))
+      owner)))
+
+(defun compose-preview--enclosing-kotlin-owners (position)
+  "Return JVM owner names enclosing Kotlin source POSITION."
+  (save-excursion
+    (goto-char (point-min))
+    (let ((segment-start (point-min))
+          stack)
+      (while (re-search-forward "[{}]" position t)
+        (let* ((brace (match-beginning 0))
+               (state (save-excursion (syntax-ppss brace))))
+          (unless (or (nth 3 state) (nth 4 state))
+            (if (eq (char-after brace) ?{)
+                (push (compose-preview--kotlin-owner-in-region
+                       segment-start brace)
+                      stack)
+              (when stack
+                (pop stack)))
+            (setq segment-start (1+ brace)))))
+      (nreverse (delq nil stack)))))
+
+(defun compose-preview--current-preview-method-fqn ()
+  "Return fully qualified JVM name of the Compose Preview at point."
+  (when (and buffer-file-name (string-match-p "\\.kt\\'" buffer-file-name))
+    (save-excursion
+      (end-of-line)
+      (when (re-search-backward compose-preview--kotlin-function-regexp nil t)
+        (let ((function-start (point))
+              (method (match-string-no-properties 1)))
+          (when (compose-preview--function-has-preview-annotation-p function-start)
+            (let* ((package (compose-preview--current-package))
+                   (owners (compose-preview--enclosing-kotlin-owners function-start))
+                   (declaring-class
+                    (if owners
+                        (string-join owners "$")
+                      (concat (file-name-base buffer-file-name) "Kt"))))
+              (string-join (delq nil (list package declaring-class method)) "."))))))))
+
 (defun compose-preview--current-preview-method ()
   "Return the containing Compose @Preview function name at point."
   (when (and buffer-file-name (string-match-p "\\.kt\\'" buffer-file-name))
@@ -577,22 +627,55 @@ When FORCE-PROMPT is non-nil, prompt for module and variant via android-mode."
           (push (match-string-no-properties 1) names))
         (delete-dups names)))))
 
+(defun compose-preview--source-declaring-prefixes (file)
+  "Return possible JVM declaring class prefixes for Kotlin source FILE."
+  (when (and file (file-readable-p file))
+    (with-temp-buffer
+      (insert-file-contents file)
+      (setq-local buffer-file-name file)
+      (let* ((package (compose-preview--current-package))
+             (qualify (lambda (name)
+                        (if (and package (not (string-empty-p package)))
+                            (concat package "." name)
+                          name)))
+             (prefixes (list (compose-preview--current-buffer-class-prefix))))
+        (goto-char (point-min))
+        (while (re-search-forward
+                "^[[:space:]]*\\(?:[[:word:]]+[[:space:]]+\\)*\\(?:class\\|interface\\|object\\)[[:space:]]+\\([A-Za-z_][A-Za-z0-9_]*\\)"
+                nil t)
+          (push (funcall qualify (match-string-no-properties 1)) prefixes))
+        (delete-dups (delq nil prefixes))))))
+
 (defun compose-preview--preview-method-name (preview)
   "Return method name from model PREVIEW."
   (car (last (split-string (compose-preview--json-get preview "methodFQN") "\\." t))))
 
 (defun compose-preview--select-model-previews (model source-file method)
-  "Select MODEL previews for SOURCE-FILE and optional METHOD."
+  "Select MODEL previews for SOURCE-FILE and optional METHOD.
+METHOD may be an unqualified name or a full JVM method name."
   (let* ((previews (compose-preview--json-get model "previews"))
-         (package (and source-file (compose-preview--source-file-package source-file)))
+         (source-name (and source-file (file-name-nondirectory source-file)))
+         (package (compose-preview--source-file-package source-file))
+         (prefixes (compose-preview--source-declaring-prefixes source-file))
          (names (compose-preview--function-names-in-file source-file)))
     (seq-filter
      (lambda (preview)
        (let ((fqn (compose-preview--json-get preview "methodFQN"))
+             (model-source (compose-preview--json-get preview "sourceFile"))
              (name (compose-preview--preview-method-name preview)))
-         (and (or (null package) (string-prefix-p (concat package ".") fqn))
+         (and (or (null package)
+                  (string-prefix-p (concat package ".") fqn))
+              (or (null source-name)
+                  (and model-source (string= model-source source-name))
+                  (and (null model-source)
+                       (seq-some (lambda (prefix)
+                                   (string-prefix-p (concat prefix ".") fqn))
+                                 prefixes)))
               (or (null names) (member name names))
-              (or (null method) (string= name method)))))
+              (or (null method)
+                  (if (string-match-p "\\." method)
+                      (string= fqn method)
+                    (string= name method))))))
      previews)))
 
 (defun compose-preview--library-directory ()
@@ -604,8 +687,8 @@ When FORCE-PROMPT is non-nil, prompt for module and variant via android-mode."
   (expand-file-name (concat "launcher-" compose-preview-renderer-version "/")
                     compose-preview-cache-directory))
 
-(defun compose-preview--ensure-launcher (model log-buffer)
-  "Compile the renderer launcher for MODEL, logging to LOG-BUFFER."
+(defun compose-preview--launcher-spec (model)
+  "Return launcher compilation and cache details for MODEL."
   (let* ((source (expand-file-name "ComposePreviewRenderLauncher.java"
                                    (compose-preview--library-directory)))
          (directory (compose-preview--launcher-directory))
@@ -615,20 +698,10 @@ When FORCE-PROMPT is non-nil, prompt for module and variant via android-mode."
          (classpath (string-join
                      (compose-preview--json-get model "rendererClassPath")
                      path-separator)))
-    (unless (and (file-readable-p class-file)
-                 (file-newer-than-file-p class-file source))
-      (make-directory directory t)
-      (with-current-buffer log-buffer
-        (let ((inhibit-read-only t))
-          (goto-char (point-max))
-          (insert (format "\n$ %s -cp %s -d %s %s\n"
-                          javac classpath directory source))))
-      (unless (zerop (call-process javac nil log-buffer t
-                                   "-nowarn" "-cp" classpath
-                                   "-d" directory source))
-        (display-buffer log-buffer)
-        (user-error "Could not compile Compose preview renderer launcher")))
-    directory))
+    (list :source source :directory directory :class-file class-file
+          :javac javac :classpath classpath
+          :current (and (file-readable-p class-file)
+                        (file-newer-than-file-p class-file source)))))
 
 (defun compose-preview--preview-id (preview annotation index)
   "Return stable id for PREVIEW ANNOTATION at INDEX."
@@ -832,46 +905,117 @@ FORMAT-STRING and ARGS are passed to `format'."
           (compose-preview--fail context "renderer process exited with status %d"
                                  (process-exit-status process)))))))
 
+(defun compose-preview--launch-renderer (context)
+  "Launch the layoutlib renderer described by CONTEXT."
+  (let* ((model (plist-get context :model))
+         (previews (plist-get context :previews))
+         (render (plist-get context :render))
+         (launcher (plist-get context :launcher))
+         (target (plist-get context :target))
+         (log-buffer (plist-get context :log-buffer))
+         (java (compose-preview--json-get model "javaExecutable"))
+         (renderer-cp (compose-preview--json-get model "rendererClassPath"))
+         (classpath (string-join
+                     (cons (plist-get launcher :directory) renderer-cp)
+                     path-separator))
+         (java-home (file-name-directory
+                     (directory-file-name (file-name-directory java))))
+         (process-environment
+          (cons (concat "JAVA_HOME=" java-home) process-environment))
+         (default-directory (plist-get target :project-root))
+         (process
+          (make-process
+           :name "compose-preview-renderer"
+           :buffer log-buffer :stderr log-buffer :noquery t
+           :command (list java "-Dlayoutlib.thread.profile.timeoutms=10000"
+                          "-cp" classpath "ComposePreviewRenderLauncher"
+                          (plist-get render :settings))
+           :sentinel #'ignore)))
+    (setq compose-preview--process process)
+    (process-put process 'compose-preview-context context)
+    (set-process-sentinel process #'compose-preview--render-sentinel)
+    (compose-preview--panel-status
+     (plist-get context :source-buffer) (plist-get target :module-root)
+     (format "rendering %d declarations…" (length previews)))))
+
+(defun compose-preview--launcher-sentinel (process _event)
+  "Continue rendering after asynchronous launcher compiler PROCESS."
+  (when (memq (process-status process) '(exit signal))
+    (let* ((context (process-get process 'compose-preview-context))
+           (generation (plist-get context :generation)))
+      (when (compose-preview--active-generation-p generation)
+        (setq compose-preview--process nil)
+        (if (zerop (process-exit-status process))
+            (compose-preview--launch-renderer context)
+          (compose-preview--fail context "launcher compiler exited with status %d"
+                                 (process-exit-status process)))))))
+
+(defun compose-preview--compile-launcher (context)
+  "Compile the renderer launcher asynchronously for CONTEXT."
+  (let* ((launcher (plist-get context :launcher))
+         (target (plist-get context :target))
+         (log-buffer (plist-get context :log-buffer))
+         (directory (plist-get launcher :directory))
+         (default-directory (plist-get target :project-root)))
+    (make-directory directory t)
+    (with-current-buffer log-buffer
+      (let ((inhibit-read-only t))
+        (goto-char (point-max))
+        (insert (format "\n$ %s -cp %s -d %s %s\n"
+                        (plist-get launcher :javac)
+                        (plist-get launcher :classpath)
+                        directory (plist-get launcher :source)))))
+    (let ((process
+           (make-process
+            :name "compose-preview-launcher-compiler"
+            :buffer log-buffer :stderr log-buffer :noquery t
+            :command (list (plist-get launcher :javac) "-nowarn"
+                           "-cp" (plist-get launcher :classpath)
+                           "-d" directory (plist-get launcher :source))
+            :sentinel #'ignore)))
+      (setq compose-preview--process process)
+      (process-put process 'compose-preview-context context)
+      (set-process-sentinel process #'compose-preview--launcher-sentinel)
+      (compose-preview--panel-status
+       (plist-get context :source-buffer) (plist-get target :module-root)
+       "compiling renderer launcher…"))))
+
 (defun compose-preview--start-render (context)
-  "Start the renderer described by CONTEXT."
+  "Prepare and start renderer work described by CONTEXT."
   (let* ((model (compose-preview--read-json (plist-get context :model-file)))
          (source-file (plist-get context :source-file))
          (method (plist-get context :preview-method))
          (previews (compose-preview--select-model-previews model source-file method))
-         (target (plist-get context :target))
-         (log-buffer (plist-get context :log-buffer)))
+         (target (plist-get context :target)))
     (if (null previews)
         (compose-preview--fail context "no previews found for %s"
                                (or (and source-file (file-name-nondirectory source-file))
                                    (plist-get target :module-path)))
       (condition-case err
-          (let* ((launcher-dir (compose-preview--ensure-launcher model log-buffer))
-                 (render (compose-preview--render-settings
-                          model previews target (plist-get context :generation)))
-                 (java (compose-preview--json-get model "javaExecutable"))
-                 (renderer-cp (compose-preview--json-get model "rendererClassPath"))
-                 (classpath (string-join (cons launcher-dir renderer-cp) path-separator))
-                 (java-home (file-name-directory
-                             (directory-file-name (file-name-directory java))))
-                 (process-environment
-                  (cons (concat "JAVA_HOME=" java-home) process-environment))
-                 (default-directory (plist-get target :project-root))
-                 (process
-                  (make-process
-                   :name "compose-preview-renderer"
-                   :buffer log-buffer :stderr log-buffer :noquery t
-                   :command (list java "-Dlayoutlib.thread.profile.timeoutms=10000"
-                                  "-cp" classpath "ComposePreviewRenderLauncher"
-                                  (plist-get render :settings))
-                   :sentinel #'ignore)))
-            (setq context (plist-put context :render render)
-                  compose-preview--process process)
-            (process-put process 'compose-preview-context context)
-            (set-process-sentinel process #'compose-preview--render-sentinel)
-            (compose-preview--panel-status
-             (plist-get context :source-buffer) (plist-get target :module-root)
-             (format "rendering %d declarations…" (length previews))))
+          (let ((launcher (compose-preview--launcher-spec model))
+                (render (compose-preview--render-settings
+                         model previews target (plist-get context :generation))))
+            (setq context (plist-put context :model model)
+                  context (plist-put context :previews previews)
+                  context (plist-put context :render render)
+                  context (plist-put context :launcher launcher))
+            (if (plist-get launcher :current)
+                (compose-preview--launch-renderer context)
+              (compose-preview--compile-launcher context)))
         (error (compose-preview--fail context "%s" (error-message-string err)))))))
+
+(defun compose-preview--gradle-failure-message (context status)
+  "Return the most useful Gradle failure message for CONTEXT and STATUS."
+  (let ((buffer (plist-get context :log-buffer)))
+    (or (and (buffer-live-p buffer)
+             (with-current-buffer buffer
+               (save-excursion
+                 (goto-char (point-max))
+                 (when (re-search-backward
+                        "^[[:space:]]*>[[:space:]]+\\(compose-preview: .+\\)$"
+                        nil t)
+                   (match-string-no-properties 1)))))
+        (format "Gradle preparation exited with status %d" status))))
 
 (defun compose-preview--gradle-sentinel (process _event)
   "Start rendering after asynchronous Gradle PROCESS succeeds."
@@ -882,8 +1026,10 @@ FORMAT-STRING and ARGS are passed to `format'."
         (setq compose-preview--process nil)
         (if (zerop (process-exit-status process))
             (compose-preview--start-render context)
-          (compose-preview--fail context "Gradle preparation exited with status %d"
-                                 (process-exit-status process)))))))
+          (compose-preview--fail
+           context "%s"
+           (compose-preview--gradle-failure-message
+            context (process-exit-status process))))))))
 
 ;;;###autoload
 (defun compose-preview-refresh (&optional variant)
@@ -896,7 +1042,7 @@ prompt for the module and full variant name."
          (variant (or variant (plist-get target :variant)))
          (source-file buffer-file-name)
          (preview-method (unless compose-preview--refresh-all-in-file
-                           (compose-preview--current-preview-method)))
+                           (compose-preview--current-preview-method-fqn)))
          (generation (cl-incf compose-preview--generation))
          (model-file (compose-preview--model-file target generation))
          (project-root (plist-get target :project-root))

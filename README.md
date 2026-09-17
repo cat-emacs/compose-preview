@@ -82,6 +82,18 @@ non-namespaced R jar. AGP only links that apk when Android resources are
 requested for local tests, so the init script enables
 `testOptions.unitTests.includeAndroidResources` for the target module.
 
+### Kotlin Multiplatform
+
+`com.android.kotlin.multiplatform.library` is detected but cannot currently be
+rendered through this external init script. AGP does not expose the KMP host-test
+resource APK and matching runtime R jar through its public Variant API, and its
+KMP task manager does not register the Compose Preview runfiles task used by
+ordinary Android variants. The injected `composePreviewModel` task therefore
+fails with a specific diagnostic instead of producing an empty render or a
+misleading missing-task error. Supporting this safely requires AGP to expose or
+register those artifacts; this package deliberately does not reflect into AGP
+internals or hard-code intermediate paths.
+
 ## Verified Against
 
 - `Android-screenshot-testing-playground`, AGP 8.11.1 / Gradle 8.13, library
