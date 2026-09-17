@@ -21,6 +21,29 @@
     (should (equal (compose-preview--module-root-from-name project-root "app:feature")
                    "/tmp/project/app/feature/"))))
 
+(ert-deftest compose-preview-model-files-separate-gradle-cache-and-render-snapshots ()
+  "Gradle model paths stay stable while renderer snapshots remain isolated."
+  (let ((target '(:module-root "/tmp/project/app/" :variant "androidMain")))
+    (should (equal (compose-preview--model-file target)
+                   "/tmp/project/app/build/compose-preview/emacs/model-androidMain.json"))
+    (should (equal (compose-preview--model-file target 7)
+                   "/tmp/project/app/build/compose-preview/emacs/model-androidMain-7.json"))))
+
+(ert-deftest compose-preview-successful-gradle-snapshots-model-before-rendering ()
+  "A successful active Gradle process snapshots its stable model."
+  (let ((compose-preview--generation 3)
+        events)
+    (cl-letf (((symbol-function 'process-status) (lambda (_process) 'exit))
+              ((symbol-function 'process-exit-status) (lambda (_process) 0))
+              ((symbol-function 'process-get)
+               (lambda (_process _property) '(:generation 3)))
+              ((symbol-function 'compose-preview--snapshot-model)
+               (lambda (_context) (push 'snapshot events)))
+              ((symbol-function 'compose-preview--start-render)
+               (lambda (_context) (push 'render events))))
+      (compose-preview--gradle-sentinel 'process "finished\n")
+      (should (equal (nreverse events) '(snapshot render))))))
+
 (ert-deftest compose-preview-current-buffer-class-prefix ()
   "Kotlin source buffers map to generated file facade class names."
   (with-temp-buffer
@@ -398,6 +421,18 @@
        "compose-preview: Android KMP failed")
       (should (equal status "failed — Android KMP failed"))
       (should (equal logged "Android KMP failed")))))
+
+(ert-deftest compose-preview-gradle-arguments-reuse-daemon-and-caches ()
+  "Preview Gradle invocations reuse the daemon and incremental caches."
+  (let ((compose-preview-use-gradle-daemon t)
+        (compose-preview-force-clean-build nil))
+    (should (equal (compose-preview--gradle-arguments ":app:preview" "/init.gradle")
+                   '(":app:preview" "--init-script" "/init.gradle" "--daemon"))))
+  (let ((compose-preview-use-gradle-daemon nil)
+        (compose-preview-force-clean-build t))
+    (should (equal (compose-preview--gradle-arguments ":app:preview" "/init.gradle")
+                   '(":app:preview" "--init-script" "/init.gradle"
+                     "--no-build-cache" "--no-parallel")))))
 
 (ert-deftest compose-preview-gradle-failure-prefers-specific-diagnostic ()
   "Gradle failures surface compose-preview diagnostics in the panel."

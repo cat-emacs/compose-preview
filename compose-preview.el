@@ -83,6 +83,11 @@ A float means a fraction of the frame width; an integer means columns."
   :type 'boolean
   :group 'compose-preview)
 
+(defcustom compose-preview-use-gradle-daemon t
+  "Whether preview preparation should reuse a persistent Gradle daemon."
+  :type 'boolean
+  :group 'compose-preview)
+
 (defcustom compose-preview-cache-directory
   (expand-file-name "compose-preview/"
                     (or (getenv "XDG_CACHE_HOME")
@@ -603,11 +608,19 @@ When FORCE-PROMPT is non-nil, prompt for module and variant via android-mode."
                     (plist-get target :module-root)))
 
 (defun compose-preview--model-file (target &optional generation)
-  "Return model file for TARGET and optional GENERATION."
-  (expand-file-name (if generation
-                        (format "model-%s.json" generation)
-                      "model.json")
-                    (compose-preview--work-directory target)))
+  "Return model file for TARGET, isolated by GENERATION when non-nil."
+  (let ((variant (compose-preview--sanitize
+                  (or (plist-get target :variant) "default"))))
+    (expand-file-name (if generation
+                          (format "model-%s-%s.json" variant generation)
+                        (format "model-%s.json" variant))
+                      (compose-preview--work-directory target))))
+
+(defun compose-preview--snapshot-model (context)
+  "Copy CONTEXT's stable Gradle model to its generation-specific file."
+  (let ((source (plist-get context :gradle-model-file))
+        (destination (plist-get context :model-file)))
+    (copy-file source destination t)))
 
 (defun compose-preview--source-file-package (file)
   "Return Kotlin package declared in FILE."
@@ -1005,6 +1018,14 @@ FORMAT-STRING and ARGS are passed to `format'."
               (compose-preview--compile-launcher context)))
         (error (compose-preview--fail context "%s" (error-message-string err)))))))
 
+(defun compose-preview--gradle-arguments (task-path init-script)
+  "Return Gradle arguments for TASK-PATH using INIT-SCRIPT."
+  (append (list task-path "--init-script" init-script)
+          (when compose-preview-use-gradle-daemon
+            (list "--daemon"))
+          (when compose-preview-force-clean-build
+            (list "--no-build-cache" "--no-parallel"))))
+
 (defun compose-preview--gradle-failure-message (context status)
   "Return the most useful Gradle failure message for CONTEXT and STATUS."
   (let ((buffer (plist-get context :log-buffer)))
@@ -1026,7 +1047,13 @@ FORMAT-STRING and ARGS are passed to `format'."
       (when (compose-preview--active-generation-p generation)
         (setq compose-preview--process nil)
         (if (zerop (process-exit-status process))
-            (compose-preview--start-render context)
+            (condition-case err
+                (progn
+                  (compose-preview--snapshot-model context)
+                  (compose-preview--start-render context))
+              (error
+               (compose-preview--fail context "%s"
+                                      (error-message-string err))))
           (compose-preview--fail
            context "%s"
            (compose-preview--gradle-failure-message
@@ -1045,6 +1072,8 @@ prompt for the module and full variant name."
          (preview-method (unless compose-preview--refresh-all-in-file
                            (compose-preview--current-preview-method-fqn)))
          (generation (cl-incf compose-preview--generation))
+         (_ (setq target (plist-put target :variant variant)))
+         (gradle-model-file (compose-preview--model-file target))
          (model-file (compose-preview--model-file target generation))
          (project-root (plist-get target :project-root))
          (module-path (plist-get target :module-path))
@@ -1058,19 +1087,16 @@ prompt for the module and full variant name."
           (append
            (list (concat "COMPOSE_PREVIEW_MODULE_PATH=" module-path)
                  (concat "COMPOSE_PREVIEW_VARIANT=" variant)
-                 (concat "COMPOSE_PREVIEW_MODEL_FILE=" model-file)
+                 (concat "COMPOSE_PREVIEW_MODEL_FILE=" gradle-model-file)
                  (concat "COMPOSE_PREVIEW_ADAPTER_DIRECTORY=" adapter-directory)
                  (concat "COMPOSE_PREVIEW_LAYOUTLIB_VERSION=" compose-preview-layoutlib-version)
                  (concat "COMPOSE_PREVIEW_RENDERER_VERSION=" compose-preview-renderer-version)
                  (concat "COMPOSE_PREVIEW_DETECTOR_VERSION=" compose-preview-detector-version))
            process-environment))
          (default-directory project-root)
-         (gradle-args (append
-                       (list task-path "--init-script" init-script)
-                       (when compose-preview-force-clean-build
-                         (list "--no-build-cache" "--no-parallel"))))
+         (gradle-args (compose-preview--gradle-arguments task-path init-script))
          context process)
-    (setq target (compose-preview--cache-target (plist-put target :variant variant)))
+    (setq target (compose-preview--cache-target target))
     (when (process-live-p compose-preview--process)
       (delete-process compose-preview--process))
     (with-current-buffer log-buffer
@@ -1079,8 +1105,9 @@ prompt for the module and full variant name."
         (insert (format "$ %s %s\n\n" gradle (string-join gradle-args " ")))))
     (setq context (list :generation generation :target target
                         :source-buffer source-buffer :source-file source-file
-                        :preview-method preview-method :model-file model-file
-                        :log-buffer log-buffer)
+                        :preview-method preview-method
+                        :gradle-model-file gradle-model-file
+                        :model-file model-file :log-buffer log-buffer)
           process (make-process
                    :name "compose-preview-gradle"
                    :buffer log-buffer :stderr log-buffer :noquery t
