@@ -1050,12 +1050,15 @@ prompt for the module and full variant name."
          (task-path (compose-preview--task-path module-path "composePreviewModel"))
          (gradle (compose-preview--gradle-executable project-root))
          (init-script (compose-preview--get-init-script))
+         (adapter-directory (expand-file-name "adapters/"
+                                               compose-preview--package-directory))
          (log-buffer (get-buffer-create compose-preview-log-buffer-name))
          (process-environment
           (append
            (list (concat "COMPOSE_PREVIEW_MODULE_PATH=" module-path)
                  (concat "COMPOSE_PREVIEW_VARIANT=" variant)
                  (concat "COMPOSE_PREVIEW_MODEL_FILE=" model-file)
+                 (concat "COMPOSE_PREVIEW_ADAPTER_DIRECTORY=" adapter-directory)
                  (concat "COMPOSE_PREVIEW_LAYOUTLIB_VERSION=" compose-preview-layoutlib-version)
                  (concat "COMPOSE_PREVIEW_RENDERER_VERSION=" compose-preview-renderer-version)
                  (concat "COMPOSE_PREVIEW_DETECTOR_VERSION=" compose-preview-detector-version))

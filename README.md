@@ -84,15 +84,40 @@ requested for local tests, so the init script enables
 
 ### Kotlin Multiplatform
 
-`com.android.kotlin.multiplatform.library` is detected but cannot currently be
-rendered through this external init script. AGP does not expose the KMP host-test
-resource APK and matching runtime R jar through its public Variant API, and its
-KMP task manager does not register the Compose Preview runfiles task used by
-ordinary Android variants. The injected `composePreviewModel` task therefore
-fails with a specific diagnostic instead of producing an empty render or a
-misleading missing-task error. Supporting this safely requires AGP to expose or
-register those artifacts; this package deliberately does not reflect into AGP
-internals or hard-code intermediate paths.
+Traditional Kotlin Multiplatform modules using `androidTarget` with
+`com.android.application` or `com.android.library` follow the ordinary Android
+variant path. Modules using the newer
+`com.android.kotlin.multiplatform.library` plugin are supported on AGP 9.3.x by
+a version-gated adapter under `adapters/`.
+
+The KMP module must create an Android host test, include Android resources, and
+put the Android Compose tooling runtime on the Android target's runtime
+classpath:
+
+```kotlin
+kotlin {
+    android {
+        androidResources.enable = true
+        withHostTestBuilder {}.configure {
+            isIncludeAndroidResources = true
+        }
+    }
+    sourceSets.androidMain.dependencies {
+        implementation("androidx.compose.ui:ui-tooling:<compose-version>")
+    }
+}
+```
+
+The tooling dependency provides `ComposeViewAdapter`; Compose Multiplatform's
+common `uiToolingPreview` dependency provides the `@Preview` annotation but not
+that Android runtime implementation.
+
+AGP's public Variant API exposes the KMP host-test component but not its
+layoutlib resource APK or matching runtime R jar. The AGP 9.3 adapter contains
+the only two internal artifact lookups used by this package; project classes,
+dependency classpaths, task registration, and rendering continue to use public
+APIs. An unverified AGP version or changed internal artifact model fails with a
+specific compatibility error rather than guessing intermediate paths.
 
 ## Verified Against
 
@@ -103,6 +128,18 @@ internals or hard-code intermediate paths.
 - `nowinandroid`, AGP 9.3.2 / Gradle 9.7.1, with Isolated Projects and the
   configuration cache enabled and a flavored variant (`demoDebug`). 21 preview
   declarations expanded to 40 renders with no errors.
+- `com.android.kotlin.multiplatform.library`, AGP 9.3.2 / Gradle 9.7.1, using
+  the `androidMain` variant and host-test resources. Both an `androidMain`
+  Preview reading a string through the module R class and a Compose
+  Multiplatform Preview declared in `commonMain` rendered through layoutlib as
+  non-empty 630 x 263 PNGs. The model task reused Gradle's configuration cache;
+  removing the host test produced the expected `withHostTestBuilder {}`
+  diagnostic.
+
+These checks are focused runtime validation rather than repository test
+fixtures: this personal configuration repository does not add new test files.
+The existing ERT suite asserts the adapter boundary, AGP version gate, required
+artifact keys, and user-facing configuration diagnostics.
 
 ## Configuration
 
@@ -112,6 +149,7 @@ The init script reads these environment variables:
 | --- | --- |
 | `COMPOSE_PREVIEW_MODULE_PATH` | Gradle path of the target module, required |
 | `COMPOSE_PREVIEW_MODEL_FILE` | Where to write the JSON model, required |
+| `COMPOSE_PREVIEW_ADAPTER_DIRECTORY` | Versioned AGP adapters; set by Emacs |
 | `COMPOSE_PREVIEW_VARIANT` | Variant name, defaults to `debug` |
 | `COMPOSE_PREVIEW_LAYOUTLIB_VERSION` | Defaults to the version AGP pins |
 | `COMPOSE_PREVIEW_RENDERER_VERSION` | Standalone renderer version |

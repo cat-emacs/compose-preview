@@ -1,0 +1,71 @@
+// Android KMP compatibility adapter for AGP 9.3.x.
+//
+// AGP's public Variant API exposes the KMP host-test component, but not the
+// resource APK and runtime R jar that layoutlib needs. Keep the two internal
+// artifact lookups isolated in this version-gated adapter.
+
+static String androidGradlePluginVersion(Object component) {
+    try {
+        def loader = component.getClass().getClassLoader()
+        return String.valueOf(loader.loadClass("com.android.Version")
+                .getField("ANDROID_GRADLE_PLUGIN_VERSION").get(null))
+    } catch (ReflectiveOperationException error) {
+        throw new GradleException(
+                "compose-preview: could not determine the Android Gradle Plugin version", error)
+    }
+}
+
+static Object internalArtifact(Object component, String name) {
+    try {
+        def loader = component.getClass().getClassLoader()
+        def type = loader.loadClass(
+                "com.android.build.gradle.internal.scope.InternalArtifactType\$${name}")
+        return type.getField("INSTANCE").get(null)
+    } catch (ReflectiveOperationException error) {
+        throw new GradleException(
+                "compose-preview: AGP 9.3 KMP adapter could not access ${name}", error)
+    }
+}
+
+static Object requiredHostTest(Object variant) {
+    def host = variant.hostTests.values().find {
+        it.name == "androidHostTest" || it.name.toLowerCase(Locale.ROOT).contains("host")
+    }
+    if (host == null) {
+        throw new GradleException(
+                "compose-preview: Android KMP requires withHostTestBuilder {}")
+    }
+    if (!host.androidResourcesIncluded) {
+        throw new GradleException(
+                "compose-preview: Android KMP host test must set isIncludeAndroidResources = true")
+    }
+    return host
+}
+
+def targetModulePath = gradle.ext.composePreviewTargetModulePath
+def targetVariant = gradle.ext.composePreviewTargetVariant
+def registerKmp = gradle.ext.composePreviewRegisterKmp
+
+gradle.beforeProject { project ->
+    if (project.path != targetModulePath) {
+        return
+    }
+    project.plugins.withId("com.android.kotlin.multiplatform.library") {
+        def androidComponents = project.extensions.findByName("androidComponents")
+        if (androidComponents == null) {
+            return
+        }
+        androidComponents.onVariants(androidComponents.selector().withName(targetVariant)) { variant ->
+            def version = androidGradlePluginVersion(variant)
+            if (!(version ==~ /9\.3(?:\..*)?/)) {
+                throw new GradleException(
+                        "compose-preview: Android KMP supports AGP 9.3.x; found ${version}")
+            }
+            def host = requiredHostTest(variant)
+            def resourceApk = host.artifacts.get(internalArtifact(host, "APK_FOR_LOCAL_TEST"))
+            def runtimeRJar = host.artifacts.get(
+                    internalArtifact(host, "COMPILE_AND_RUNTIME_R_CLASS_JAR"))
+            registerKmp(project, variant, resourceApk, runtimeRJar)
+        }
+    }
+}

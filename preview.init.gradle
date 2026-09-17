@@ -319,6 +319,15 @@ static void wireScopedClasses(Object variant, Object taskProvider, String scopeN
             asFunction1(loader, dirsGetter))
 }
 
+static Object dependencyClassesFromConfiguration(Object configuration, String artifactType) {
+    return configuration.incoming.artifactView { view ->
+        view.lenient(true)
+        view.attributes {
+            it.attribute(Attribute.of("artifactType", String), artifactType)
+        }
+    }.files
+}
+
 static Object dependencyClassesView(Object project, String configurationName, String artifactType) {
     return project.provider {
         def configuration = project.configurations.findByName(configurationName)
@@ -340,20 +349,56 @@ if (targetModulePath == null || modelFilePath == null) {
 
 def variantSuffix = targetVariant.substring(0, 1).toUpperCase(Locale.ROOT) + targetVariant.substring(1)
 
+gradle.ext.composePreviewTargetModulePath = targetModulePath
+gradle.ext.composePreviewTargetVariant = targetVariant
+gradle.ext.composePreviewRegisterKmp = { project, variant, resourceApk, runtimeRJar ->
+    def layoutlibRuntime = project.configurations.detachedConfiguration(
+            project.dependencies.create("com.android.tools.layoutlib:layoutlib-runtime:${layoutlibVersion}"))
+    def layoutlibResources = project.configurations.detachedConfiguration(
+            project.dependencies.create("com.android.tools.layoutlib:layoutlib-resources:${layoutlibVersion}"))
+    def renderer = project.configurations.detachedConfiguration(
+            project.dependencies.create("com.android.tools.layoutlib:layoutlib:${layoutlibVersion}"),
+            project.dependencies.create("com.android.tools.compose:compose-preview-renderer:${rendererVersion}"))
+    [layoutlibRuntime, layoutlibResources, renderer].each { it.transitive = true }
+    def provider = project.tasks.register("composePreviewModel", ComposePreviewModelTask) { task ->
+        task.group = "compose preview"
+        task.description = "Collects Android KMP Compose preview metadata for Emacs"
+        task.namespace.set(variant.namespace)
+        task.modulePath.set(targetModulePath)
+        task.projectRootPath.set(project.rootDir.absolutePath)
+        task.moduleRootPath.set(project.projectDir.absolutePath)
+        task.variantName.set(targetVariant)
+        task.modelFile.set(new File(modelFilePath))
+        task.layoutlibDataDir.set(
+                project.layout.buildDirectory.dir("compose-preview/layoutlib-${layoutlibVersion}"))
+        task.layoutlibRuntimeJar.from(layoutlibRuntime)
+        task.layoutlibResourcesJar.from(layoutlibResources)
+        task.rendererClasspath.from(renderer)
+        task.allJars.set([])
+        task.allDirs.set([])
+        [variant.runtimeConfiguration, variant.compileConfiguration].each { configuration ->
+            ["android-classes-jar", "jar", "processed-jar"].each { artifactType ->
+                task.dependencyClasses.from(
+                        dependencyClassesFromConfiguration(configuration, artifactType))
+            }
+            task.dependencyRClasses.from(
+                    dependencyClassesFromConfiguration(configuration, "r-class-jar"))
+        }
+        task.resourceApkCandidates.from(resourceApk)
+        task.aggregatedRClassJar.from(runtimeRJar)
+    }
+    wireScopedClasses(variant, provider, "PROJECT", { it.projectJars }, { it.projectDirs })
+}
+
+def adapterDirectory = System.getenv("COMPOSE_PREVIEW_ADAPTER_DIRECTORY")
+if (adapterDirectory == null) {
+    throw new GradleException("compose-preview: COMPOSE_PREVIEW_ADAPTER_DIRECTORY is required")
+}
+apply from: new File(adapterDirectory, "agp-9.3-kmp.init.gradle")
+
 gradle.beforeProject { project ->
     if (project.path != targetModulePath) {
         return
-    }
-    project.plugins.withId("com.android.kotlin.multiplatform.library") {
-        project.tasks.register("composePreviewModel") {
-            group = "compose preview"
-            description = "Explains why standalone Compose preview is unavailable for Android KMP"
-            doLast {
-                throw new GradleException(
-                        "compose-preview: com.android.kotlin.multiplatform.library is not supported: " +
-                        "AGP does not expose its host-test resource APK and runtime R jar through the public Variant API")
-            }
-        }
     }
     ["com.android.application", "com.android.library", "com.android.dynamic-feature"].each { pluginId ->
         project.plugins.withId(pluginId) {

@@ -304,11 +304,26 @@
       (should (string-match-p "PreviewMethodFinder" script))
       (should (string-match-p "composePreviewModel" script))
       (should (string-match-p "sourceFileForMethod" script))
-      (should (string-match-p "com.android.kotlin.multiplatform.library" script))
-      (should (string-match-p "host-test resource APK" script))
+      (should (string-match-p "composePreviewRegisterKmp" script))
+      (should (string-match-p "COMPOSE_PREVIEW_ADAPTER_DIRECTORY" script))
+      (should-not (string-match-p "InternalArtifactType" script))
       (should (string-match-p "rClassJars" script))
       (should (string-match-p "includeAndroidResources" script))
       (should-not (string-match-p "Paparazzi\\|Roborazzi" script)))))
+
+(ert-deftest compose-preview-kmp-adapter-is-version-gated ()
+  "Android KMP internal artifacts stay isolated behind an AGP version gate."
+  (with-temp-buffer
+    (insert-file-contents
+     (expand-file-name "adapters/agp-9.3-kmp.init.gradle"))
+    (let ((adapter (buffer-string)))
+      (should (string-match-p "com.android.kotlin.multiplatform.library" adapter))
+      (should (string-match-p "ANDROID_GRADLE_PLUGIN_VERSION" adapter))
+      (should (string-match-p "9\\\\.3" adapter))
+      (should (string-match-p "APK_FOR_LOCAL_TEST" adapter))
+      (should (string-match-p "COMPILE_AND_RUNTIME_R_CLASS_JAR" adapter))
+      (should (string-match-p "withHostTestBuilder" adapter))
+      (should (string-match-p "isIncludeAndroidResources" adapter)))))
 
 (ert-deftest compose-preview-launcher-passes-r-class-jars ()
   "Launcher uses Studio's bootstrapper entry point with R class jars."
