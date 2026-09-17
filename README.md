@@ -13,7 +13,9 @@ The Emacs, Gradle, and renderer paths are implemented end to end. A refresh
 returns immediately, builds and renders in background processes, and updates a
 persistent side-window panel without clearing the last successful images while
 work is in progress. The panel shows build, render, ready, and failure status.
-Saving can also trigger a debounced refresh when
+It groups results by Android Studio's `@Preview(group = "...")` setting and
+renders each group as a collapsible section; ungrouped previews appear under
+`Default`. Saving can also trigger a debounced refresh when
 `compose-preview-auto-refresh-mode` is enabled in the source buffer.
 
 ## How It Works
@@ -37,9 +39,15 @@ Rendering happens in three steps.
 Run `M-x compose-preview-refresh` from a Kotlin source buffer. The command opens
 a panel on the right and returns immediately. Inside the panel:
 
+- click a group title, or press `TAB` / `RET` on it, to fold or unfold it;
+- `S-TAB` folds all groups when all are open, otherwise it unfolds all groups;
 - `g` refreshes from its associated source buffer;
 - `l` opens the Gradle and renderer log;
 - `q` closes the side window.
+
+Groups follow Android Studio Preview semantics: explicit `@Preview(group =
+"...")` values are sorted by display name and ungrouped previews use `Default`.
+Fold state is preserved across automatic and manual refreshes.
 
 Run `M-x compose-preview-auto-refresh-mode` in a source buffer to refresh all
 previews in that file after each save. Saves are debounced by

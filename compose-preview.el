@@ -154,8 +154,23 @@ Each entry is (PROJECT-ROOT . TARGET), where TARGET is a plist containing
   source-file
   files)
 
+(defconst compose-preview--default-group "Default"
+  "Display name for Preview annotations without an explicit group.")
+
+(defvar-local compose-preview--collapsed-groups nil
+  "Hash table of collapsed Preview group names in the results buffer.")
+
+(defvar-local compose-preview--group-names nil
+  "Ordered Preview group names currently rendered in the results buffer.")
+
+(defvar-local compose-preview--group-overlays nil
+  "Hash table of Preview group body overlays in the results buffer.")
+
 (defvar compose-preview-results-mode-map
   (let ((map (make-sparse-keymap)))
+    (define-key map (kbd "TAB") #'compose-preview-toggle-group)
+    (define-key map (kbd "<backtab>") #'compose-preview-toggle-all-groups)
+    (define-key map (kbd "RET") #'compose-preview-toggle-group)
     (define-key map (kbd "g") #'compose-preview-panel-refresh)
     (define-key map (kbd "l") #'compose-preview-open-log)
     (define-key map (kbd "q") #'quit-window)
@@ -164,7 +179,11 @@ Each entry is (PROJECT-ROOT . TARGET), where TARGET is a plist containing
 
 (define-derived-mode compose-preview-results-mode special-mode "ComposePreview"
   "Major mode for browsing Compose preview images."
-  :group 'compose-preview)
+  :group 'compose-preview
+  (unless (hash-table-p compose-preview--collapsed-groups)
+    (setq-local compose-preview--collapsed-groups (make-hash-table :test #'equal)))
+  (setq-local compose-preview--group-overlays (make-hash-table :test #'equal))
+  (add-to-invisibility-spec 'compose-preview-fold))
 
 (defun compose-preview-open-log ()
   "Show the Compose preview build and renderer log."
@@ -730,6 +749,7 @@ Use GENERATION to isolate concurrent or superseded render attempts."
          (output (expand-file-name (format "rendered%s/" suffix) root))
          (settings-file (expand-file-name (format "settings%s.json" suffix) root))
          (results-file (expand-file-name (format "results%s.json" suffix) root))
+         (metadata (make-hash-table :test #'equal))
          screenshots)
     (when (file-directory-p output)
       (delete-directory output t))
@@ -737,13 +757,19 @@ Use GENERATION to isolate concurrent or superseded render attempts."
     (dolist (preview previews)
       (cl-loop for annotation in (compose-preview--json-get preview "annotations")
                for index from 0
-               do (let ((entry
-                         `(("previewType" . "COMPOSE")
-                           ("methodFQN" . ,(compose-preview--json-get preview "methodFQN"))
-                           ("previewId" . ,(compose-preview--preview-id preview annotation index))
-                           ("methodParams" . ,(vconcat (compose-preview--json-get preview "methodParams")))
-                           ("previewParams" . ,(or annotation
-                                                    (make-hash-table :test #'equal))))))
+               do (let* ((id (compose-preview--preview-id preview annotation index))
+                         (entry
+                          `(("previewType" . "COMPOSE")
+                            ("methodFQN" . ,(compose-preview--json-get preview "methodFQN"))
+                            ("previewId" . ,id)
+                            ("methodParams" . ,(vconcat (compose-preview--json-get preview "methodParams")))
+                            ("previewParams" . ,(or annotation
+                                                     (make-hash-table :test #'equal))))))
+                    (puthash id
+                             (list :preview-name (compose-preview--json-get annotation "name")
+                                   :group (compose-preview--json-get annotation "group")
+                                   :source-file (compose-preview--json-get preview "sourceFile"))
+                             metadata)
                     (when-let* ((wrapper (compose-preview--json-get preview "previewWrapperFQN")))
                       (push (cons "previewWrapperFqn" wrapper) entry))
                     (push entry screenshots))))
@@ -761,7 +787,8 @@ Use GENERATION to isolate concurrent or superseded render attempts."
        ("resourceApkPath" . ,(compose-preview--json-get model "resourceApkPath"))
        ("resultsFilePath" . ,results-file)
        ("screenshots" . ,(vconcat (nreverse screenshots)))))
-    (list :settings settings-file :results results-file :output output)))
+    (list :settings settings-file :results results-file :output output
+          :metadata metadata)))
 
 (defun compose-preview--insert-image (file)
   "Insert FILE as an image preview when Emacs can display it."
@@ -797,28 +824,142 @@ Use GENERATION to isolate concurrent or superseded render attempts."
           (insert "Compose Preview\n\nWaiting for the first render...\n"))))
     (compose-preview--display-panel buffer)))
 
+(defun compose-preview--group-name (preview)
+  "Return display group name for PREVIEW."
+  (let ((group (compose-preview-item-group preview)))
+    (if (and (stringp group) (not (string-empty-p group)))
+        group
+      compose-preview--default-group)))
+
+(defun compose-preview--group-items (previews)
+  "Group PREVIEWS by annotation group in Android Studio display order."
+  (let ((groups (make-hash-table :test #'equal)))
+    (dolist (preview previews)
+      (let ((name (compose-preview--group-name preview)))
+        (puthash name (append (gethash name groups) (list preview)) groups)))
+    (let* ((names (hash-table-keys groups))
+           (named (sort (delete compose-preview--default-group names)
+                        #'string-lessp))
+           (ordered (if (gethash compose-preview--default-group groups)
+                        (cons compose-preview--default-group named)
+                      named)))
+      (mapcar (lambda (name) (cons name (gethash name groups))) ordered))))
+
+(defun compose-preview--group-at-point ()
+  "Return Preview group name at point, or nil outside a group header."
+  (get-text-property (line-beginning-position) 'compose-preview-group))
+
+(defun compose-preview--property-position (property value)
+  "Return first position whose PROPERTY is equal to VALUE."
+  (let ((position (point-min))
+        found)
+    (while (and (< position (point-max)) (not found))
+      (if (equal (get-text-property position property) value)
+          (setq found position)
+        (setq position (or (next-single-property-change
+                            position property nil (point-max))
+                           (point-max)))))
+    found))
+
+(defun compose-preview--set-group-collapsed (group collapsed)
+  "Set GROUP visibility according to COLLAPSED in the current panel."
+  (puthash group collapsed compose-preview--collapsed-groups)
+  (let* ((header-start (compose-preview--property-position
+                        'compose-preview-group group))
+         (body-start (compose-preview--property-position
+                      'compose-preview-group-body group)))
+    (when (and header-start body-start)
+      (let* ((body-end (or (next-single-property-change
+                            body-start 'compose-preview-group-body nil (point-max))
+                           (point-max)))
+             (existing (gethash group compose-preview--group-overlays))
+             (overlay (if (and (overlayp existing) (overlay-buffer existing))
+                          existing
+                        (make-overlay body-start body-end))))
+        (move-overlay overlay body-start body-end)
+        (overlay-put overlay 'invisible (and collapsed 'compose-preview-fold))
+        (overlay-put overlay 'isearch-open-invisible #'delete-overlay)
+        (puthash group overlay compose-preview--group-overlays)
+        (let ((inhibit-read-only t))
+          (put-text-property header-start (1+ header-start)
+                             'display (if collapsed ">" "v")))))))
+
+(defun compose-preview-toggle-group (&optional group)
+  "Toggle GROUP, or the Preview group header at point."
+  (interactive)
+  (let ((group (or group (compose-preview--group-at-point))))
+    (unless group
+      (user-error "Point is not on a Preview group header"))
+    (compose-preview--set-group-collapsed
+     group (not (gethash group compose-preview--collapsed-groups)))))
+
+(defun compose-preview-toggle-all-groups ()
+  "Expand all Preview groups, or collapse all when all are expanded."
+  (interactive)
+  (let* ((groups compose-preview--group-names)
+         (collapse (seq-every-p
+                    (lambda (group)
+                      (not (gethash group compose-preview--collapsed-groups)))
+                    groups)))
+    (dolist (group groups)
+      (compose-preview--set-group-collapsed group collapse))))
+
+(defun compose-preview--insert-preview (preview)
+  "Insert PREVIEW image and actions in the current results buffer."
+  (when-let* ((files (compose-preview-item-files preview)))
+    (insert (propertize (compose-preview-item-name preview) 'face 'bold) "\n")
+    (dolist (file files)
+      (insert-button "open image" 'follow-link t
+                     'action (lambda (_button) (find-file file)))
+      (insert "\n")
+      (compose-preview--insert-image file)
+      (insert "\n"))
+    (insert "\n")))
+
+(defun compose-preview--insert-group (name previews)
+  "Insert collapsible group NAME containing PREVIEWS."
+  (let ((header-start (point))
+        (collapsed (gethash name compose-preview--collapsed-groups)))
+    (insert-text-button (format "%s  %s  %d\n" (if collapsed ">" "v") name
+                                (length previews))
+                        'face 'font-lock-function-name-face
+                        'follow-link t
+                        'help-echo "Toggle group (TAB or RET)"
+                        'compose-preview-group name
+                        'action (lambda (button)
+                                  (compose-preview-toggle-group
+                                   (button-get button 'compose-preview-group))))
+    (put-text-property header-start (point) 'compose-preview-group name)
+    (let ((body-start (point)))
+      (dolist (preview previews)
+        (compose-preview--insert-preview preview))
+      (put-text-property body-start (point) 'compose-preview-group-body name)
+      (compose-preview--set-group-collapsed name collapsed))))
+
 (defun compose-preview--render-results (module-root images &optional previews source-buffer)
   "Render IMAGES and PREVIEWS for MODULE-ROOT in the preview panel."
   (let ((buffer (get-buffer-create compose-preview-results-buffer-name)))
     (with-current-buffer buffer
-      (let ((inhibit-read-only t))
+      (let ((inhibit-read-only t)
+            (collapsed (and (hash-table-p compose-preview--collapsed-groups)
+                            compose-preview--collapsed-groups)))
         (erase-buffer)
         (compose-preview-results-mode)
+        (setq-local compose-preview--collapsed-groups
+                    (or collapsed (make-hash-table :test #'equal))
+                    compose-preview--group-overlays
+                    (make-hash-table :test #'equal))
         (setq-local compose-preview--source-buffer source-buffer
+                    compose-preview--group-names
+                    (mapcar #'car (compose-preview--group-items previews))
                     default-directory module-root
                     header-line-format (propertize " Compose Preview: ready"
                                                     'face 'success))
-        (insert (format "Compose Preview  %s\n\n" module-root))
-        (dolist (preview previews)
-          (when-let* ((files (compose-preview-item-files preview)))
-            (insert (propertize (compose-preview-item-name preview) 'face 'bold) "\n")
-            (dolist (file files)
-              (insert-button "open image" 'follow-link t
-                             'action (lambda (_button) (find-file file)))
-              (insert "\n")
-              (compose-preview--insert-image file)
-              (insert "\n"))
-            (insert "\n")))
+        (insert (format "Compose Preview  %s\n" module-root))
+        (insert (propertize "TAB/RET toggle group  S-TAB toggle all\n\n"
+                            'face 'shadow))
+        (dolist (group (compose-preview--group-items previews))
+          (compose-preview--insert-group (car group) (cdr group)))
         (unless previews
           (dolist (file images)
             (insert (file-relative-name file module-root) "\n")
@@ -856,13 +997,15 @@ FORMAT-STRING and ARGS are passed to `format'."
                                    (concat "failed — " message) 'error)
     (compose-preview--log "%s" message)))
 
-(defun compose-preview--result-items (results output)
-  "Convert renderer RESULTS into preview items rooted at OUTPUT."
+(defun compose-preview--result-items (results output &optional metadata)
+  "Convert renderer RESULTS into preview items rooted at OUTPUT.
+Use METADATA keyed by preview id to preserve annotation display settings."
   (mapcar
    (lambda (result)
      (let* ((fqn (compose-preview--json-get result "methodFQN"))
             (path (compose-preview--json-get result "imagePath"))
             (id (compose-preview--json-get result "previewId"))
+            (details (and metadata (gethash id metadata)))
             (suffix (string-remove-prefix (concat fqn "_") id))
             (name (car (last (split-string fqn "\\." t))))
             (label (if (string-match-p "\\`[0-9]+\\'" suffix)
@@ -873,6 +1016,9 @@ FORMAT-STRING and ARGS are passed to `format'."
         :id id :name label
         :declaring-class (string-join (butlast (split-string fqn "\\." t)) ".")
         :method name
+        :preview-name (plist-get details :preview-name)
+        :group (plist-get details :group)
+        :source-file (plist-get details :source-file)
         :files (and path (list (expand-file-name path output))))))
    results))
 
@@ -895,7 +1041,8 @@ FORMAT-STRING and ARGS are passed to `format'."
       (let* ((target (plist-get context :target))
              (source (plist-get context :source-buffer))
              (items (compose-preview--result-items
-                     result-list (plist-get render :output))))
+                     result-list (plist-get render :output)
+                     (plist-get render :metadata))))
         (setq compose-preview--last-results-directory (plist-get render :output)
               compose-preview--last-result-items items
               compose-preview--last-source-buffer source)

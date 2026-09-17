@@ -303,14 +303,21 @@
             (cons "methodParams"
                   (list (list (cons "provider" "com.example.Provider"))))
             (cons "annotations"
-                  (list nil (list (cons "name" "Phone"))))))))
+                  (list nil (list (cons "name" "Phone")
+                                  (cons "group" "Devices"))))))))
     (unwind-protect
         (let* ((render (compose-preview--render-settings model previews target))
                (settings (compose-preview--read-json (plist-get render :settings)))
-               (screenshots (compose-preview--json-get settings "screenshots")))
+               (screenshots (compose-preview--json-get settings "screenshots"))
+               (metadata (plist-get render :metadata))
+               (phone-id "com.example.FooKt.Preview_Phone"))
           (should (= (length screenshots) 2))
           (should (equal (compose-preview--json-get settings "rClassJars")
                          '("/R.jar")))
+          (should (equal (plist-get (gethash phone-id metadata) :group)
+                         "Devices"))
+          (should (equal (plist-get (gethash phone-id metadata) :preview-name)
+                         "Phone"))
           (should (equal (compose-preview--json-get
                           (car (compose-preview--json-get
                                 (car screenshots) "methodParams"))
@@ -368,14 +375,74 @@
     (should (string-match-p "layoutlib.thread.profile.timeoutms"
                             (buffer-string)))))
 
+(ert-deftest compose-preview-groups-use-annotation-names-and-default-group ()
+  "Preview items are grouped and sorted by annotation group name."
+  (let* ((ungrouped (make-compose-preview-item :name "Plain"))
+         (tablet (make-compose-preview-item :name "Tablet" :group "Tablets"))
+         (phone (make-compose-preview-item :name "Phone" :group "Phones"))
+         (groups (compose-preview--group-items (list tablet ungrouped phone))))
+    (should (equal (mapcar #'car groups) '("Default" "Phones" "Tablets")))
+    (should (equal (mapcar #'compose-preview-item-name (cdr (assoc "Phones" groups)))
+                   '("Phone")))))
+
+(ert-deftest compose-preview-group-sections-toggle-visibility ()
+  "Group headers hide and reveal their Preview body without rebuilding it."
+  (with-temp-buffer
+    (compose-preview-results-mode)
+    (let ((inhibit-read-only t))
+      (cl-letf (((symbol-function 'compose-preview--insert-image)
+                 (lambda (_file) (insert "[image]"))))
+        (compose-preview--insert-group
+         "Devices"
+         (list (make-compose-preview-item :name "Phone" :files '("phone.png"))))))
+    (goto-char (point-min))
+    (should (equal (compose-preview--group-at-point) "Devices"))
+    (compose-preview-toggle-group)
+    (should (gethash "Devices" compose-preview--collapsed-groups))
+    (should (seq-some (lambda (overlay) (overlay-get overlay 'invisible))
+                      (overlays-in (point-min) (point-max))))
+    (compose-preview-toggle-group "Devices")
+    (should-not (gethash "Devices" compose-preview--collapsed-groups))
+    (should-not (seq-some (lambda (overlay) (overlay-get overlay 'invisible))
+                          (overlays-in (point-min) (point-max))))))
+
+(ert-deftest compose-preview-render-results-preserves-fold-state ()
+  "Refreshing the panel preserves collapsed Preview groups."
+  (let ((items (list (make-compose-preview-item
+                      :name "Phone" :group "Devices" :files '("phone.png")))))
+    (unwind-protect
+        (cl-letf (((symbol-function 'compose-preview--insert-image)
+                   (lambda (_file) (insert "[image]")))
+                  ((symbol-function 'compose-preview--display-panel) #'ignore))
+          (compose-preview--render-results "/tmp/" nil items nil)
+          (with-current-buffer compose-preview-results-buffer-name
+            (compose-preview-toggle-group "Devices")
+            (should (gethash "Devices" compose-preview--collapsed-groups)))
+          (compose-preview--render-results "/tmp/" nil items nil)
+          (with-current-buffer compose-preview-results-buffer-name
+            (should (gethash "Devices" compose-preview--collapsed-groups))
+            (should (eq (overlay-get
+                         (gethash "Devices" compose-preview--group-overlays)
+                         'invisible)
+                        'compose-preview-fold))))
+      (when-let* ((buffer (get-buffer compose-preview-results-buffer-name)))
+        (kill-buffer buffer)))))
+
 (ert-deftest compose-preview-result-items-preserve-preview-labels ()
   "Renderer results map to panel items and retain multipreview labels."
-  (let* ((results '((("methodFQN" . "com.example.FooKt.CardPreview")
-                     ("previewId" . "com.example.FooKt.CardPreview_Phone")
+  (let* ((id "com.example.FooKt.CardPreview_Phone")
+         (metadata (make-hash-table :test #'equal))
+         (results `((("methodFQN" . "com.example.FooKt.CardPreview")
+                     ("previewId" . ,id)
                      ("imagePath" . "phone.png"))))
-         (items (compose-preview--result-items results "/tmp/rendered/"))
+         (_ (puthash id '(:preview-name "Phone" :group "Devices"
+                          :source-file "Foo.kt") metadata))
+         (items (compose-preview--result-items results "/tmp/rendered/" metadata))
          (item (car items)))
     (should (equal (compose-preview-item-name item) "CardPreview - Phone"))
+    (should (equal (compose-preview-item-preview-name item) "Phone"))
+    (should (equal (compose-preview-item-group item) "Devices"))
+    (should (equal (compose-preview-item-source-file item) "Foo.kt"))
     (should (equal (compose-preview-item-files item)
                    '("/tmp/rendered/phone.png")))))
 
