@@ -446,6 +446,78 @@
     (should (equal (compose-preview-item-files item)
                    '("/tmp/rendered/phone.png")))))
 
+(ert-deftest compose-preview-result-items-preserve-render-issues ()
+  "Renderer issues stay attached to their individual Preview item."
+  (let* ((error '(("status" . "ERROR_RENDER_TASK")
+                  ("message" . "Could not inflate ComposeViewAdapter")))
+         (results `((("methodFQN" . "com.example.FooKt.Broken")
+                     ("previewId" . "com.example.FooKt.Broken_0")
+                     ("imagePath" . "broken.png")
+                     ("error" . ,error))))
+         (item (car (compose-preview--result-items results "/tmp/"))))
+    (should (equal (compose-preview-item-method-fqn item)
+                   "com.example.FooKt.Broken"))
+    (should (equal (compose-preview-item-error item) error))))
+
+(ert-deftest compose-preview-insert-preview-shows-image-and-issue ()
+  "A Preview can display its image and renderer issue together."
+  (with-temp-buffer
+    (cl-letf (((symbol-function 'file-readable-p) (lambda (_file) t))
+              ((symbol-function 'compose-preview--insert-image)
+               (lambda (_file) (insert "[image]"))))
+      (compose-preview--insert-preview
+       (make-compose-preview-item
+        :name "Broken" :files '("broken.png")
+        :error '(("message" . "Missing dependency")))))
+    (should (string-match-p "\\[image\\]" (buffer-string)))
+    (should (string-match-p "Issue: Missing dependency" (buffer-string)))))
+
+(ert-deftest compose-preview-goto-preview-method-selects-exact-owner ()
+  "Source navigation disambiguates methods with identical names."
+  (with-temp-buffer
+    (setq-local buffer-file-name "/tmp/Foo.kt")
+    (insert "package com.example\nclass First {\n  @Preview\n  fun Card() {}\n}\n"
+            "class Second {\n  @Preview\n  fun Card() {}\n}\n")
+    (should (compose-preview--goto-preview-method
+             (make-compose-preview-item
+              :method "Card" :method-fqn "com.example.Second.Card")))
+    (should (looking-at-p "fun Card"))
+    (should (save-excursion (re-search-backward "class Second" nil t)))))
+
+(ert-deftest compose-preview-finish-render-keeps-partial-results ()
+  "Individual render failures do not discard successful Preview results."
+  (let* ((results-file (make-temp-file "compose-preview-results" nil ".json"))
+         (compose-preview--last-result-items nil)
+         rendered status)
+    (unwind-protect
+        (progn
+          (with-temp-file results-file
+            (insert "{\"screenshotResults\":["
+                    "{\"methodFQN\":\"com.example.FooKt.Good\","
+                    "\"previewId\":\"com.example.FooKt.Good_0\","
+                    "\"imagePath\":\"good.png\"},"
+                    "{\"methodFQN\":\"com.example.FooKt.Bad\","
+                    "\"previewId\":\"com.example.FooKt.Bad_0\","
+                    "\"error\":{\"message\":\"boom\"}}]}"))
+          (with-current-buffer (get-buffer-create compose-preview-results-buffer-name)
+            (compose-preview-results-mode))
+          (cl-letf (((symbol-function 'compose-preview--render-results)
+                     (lambda (_root _images items _source)
+                       (setq rendered items)))
+                    ((symbol-function 'compose-preview--log) #'ignore))
+            (compose-preview--finish-render
+             `(:target (:module-root "/tmp/")
+               :render (:results ,results-file :output "/tmp/")))
+            (with-current-buffer compose-preview-results-buffer-name
+              (setq status header-line-format)))
+          (should (= (length rendered) 2))
+          (should-not (compose-preview-item-error (car rendered)))
+          (should (compose-preview-item-error (cadr rendered)))
+          (should (string-match-p "1 issue" (substring-no-properties status))))
+      (delete-file results-file)
+      (when-let* ((buffer (get-buffer compose-preview-results-buffer-name)))
+        (kill-buffer buffer)))))
+
 (ert-deftest compose-preview-stale-render-sentinel-is-ignored ()
   "A superseded renderer process cannot replace current panel results."
   (let ((compose-preview--generation 2)

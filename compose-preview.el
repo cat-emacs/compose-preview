@@ -170,11 +170,13 @@ Each entry is (PROJECT-ROOT . TARGET), where TARGET is a plist containing
   id
   declaring-class
   method
+  method-fqn
   name
   preview-name
   group
   source-file
-  files)
+  files
+  error)
 
 (defconst compose-preview--default-group "Default"
   "Display name for Preview annotations without an explicit group.")
@@ -193,6 +195,7 @@ Each entry is (PROJECT-ROOT . TARGET), where TARGET is a plist containing
     (define-key map (kbd "TAB") #'compose-preview-toggle-group)
     (define-key map (kbd "<backtab>") #'compose-preview-toggle-all-groups)
     (define-key map (kbd "RET") #'compose-preview-toggle-group)
+    (define-key map (kbd "o") #'compose-preview-goto-source)
     (define-key map (kbd "g") #'compose-preview-panel-refresh)
     (define-key map (kbd "l") #'compose-preview-open-log)
     (define-key map (kbd "q") #'compose-preview-panel-quit)
@@ -534,6 +537,16 @@ Each entry is (PROJECT-ROOT . TARGET), where TARGET is a plist containing
             (setq segment-start (1+ brace)))))
       (nreverse (delq nil stack)))))
 
+(defun compose-preview--kotlin-method-fqn (function-start method)
+  "Return JVM FQN for METHOD declared at FUNCTION-START."
+  (let* ((package (compose-preview--current-package))
+         (owners (compose-preview--enclosing-kotlin-owners function-start))
+         (declaring-class
+          (if owners
+              (string-join owners "$")
+            (concat (file-name-base buffer-file-name) "Kt"))))
+    (string-join (delq nil (list package declaring-class method)) ".")))
+
 (defun compose-preview--current-preview-method-fqn ()
   "Return fully qualified JVM name of the Compose Preview at point."
   (when (and buffer-file-name (string-match-p "\\.kt\\'" buffer-file-name))
@@ -543,13 +556,7 @@ Each entry is (PROJECT-ROOT . TARGET), where TARGET is a plist containing
         (let ((function-start (point))
               (method (match-string-no-properties 1)))
           (when (compose-preview--function-has-preview-annotation-p function-start)
-            (let* ((package (compose-preview--current-package))
-                   (owners (compose-preview--enclosing-kotlin-owners function-start))
-                   (declaring-class
-                    (if owners
-                        (string-join owners "$")
-                      (concat (file-name-base buffer-file-name) "Kt"))))
-              (string-join (delq nil (list package declaring-class method)) "."))))))))
+            (compose-preview--kotlin-method-fqn function-start method)))))))
 
 (defun compose-preview--current-preview-method ()
   "Return the containing Compose @Preview function name at point."
@@ -562,6 +569,50 @@ Each entry is (PROJECT-ROOT . TARGET), where TARGET is a plist containing
           (when (compose-preview--function-has-preview-annotation-p
                  function-start)
             name))))))
+
+(defun compose-preview--source-buffer-for-item (preview)
+  "Return the source buffer associated with PREVIEW."
+  (let ((source compose-preview--source-buffer)
+        (name (compose-preview-item-source-file preview)))
+    (cond
+     ((and (buffer-live-p source)
+           (or (null name)
+               (when-let* ((file (buffer-local-value 'buffer-file-name source)))
+                 (equal name (file-name-nondirectory file)))))
+      source)
+     ((and name
+           (seq-find (lambda (buffer)
+                       (when-let* ((file (buffer-local-value 'buffer-file-name buffer)))
+                         (and (equal name (file-name-nondirectory file))
+                              (file-in-directory-p file default-directory))))
+                     (buffer-list))))
+     (name
+      (when-let* ((matches (directory-files-recursively
+                            default-directory
+                            (concat "/" (regexp-quote name) "\\'") nil))
+                  (file (or (seq-find (lambda (candidate)
+                                       (string-match-p "/src/" candidate))
+                                     matches)
+                            (car matches))))
+        (find-file-noselect file))))))
+
+(defun compose-preview--goto-preview-method (preview)
+  "Move point to the declaration represented by PREVIEW."
+  (let ((fqn (compose-preview-item-method-fqn preview))
+        (method (compose-preview-item-method preview))
+        found)
+    (goto-char (point-min))
+    (while (and (not found)
+                (re-search-forward compose-preview--kotlin-function-regexp nil t))
+      (let ((start (match-beginning 0))
+            (name (match-string-no-properties 1)))
+        (when (and (equal name method)
+                   (equal fqn (compose-preview--kotlin-method-fqn start name)))
+          (setq found start))))
+    (when found
+      (goto-char found)
+      (back-to-indentation))
+    found))
 
 (defun compose-preview--android-flavors-available-p ()
   "Return non-nil when android-mode flavor helpers are available."
@@ -997,17 +1048,65 @@ Use GENERATION to isolate concurrent or superseded render attempts."
     (dolist (group groups)
       (compose-preview--set-group-collapsed group collapse))))
 
+(defun compose-preview-goto-source (&optional preview)
+  "Visit the source declaration for PREVIEW or the item at point."
+  (interactive)
+  (let ((preview (or preview (get-text-property (point) 'compose-preview-item))))
+    (unless preview
+      (user-error "Point is not on a Compose Preview"))
+    (let ((buffer (compose-preview--source-buffer-for-item preview)))
+      (unless (buffer-live-p buffer)
+        (user-error "Source file for %s was not found"
+                    (compose-preview-item-name preview)))
+      (pop-to-buffer buffer)
+      (unless (compose-preview--goto-preview-method preview)
+        (user-error "Source declaration for %s was not found"
+                    (compose-preview-item-name preview))))))
+
+(defun compose-preview--error-summary (error)
+  "Return a concise user-facing summary for renderer ERROR."
+  (or (and-let* ((message (compose-preview--json-get error "message")))
+        (unless (string-empty-p message) message))
+      (and-let* ((missing (compose-preview--json-get error "missingClasses")))
+        (format "Missing class%s: %s" (if (= (length missing) 1) "" "es")
+                (string-join missing ", ")))
+      (and-let* ((problem (car (compose-preview--json-get error "problems")))
+                 (html (compose-preview--json-get problem "html")))
+        (string-trim (replace-regexp-in-string "<[^>]+>" " " html)))
+      (compose-preview--json-get error "status")
+      "Unknown rendering issue"))
+
 (defun compose-preview--insert-preview (preview)
-  "Insert PREVIEW image and actions in the current results buffer."
-  (when-let* ((files (compose-preview-item-files preview)))
-    (insert (propertize (compose-preview-item-name preview) 'face 'bold) "\n")
+  "Insert PREVIEW image, issue summary, and actions in the results buffer."
+  (let ((start (point))
+        (files (seq-filter #'file-readable-p
+                           (compose-preview-item-files preview)))
+        (error (compose-preview-item-error preview)))
+    (insert-text-button (compose-preview-item-name preview)
+                        'face 'bold 'follow-link t
+                        'help-echo "Visit Preview source (o)"
+                        'compose-preview-item preview
+                        'action (lambda (button)
+                                  (compose-preview-goto-source
+                                   (button-get button 'compose-preview-item))))
+    (insert "\n")
     (dolist (file files)
       (insert-button "open image" 'follow-link t
                      'action (lambda (_button) (find-file file)))
       (insert "\n")
       (compose-preview--insert-image file)
       (insert "\n"))
-    (insert "\n")))
+    (when error
+      (insert (propertize (concat "Issue: " (compose-preview--error-summary error))
+                          'face 'error)
+              "\n")
+      (insert-text-button "open render log" 'follow-link t
+                          'action (lambda (_button) (compose-preview-open-log)))
+      (insert "\n"))
+    (unless (or files error)
+      (insert (propertize "No image was produced." 'face 'error) "\n"))
+    (insert "\n")
+    (put-text-property start (point) 'compose-preview-item preview)))
 
 (defun compose-preview--insert-group (name previews)
   "Insert collapsible group NAME containing PREVIEWS."
@@ -1049,8 +1148,9 @@ Use GENERATION to isolate concurrent or superseded render attempts."
                     header-line-format (propertize " Compose Preview: ready"
                                                     'face 'success))
         (insert (format "Compose Preview  %s\n" module-root))
-        (insert (propertize "TAB/RET toggle group  S-TAB toggle all\n\n"
-                            'face 'shadow))
+        (insert (propertize
+                 "TAB/RET toggle group  S-TAB toggle all  o visit source\n\n"
+                 'face 'shadow))
         (dolist (group (compose-preview--group-items previews))
           (compose-preview--insert-group (car group) (cdr group)))
         (unless previews
@@ -1109,10 +1209,12 @@ Use METADATA keyed by preview id to preserve annotation display settings."
         :id id :name label
         :declaring-class (string-join (butlast (split-string fqn "\\." t)) ".")
         :method name
+        :method-fqn fqn
         :preview-name (plist-get details :preview-name)
         :group (plist-get details :group)
         :source-file (plist-get details :source-file)
-        :files (and path (list (expand-file-name path output))))))
+        :files (and path (list (expand-file-name path output)))
+        :error (compose-preview--json-get result "error"))))
    results))
 
 (defun compose-preview--finish-render (context)
@@ -1127,15 +1229,17 @@ Use METADATA keyed by preview id to preserve annotation display settings."
     (cond
      (global-error
       (compose-preview--fail context "renderer failed: %s" global-error))
-     (failed
-      (compose-preview--fail context "%d preview images failed; press l for the log"
-                             (length failed)))
      (t
       (let* ((target (plist-get context :target))
              (source (plist-get context :source-buffer))
              (items (compose-preview--result-items
                      result-list (plist-get render :output)
-                     (plist-get render :metadata))))
+                     (plist-get render :metadata)))
+             (failed-count (length failed))
+             (rendered-count
+              (seq-count (lambda (result)
+                           (compose-preview--json-get result "imagePath"))
+                         result-list)))
         (setq compose-preview--last-results-directory (plist-get render :output)
               compose-preview--last-result-items items
               compose-preview--last-source-buffer source)
@@ -1143,7 +1247,16 @@ Use METADATA keyed by preview id to preserve annotation display settings."
          (plist-get target :module-root)
          (apply #'append (mapcar #'compose-preview-item-files items))
          items source)
-        (compose-preview--log "rendered %d preview images" (length result-list)))))))
+        (when (> failed-count 0)
+          (with-current-buffer compose-preview-results-buffer-name
+            (setq header-line-format
+                  (propertize
+                   (format " Compose Preview: ready — %d issue%s"
+                           failed-count (if (= failed-count 1) "" "s"))
+                   'face 'warning))))
+        (compose-preview--log
+         "rendered %d preview images; %d preview%s reported issues"
+         rendered-count failed-count (if (= failed-count 1) "" "s")))))))
 
 (defun compose-preview--render-sentinel (process _event)
   "Handle completion of asynchronous renderer PROCESS."

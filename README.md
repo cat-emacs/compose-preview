@@ -41,13 +41,18 @@ a panel on the right and returns immediately. Inside the panel:
 
 - click a group title, or press `TAB` / `RET` on it, to fold or unfold it;
 - `S-TAB` folds all groups when all are open, otherwise it unfolds all groups;
+- click a Preview title, or press `o` on its card, to visit the exact source
+  declaration;
 - `g` refreshes from its associated source buffer;
 - `l` opens the Gradle and renderer log;
 - `q` closes the side window.
 
 Groups follow Android Studio Preview semantics: explicit `@Preview(group =
 "...")` values are sorted by display name and ungrouped previews use `Default`.
-Fold state is preserved across automatic and manual refreshes.
+Fold state is preserved across automatic and manual refreshes. Renderer issues
+are isolated to their Preview cards: successful images remain visible, and a
+card can show both its image and a fidelity warning with a link to the render
+log.
 
 Run `M-x compose-preview-auto-refresh-mode` in a source buffer to refresh all
 previews in that file after each save. Saves are debounced by
