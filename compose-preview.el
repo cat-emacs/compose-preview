@@ -73,6 +73,16 @@ A float means a fraction of the frame width; an integer means columns."
   :type 'number
   :group 'compose-preview)
 
+(defcustom compose-preview-file-switch-delay 0.25
+  "Seconds to debounce preview refreshes after selecting another file."
+  :type 'number
+  :group 'compose-preview)
+
+(defcustom compose-preview-follow-current-file t
+  "Whether an active Preview panel should follow the selected Kotlin file."
+  :type 'boolean
+  :group 'compose-preview)
+
 (defcustom compose-preview-use-android-mode-flavors t
   "Whether to reuse android-mode's module and variant discovery."
   :type 'boolean
@@ -113,6 +123,18 @@ A float means a fraction of the frame width; an integer means columns."
 
 (defvar compose-preview--generation 0
   "Generation used to ignore stale asynchronous process sentinels.")
+
+(defvar compose-preview--follow-active nil
+  "Non-nil while the Preview panel follows selected source files.")
+
+(defvar compose-preview--follow-buffer nil
+  "Last selected source buffer observed by Preview file following.")
+
+(defvar compose-preview--follow-timer nil
+  "Pending timer for a Preview refresh after switching files.")
+
+(defvar compose-preview--follow-refresh nil
+  "Non-nil while refreshing because the selected file changed.")
 
 (defvar-local compose-preview--source-buffer nil
   "Source buffer associated with a Compose preview results buffer.")
@@ -173,7 +195,7 @@ Each entry is (PROJECT-ROOT . TARGET), where TARGET is a plist containing
     (define-key map (kbd "RET") #'compose-preview-toggle-group)
     (define-key map (kbd "g") #'compose-preview-panel-refresh)
     (define-key map (kbd "l") #'compose-preview-open-log)
-    (define-key map (kbd "q") #'quit-window)
+    (define-key map (kbd "q") #'compose-preview-panel-quit)
     map)
   "Keymap for `compose-preview-results-mode'.")
 
@@ -184,6 +206,77 @@ Each entry is (PROJECT-ROOT . TARGET), where TARGET is a plist containing
     (setq-local compose-preview--collapsed-groups (make-hash-table :test #'equal)))
   (setq-local compose-preview--group-overlays (make-hash-table :test #'equal))
   (add-to-invisibility-spec 'compose-preview-fold))
+
+(defun compose-preview--cancel-follow-timer ()
+  "Cancel a pending Preview refresh caused by switching files."
+  (when (timerp compose-preview--follow-timer)
+    (cancel-timer compose-preview--follow-timer))
+  (setq compose-preview--follow-timer nil))
+
+(defun compose-preview--kotlin-source-buffer-p (buffer)
+  "Return non-nil when BUFFER visits a Kotlin source file."
+  (and (buffer-live-p buffer)
+       (buffer-local-value 'buffer-file-name buffer)
+       (string-match-p "\\.kt\\'" (buffer-local-value 'buffer-file-name buffer))))
+
+(defun compose-preview--hide-panel ()
+  "Hide the Preview side window without ending its follow session."
+  (when-let* ((window (get-buffer-window compose-preview-results-buffer-name t)))
+    (quit-window nil window)))
+
+(defun compose-preview--cancel-process ()
+  "Cancel active Preview work and invalidate its sentinels."
+  (cl-incf compose-preview--generation)
+  (when (process-live-p compose-preview--process)
+    (delete-process compose-preview--process))
+  (setq compose-preview--process nil))
+
+(defun compose-preview--follow-refresh-buffer (buffer)
+  "Refresh Preview for selected Kotlin BUFFER when still current."
+  (setq compose-preview--follow-timer nil)
+  (when (and compose-preview--follow-active
+             (eq buffer (window-buffer (selected-window)))
+             (compose-preview--kotlin-source-buffer-p buffer))
+    (with-current-buffer buffer
+      (let ((compose-preview--follow-refresh t)
+            (compose-preview--refresh-all-in-file t))
+        (compose-preview-refresh)))))
+
+(defun compose-preview--follow-selected-buffer ()
+  "Update an active Preview session for the selected buffer."
+  (when (and compose-preview--follow-active
+             compose-preview-follow-current-file
+             (not (minibufferp)))
+    (let ((buffer (window-buffer (selected-window))))
+      (unless (or (eq buffer compose-preview--follow-buffer)
+                  (eq buffer (get-buffer compose-preview-results-buffer-name))
+                  (eq buffer (get-buffer compose-preview-log-buffer-name)))
+        (setq compose-preview--follow-buffer buffer)
+        (compose-preview--cancel-follow-timer)
+        (compose-preview--cancel-process)
+        (if (compose-preview--kotlin-source-buffer-p buffer)
+            (setq compose-preview--follow-timer
+                  (run-with-timer compose-preview-file-switch-delay nil
+                                  #'compose-preview--follow-refresh-buffer buffer))
+          (compose-preview--cancel-process)
+          (compose-preview--hide-panel))))))
+
+(defun compose-preview--start-following (source-buffer)
+  "Start the Preview follow session at SOURCE-BUFFER."
+  (when compose-preview-follow-current-file
+    (setq compose-preview--follow-active t
+          compose-preview--follow-buffer source-buffer)
+    (add-hook 'post-command-hook #'compose-preview--follow-selected-buffer)))
+
+(defun compose-preview-panel-quit ()
+  "Close the Preview panel and stop following selected files."
+  (interactive)
+  (setq compose-preview--follow-active nil
+        compose-preview--follow-buffer nil)
+  (compose-preview--cancel-follow-timer)
+  (compose-preview--cancel-process)
+  (remove-hook 'post-command-hook #'compose-preview--follow-selected-buffer)
+  (quit-window))
 
 (defun compose-preview-open-log ()
   "Show the Compose preview build and renderer log."
@@ -1149,9 +1242,15 @@ Use METADATA keyed by preview id to preserve annotation display settings."
          (previews (compose-preview--select-model-previews model source-file method))
          (target (plist-get context :target)))
     (if (null previews)
-        (compose-preview--fail context "no previews found for %s"
-                               (or (and source-file (file-name-nondirectory source-file))
-                                   (plist-get target :module-path)))
+        (if (plist-get context :follow-refresh)
+            (progn
+              (compose-preview--hide-panel)
+              (compose-preview--log "no previews found for %s"
+                                    (file-name-nondirectory source-file)))
+          (compose-preview--fail context "no previews found for %s"
+                                 (or (and source-file
+                                          (file-name-nondirectory source-file))
+                                     (plist-get target :module-path))))
       (condition-case err
           (let ((launcher (compose-preview--launcher-spec model))
                 (render (compose-preview--render-settings
@@ -1243,6 +1342,8 @@ prompt for the module and full variant name."
          (default-directory project-root)
          (gradle-args (compose-preview--gradle-arguments task-path init-script))
          context process)
+    (unless compose-preview--follow-refresh
+      (compose-preview--start-following source-buffer))
     (setq target (compose-preview--cache-target target))
     (when (process-live-p compose-preview--process)
       (delete-process compose-preview--process))
@@ -1253,6 +1354,7 @@ prompt for the module and full variant name."
     (setq context (list :generation generation :target target
                         :source-buffer source-buffer :source-file source-file
                         :preview-method preview-method
+                        :follow-refresh compose-preview--follow-refresh
                         :gradle-model-file gradle-model-file
                         :model-file model-file :log-buffer log-buffer)
           process (make-process

@@ -475,6 +475,94 @@
       (when (buffer-live-p source)
         (kill-buffer source)))))
 
+(ert-deftest compose-preview-disabled-file-following-installs-no-hook ()
+  "Disabling file following avoids installing the command hook."
+  (let ((compose-preview-follow-current-file nil)
+        (compose-preview--follow-active nil)
+        installed)
+    (cl-letf (((symbol-function 'add-hook) (lambda (&rest _) (setq installed t))))
+      (compose-preview--start-following 'source)
+      (should-not installed)
+      (should-not compose-preview--follow-active))))
+
+(ert-deftest compose-preview-following-schedules-selected-kotlin-buffer ()
+  "An active Preview session refreshes the newly selected Kotlin file."
+  (let ((source (generate-new-buffer " *compose-preview-follow-source*"))
+        (compose-preview--follow-active t)
+        (compose-preview-follow-current-file t)
+        scheduled cancelled)
+    (unwind-protect
+        (progn
+          (with-current-buffer source
+            (setq-local buffer-file-name "/tmp/Next.kt"))
+          (cl-letf (((symbol-function 'selected-window) (lambda () 'window))
+                    ((symbol-function 'window-buffer) (lambda (_window) source))
+                    ((symbol-function 'compose-preview--cancel-process)
+                     (lambda () (setq cancelled t)))
+                    ((symbol-function 'run-with-timer)
+                     (lambda (_delay _repeat function buffer)
+                       (setq scheduled (list function buffer))
+                       'timer)))
+            (compose-preview--follow-selected-buffer))
+          (should cancelled)
+          (should (equal scheduled
+                         (list #'compose-preview--follow-refresh-buffer source))))
+      (kill-buffer source))))
+
+(ert-deftest compose-preview-following-hides-files-without-previews ()
+  "Following a Kotlin file without Preview declarations hides the panel."
+  (let (hidden failed)
+    (cl-letf (((symbol-function 'compose-preview--read-json)
+               (lambda (_file) '(("previews"))))
+              ((symbol-function 'compose-preview--select-model-previews)
+               (lambda (&rest _) nil))
+              ((symbol-function 'compose-preview--hide-panel)
+               (lambda () (setq hidden t)))
+              ((symbol-function 'compose-preview--fail)
+               (lambda (&rest _) (setq failed t)))
+              ((symbol-function 'compose-preview--log) #'ignore))
+      (compose-preview--start-render
+       '(:model-file "/tmp/model.json"
+         :source-file "/tmp/Plain.kt"
+         :follow-refresh t
+         :target (:module-path ":app")))
+      (should hidden)
+      (should-not failed))))
+
+(ert-deftest compose-preview-following-hides-panel-for-non-kotlin-buffer ()
+  "An active Preview session closes its panel outside Kotlin files."
+  (let ((other (generate-new-buffer " *compose-preview-follow-other*"))
+        (compose-preview--follow-active t)
+        (compose-preview-follow-current-file t)
+        cancelled hidden)
+    (unwind-protect
+        (cl-letf (((symbol-function 'selected-window) (lambda () 'window))
+                  ((symbol-function 'window-buffer) (lambda (_window) other))
+                  ((symbol-function 'compose-preview--cancel-process)
+                   (lambda () (setq cancelled t)))
+                  ((symbol-function 'compose-preview--hide-panel)
+                   (lambda () (setq hidden t))))
+          (compose-preview--follow-selected-buffer)
+          (should cancelled)
+          (should hidden))
+      (kill-buffer other))))
+
+(ert-deftest compose-preview-panel-quit-stops-file-following ()
+  "Manually closing Preview stops automatic file following."
+  (let ((compose-preview--follow-active t)
+        (compose-preview--follow-buffer 'source)
+        cancelled quit)
+    (cl-letf (((symbol-function 'compose-preview--cancel-follow-timer) #'ignore)
+              ((symbol-function 'compose-preview--cancel-process)
+               (lambda () (setq cancelled t)))
+              ((symbol-function 'remove-hook) #'ignore)
+              ((symbol-function 'quit-window) (lambda (&rest _) (setq quit t))))
+      (compose-preview-panel-quit)
+      (should-not compose-preview--follow-active)
+      (should-not compose-preview--follow-buffer)
+      (should cancelled)
+      (should quit))))
+
 (ert-deftest compose-preview-failure-normalizes-package-prefix ()
   "Panel failures do not repeat an existing compose-preview prefix."
   (let (status logged)

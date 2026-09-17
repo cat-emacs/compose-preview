@@ -52,7 +52,12 @@ Fold state is preserved across automatic and manual refreshes.
 Run `M-x compose-preview-auto-refresh-mode` in a source buffer to refresh all
 previews in that file after each save. Saves are debounced by
 `compose-preview-auto-refresh-delay`; automatic refresh is buffer-local and is
-off by default. `compose-preview-panel-width` controls the side-window width.
+off by default. While a Preview panel is active, selecting another Kotlin file
+refreshes it after `compose-preview-file-switch-delay`; selecting a non-Kotlin
+buffer hides the panel. Pressing `q` ends this follow session, and the next
+manual refresh starts it again. Set `compose-preview-follow-current-file` to nil
+to disable file following. `compose-preview-panel-width` controls the side-window
+width.
 
 ### Preview discovery
 
