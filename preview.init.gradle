@@ -1,653 +1,373 @@
-// Gradle init script used by compose-preview.el.
+// Collects everything Android Studio's Compose preview renderer needs for one
+// Android module and writes it as JSON for the Emacs side to consume.
 //
-// It injects Paparazzi into the selected Android module and generates a
-// temporary JUnit test class that snapshots @Preview composables.
+// Nothing is injected into the project: no generated sources, no extra test
+// plugins, no build file rewriting. The task only reads variant artifacts and
+// resolves the layoutlib data plus the standalone renderer from Maven, exactly
+// like AGP's own Compose screenshot support does.
 
-import org.gradle.api.Project
+import com.android.tools.preview.multipreview.PreviewMethodFinder
+import groovy.json.JsonOutput
+import org.gradle.api.DefaultTask
+import org.gradle.api.attributes.Attribute
+import org.gradle.api.file.ConfigurableFileCollection
+import org.gradle.api.file.Directory
+import org.gradle.api.file.DirectoryProperty
+import org.gradle.api.file.RegularFile
+import org.gradle.api.file.RegularFileProperty
+import org.gradle.api.provider.ListProperty
+import org.gradle.api.provider.Property
+import org.gradle.api.tasks.Input
+import org.gradle.api.tasks.InputFiles
+import org.gradle.api.tasks.Internal
+import org.gradle.api.tasks.Optional
+import org.gradle.api.tasks.OutputFile
+import org.gradle.api.tasks.TaskAction
+
+import java.lang.reflect.InvocationHandler
+import java.lang.reflect.Method
+import java.lang.reflect.Proxy
 import java.nio.file.Files
+import java.nio.file.Path
 import java.nio.file.StandardCopyOption
+import java.util.zip.ZipInputStream
 
-def selectedPath = System.getenv("COMPOSE_PREVIEW_MODULE_PATH")
-def selectedVariant = System.getenv("COMPOSE_PREVIEW_VARIANT") ?: "debug"
-def selectedVariantName = selectedVariant.capitalize()
-def selectedSourceFile = System.getenv("COMPOSE_PREVIEW_SOURCE_FILE") ?: ""
-def selectedPreviewMethod = System.getenv("COMPOSE_PREVIEW_METHOD") ?: ""
-def generatedRoot = System.getenv("COMPOSE_PREVIEW_GENERATED_DIR")
-def className = "ComposePreviewPaparazziTest"
-def desktopClassName = "ComposePreviewDesktopTest"
-def providerName = "ComposablePreviewProvider"
-def paparazziVersion = System.getenv("COMPOSE_PREVIEW_PAPARAZZI_VERSION") ?: "2.0.0-alpha02"
-def roborazziVersion = System.getenv("COMPOSE_PREVIEW_ROBORAZZI_VERSION") ?: "1.50.0"
-def previewScannerVersion = System.getenv("COMPOSE_PREVIEW_SCANNER_VERSION") ?: "0.9.0"
-def testParameterInjectorVersion = System.getenv("COMPOSE_PREVIEW_TEST_PARAMETER_INJECTOR_VERSION") ?: "1.20"
-def junitVintageVersion = System.getenv("COMPOSE_PREVIEW_JUNIT_VINTAGE_VERSION") ?: "6.1.0"
-def junit4Version = System.getenv("COMPOSE_PREVIEW_JUNIT4_VERSION") ?: "4.13.2"
-def sourceTemplateFile = new File(
-  System.getenv("COMPOSE_PREVIEW_TEMPLATE_FILE") ?: "compose-preview-paparazzi-test.template.kt"
-)
+def layoutlibVersion = System.getenv("COMPOSE_PREVIEW_LAYOUTLIB_VERSION") ?: "16.1.0-jdk17"
+def rendererVersion = System.getenv("COMPOSE_PREVIEW_RENDERER_VERSION") ?: "0.0.1-alpha16"
+def targetModulePath = System.getenv("COMPOSE_PREVIEW_MODULE_PATH")
+def targetVariant = System.getenv("COMPOSE_PREVIEW_VARIANT") ?: "debug"
+def modelFilePath = System.getenv("COMPOSE_PREVIEW_MODEL_FILE")
 
-def androidPluginIds = [
-  "com.android.application",
-  "com.android.library",
-  "com.android.dynamic-feature"
-]
-def androidKmpPluginId = "com.android.kotlin.multiplatform.library"
-
-def sanitize = { String value ->
-  value.replaceAll(/[^A-Za-z0-9_]/, "_")
-}
-
-def buildStateDirs = { Project project ->
-  [
-    new File(project.buildDir, "kspCaches/${selectedVariant}"),
-    new File(project.buildDir, "kotlin/compile${selectedVariantName}Kotlin/cacheable"),
-    new File(project.buildDir, "kotlin/compile${selectedVariantName}Kotlin/classpath-snapshot"),
-    new File(project.buildDir, "kotlin/compile${selectedVariantName}UnitTestKotlin/cacheable"),
-    new File(project.buildDir, "kotlin/compile${selectedVariantName}UnitTestKotlin/classpath-snapshot")
-  ]
-}
-
-def buildStateRoot = { Project project ->
-  new File(project.rootProject.projectDir, ".gradle/compose-preview/build-state/${sanitize(project.path)}/${selectedVariant}")
-}
-
-def buildStateManifest = { Project project ->
-  new File(buildStateRoot(project), "files.txt")
-}
-
-def variantRJar = { Project project ->
-  new File(
-    project.buildDir,
-    "intermediates/compile_and_runtime_not_namespaced_r_class_jar/${selectedVariant}/process${selectedVariantName}Resources/R.jar"
-  )
-}
-
-def generatedPackageName = { Project project ->
-  def namespace = project.extensions.findByName("android")?.namespace ?: project.group?.toString()
-  (namespace ?: "compose.preview.generated") + ".composepreview"
-}
-
-def generatedTestClassName = { Project project ->
-  "${generatedPackageName(project)}.${className}"
-}
-
-def generatedDesktopTestClassName = { Project project ->
-  "${generatedPackageName(project)}.${desktopClassName}"
-}
-
-def manifestFile = { Project project ->
-  new File(
-    project.rootProject.projectDir,
-    ".gradle/compose-preview/${sanitize(project.path)}/${selectedVariant}/previews.tsv"
-  )
-}
-
-def previewOutputDir = { Project project ->
-  new File(project.buildDir, "compose-preview/${selectedVariant}")
-}
-
-def kotlinString = { String value ->
-  "\"" + value.replace("\\", "\\\\").replace("\"", "\\\"") + "\""
-}
-
-def sourceRoots = { Project project ->
-  def roots = new LinkedHashSet<File>()
-  def android = project.extensions.findByName("android")
-  android?.sourceSets?.each { sourceSet ->
-    sourceSet?.java?.srcDirs?.each { roots.add(it) }
-    if (sourceSet?.hasProperty("kotlin")) {
-      sourceSet.kotlin.srcDirs.each { roots.add(it) }
+initscript {
+    def version = System.getenv("COMPOSE_PREVIEW_DETECTOR_VERSION") ?: "32.5.0-alpha05"
+    repositories {
+        google()
+        mavenCentral()
     }
-  }
-  [
-    "src/main/kotlin",
-    "src/main/java",
-    "src/${selectedVariant}/kotlin",
-    "src/${selectedVariant}/java"
-  ].each { path -> roots.add(new File(project.projectDir, path)) }
-  roots
-    .findAll { it.isDirectory() }
-    .collect { it.absolutePath }
+    dependencies {
+        classpath "com.android.tools.compose:compose-preview-detector:${version}"
+    }
 }
 
-def kotlinMultiplatformSourceRoots = { Project project ->
-  def roots = new LinkedHashSet<File>()
-  def kotlin = project.extensions.findByName("kotlin")
-  if (kotlin == null || !kotlin.hasProperty("targets")) {
-    return []
-  }
-  kotlin.targets.matching { target ->
-    def platformType = target.hasProperty("platformType") ? target.platformType?.name : null
-    target.name == "desktop" || platformType == "jvm" || platformType == "androidJvm" || platformType == "android"
-  }.each { target ->
-    target.compilations?.each { compilation ->
-      if (["main", "test", selectedVariant, "${selectedVariant}Test"].contains(compilation.name)) {
-        compilation.allKotlinSourceSets?.each { sourceSet ->
-          sourceSet.kotlin?.srcDirs?.each { roots.add(it) }
+abstract class ComposePreviewModelTask extends DefaultTask {
+
+    @InputFiles
+    abstract ListProperty<RegularFile> getAllJars()
+
+    @InputFiles
+    abstract ListProperty<Directory> getAllDirs()
+
+    @InputFiles
+    abstract ListProperty<RegularFile> getProjectJars()
+
+    @InputFiles
+    abstract ListProperty<Directory> getProjectDirs()
+
+    @InputFiles
+    abstract ConfigurableFileCollection getDependencyClasses()
+
+    @InputFiles
+    abstract ConfigurableFileCollection getDependencyRClasses()
+
+    @InputFiles
+    @Optional
+    abstract ConfigurableFileCollection getAggregatedRClassJar()
+
+    @InputFiles
+    abstract ConfigurableFileCollection getLayoutlibRuntimeJar()
+
+    @InputFiles
+    abstract ConfigurableFileCollection getLayoutlibResourcesJar()
+
+    @InputFiles
+    abstract ConfigurableFileCollection getRendererClasspath()
+
+    @InputFiles
+    @Optional
+    abstract ConfigurableFileCollection getResourceApkCandidates()
+
+    @Input
+    abstract Property<String> getNamespace()
+
+    @Input
+    abstract Property<String> getModulePath()
+
+    @Input
+    abstract Property<String> getProjectRootPath()
+
+    @Input
+    abstract Property<String> getModuleRootPath()
+
+    @Input
+    abstract Property<String> getVariantName()
+
+    @Internal
+    abstract DirectoryProperty getLayoutlibDataDir()
+
+    @OutputFile
+    abstract RegularFileProperty getModelFile()
+
+    @TaskAction
+    void writeModel() {
+        def layoutlibDir = prepareLayoutlibData()
+        def projectDirFiles = projectDirs.get().collect { it.asFile }
+        def projectJarFiles = projectJars.get().collect { it.asFile }
+        def scopedFiles = allDirs.get().collect { it.asFile } + allJars.get().collect { it.asFile }
+        def projectClassPath = (projectDirFiles + projectJarFiles).findAll { it.exists() }
+        // Dependency R classes are a separate artifact from dependency classes,
+        // and layoutlib needs both to inflate library-provided views. The local
+        // test component's non-namespaced R jar carries every dependency's R
+        // class, which is what the renderer resolves resource ids against.
+        def aggregatedRJars = aggregatedRClassJar.files.findAll { it.name == "R.jar" }
+        def rClassJars = ((dependencyRClasses.files.toList() + aggregatedRJars) as Set)
+                .findAll { it.exists() }
+                .toList()
+        def dependencyJars = ((scopedFiles + dependencyClasses.files.toList() + rClassJars) as Set)
+                .findAll { it.exists() && !projectClassPath.contains(it) }
+                .toList()
+
+        // The finder scans its first two arguments; the rest only resolve
+        // multipreview annotations, so the module classes act as both.
+        def finder = new PreviewMethodFinder(projectDirFiles, projectJarFiles,
+                projectDirFiles, projectJarFiles, dependencyJars)
+        // ASM reports class values as type descriptors, e.g. Lcom/foo/Bar;
+        def className = { Object value ->
+            def text = String.valueOf(value)
+            (text.startsWith("L") && text.endsWith(";"))
+                    ? text.substring(1, text.length() - 1).replace('/', '.')
+                    : text
         }
-        compilation.defaultSourceSet?.kotlin?.srcDirs?.each { roots.add(it) }
-      }
-    }
-  }
-  roots
-    .findAll { it.isDirectory() }
-    .collect { it.absolutePath }
-}
+        def previews = finder.findAllPreviewMethods().collect { preview ->
+            [
+                    methodFQN      : preview.method.methodFqn,
+                    previewWrapperFQN: preview.method.previewWrapperFqn,
+                    // One entry per @PreviewParameter parameter, carrying that
+                    // annotation's attributes (provider, limit). The renderer
+                    // expands the provider values itself, and expects the
+                    // provider as a class name rather than a type descriptor.
+                    methodParams   : preview.method.parameters.collect { parameter ->
+                        parameter.annotationParameters.collectEntries { key, value ->
+                            [(key.toString()): className(value)]
+                        }
+                    },
+                    annotations    : preview.previewAnnotations.collect { annotation ->
+                        annotation.parameters.collectEntries { key, value ->
+                            [(key.toString()): String.valueOf(value)]
+                        }
+                    }
+            ]
+        }.sort { it.methodFQN }
 
-def kotlinStringList = { List<String> values ->
-  "listOf(" + values.collect { kotlinString(it) }.join(", ") + ")"
-}
+        def resourceApk = resourceApkCandidates.files.find { it.name.endsWith(".ap_") } ?:
+                resourceApkCandidates.files.find { it.name.endsWith(".apk") }
+        def fontsDir = new File(layoutlibDir, "data/fonts")
 
-def ensureBuildState = { Project project ->
-  buildStateDirs(project).each { dir ->
-    dir.mkdirs()
-  }
-  def kspSymbols = new File(project.buildDir, "kspCaches/${selectedVariant}/symbols")
-  if (kspSymbols.isDirectory()) {
-    project.delete(kspSymbols)
-  }
-}
+        def model = [
+                projectRoot     : projectRootPath.get(),
+                moduleRoot      : moduleRootPath.get(),
+                modulePath      : modulePath.get(),
+                variant         : variantName.get(),
+                namespace       : namespace.get(),
+                javaExecutable  : new File(System.getProperty("java.home"), "bin/java").absolutePath,
+                layoutlibPath   : layoutlibDir.absolutePath,
+                fontsPath       : fontsDir.isDirectory() ? fontsDir.absolutePath : null,
+                resourceApkPath : resourceApk?.absolutePath,
+                rendererClassPath: rendererClasspath.files.collect { it.absolutePath }.sort(),
+                classPath       : (projectClassPath + dependencyJars).collect { it.absolutePath },
+                projectClassPath: projectClassPath.collect { it.absolutePath },
+                // Passed to the renderer as rClassJars. Without these the
+                // renderer registers no resource packages, every library R id
+                // resolves to 0, and previews render blank.
+                rClassJars      : rClassJars.collect { it.absolutePath },
+                previews        : previews,
+        ]
 
-def snapshotBuildFile = { Project project, File stateRoot, Set<String> paths, File source ->
-  if (!source.isFile()) {
-    return
-  }
-  def rootPath = project.rootProject.projectDir.toPath()
-  def sourcePath = source.toPath()
-  if (!sourcePath.startsWith(rootPath)) {
-    return
-  }
-  def relativePath = rootPath.relativize(sourcePath).toString()
-  def target = new File(stateRoot, relativePath)
-  target.parentFile.mkdirs()
-  Files.copy(sourcePath, target.toPath(), StandardCopyOption.REPLACE_EXISTING)
-  paths.add(relativePath)
-}
-
-def snapshotBuildTree = { Project project, File stateRoot, Set<String> paths, File root, String includes ->
-  if (!root.isDirectory()) {
-    return
-  }
-  project.fileTree(dir: root, include: includes).files.each { file ->
-    snapshotBuildFile(project, stateRoot, paths, file)
-  }
-}
-
-def snapshotBuildState = { Project project ->
-  def stateRoot = buildStateRoot(project)
-  def manifest = buildStateManifest(project)
-  def paths = new LinkedHashSet<String>()
-  if (manifest.isFile()) {
-    manifest.eachLine { relativePath ->
-      if (relativePath) {
-        paths.add(relativePath)
-      }
-    }
-  }
-  stateRoot.mkdirs()
-
-  snapshotBuildFile(project, stateRoot, paths, variantRJar(project))
-  snapshotBuildTree(
-    project,
-    stateRoot,
-    paths,
-    new File(project.buildDir, "generated/source/buildConfig"),
-    "**/BuildConfig.java"
-  )
-  snapshotBuildTree(
-    project,
-    stateRoot,
-    paths,
-    new File(project.buildDir, "generated/ksp/${selectedVariant}"),
-    "**/*"
-  )
-
-  project.rootProject.allprojects.each { candidate ->
-    def libsDir = new File(candidate.buildDir, "libs")
-    if (libsDir.isDirectory()) {
-      libsDir.listFiles()
-        ?.findAll { it.isFile() && it.name.endsWith(".jar") }
-        ?.each { jar -> snapshotBuildFile(project, stateRoot, paths, jar) }
-    }
-  }
-
-  manifest.parentFile.mkdirs()
-  manifest.text = paths.join("\n")
-  project.logger.lifecycle("compose-preview: snapshotted ${paths.size()} build-state file(s) for ${project.path}")
-}
-
-def restoreBuildState = { Project project ->
-  ensureBuildState(project)
-  def stateRoot = buildStateRoot(project)
-  def manifest = buildStateManifest(project)
-  if (!manifest.isFile()) {
-    return
-  }
-  def restored = 0
-  manifest.eachLine { relativePath ->
-    if (relativePath) {
-      def source = new File(stateRoot, relativePath)
-      def target = new File(project.rootProject.projectDir, relativePath)
-      if (source.isFile()) {
-        target.parentFile.mkdirs()
-        Files.copy(source.toPath(), target.toPath(), StandardCopyOption.REPLACE_EXISTING)
-        restored++
-      }
-    }
-  }
-  project.logger.lifecycle("compose-preview: restored ${restored} build-state file(s) for ${project.path}")
-}
-
-def generateTestSource = { Project project, File outputDir, List<String> currentSourceRoots ->
-  if (!sourceTemplateFile.isFile()) {
-    throw new GradleException(
-      "compose-preview template not found: ${sourceTemplateFile}. " +
-      "Set COMPOSE_PREVIEW_TEMPLATE_FILE to compose-preview-paparazzi-test.template.kt."
-    )
-  }
-  def namespace = project.extensions.findByName("android")?.namespace ?: project.group?.toString()
-  def scanPackage = namespace ?: ""
-  def packageName = generatedPackageName(project)
-  def source = sourceTemplateFile.getText("UTF-8")
-    .replace("__PACKAGE_NAME__", packageName)
-    .replace("__CLASS_NAME__", className)
-    .replace("__PROVIDER_NAME__", providerName)
-    .replace("__SCAN_PACKAGE__", scanPackage)
-    .replace("__MANIFEST_FILE__", manifestFile(project).path.replace("\\", "\\\\"))
-    .replace("__SOURCE_FILE__", selectedSourceFile.replace("\\", "\\\\").replace("\"", "\\\""))
-    .replace("__PREVIEW_METHOD__", selectedPreviewMethod.replace("\\", "\\\\").replace("\"", "\\\""))
-    .replace("__SOURCE_ROOTS__", kotlinStringList(currentSourceRoots))
-  def file = new File(outputDir, packageName.replace(".", "/") + "/${className}.kt")
-  file.parentFile.mkdirs()
-  file.text = source
-  project.logger.lifecycle("compose-preview: generated scanner-backed Paparazzi source for ${scanPackage} at ${file}")
-}
-
-def generateDesktopTestSource = { Project project, File outputDir, List<String> currentSourceRoots ->
-  def namespace = project.extensions.findByName("android")?.namespace ?: project.group?.toString()
-  def scanPackage = namespace ?: ""
-  def packageName = generatedPackageName(project)
-  def manifestPath = manifestFile(project).path.replace("\\", "\\\\")
-  def outputPath = previewOutputDir(project).path.replace("\\", "\\\\")
-  def sourceFile = selectedSourceFile.replace("\\", "\\\\").replace("\"", "\\\"")
-  def previewMethod = selectedPreviewMethod.replace("\\", "\\\\").replace("\"", "\\\"")
-  def source = """
-@file:Suppress("FunctionName", "INVISIBLE_MEMBER", "INVISIBLE_REFERENCE")
-
-package ${packageName}
-
-import androidx.compose.ui.test.ExperimentalTestApi
-import androidx.compose.ui.test.junit4.runDesktopComposeUiTest
-import androidx.compose.ui.test.onRoot
-import io.github.takahirom.roborazzi.captureRoboImage
-import org.junit.Test
-import sergio.sastre.composable.preview.scanner.android.AndroidComposablePreviewScanner
-import sergio.sastre.composable.preview.scanner.android.AndroidPreviewInfo
-import sergio.sastre.composable.preview.scanner.android.screenshotid.AndroidPreviewScreenshotIdBuilder
-import sergio.sastre.composable.preview.scanner.core.preview.ComposablePreview
-import java.io.File
-
-private const val COMPOSE_PREVIEW_MANIFEST_FILE = "${manifestPath}"
-private const val COMPOSE_PREVIEW_OUTPUT_DIR = "${outputPath}"
-private const val COMPOSE_PREVIEW_SOURCE_FILE = "${sourceFile}"
-private const val COMPOSE_PREVIEW_METHOD = "${previewMethod}"
-private val COMPOSE_PREVIEW_SOURCE_ROOTS = ${kotlinStringList(currentSourceRoots)}
-
-private data class SourceIndex(
-    val classes: Map<String, String>,
-    val topLevelFunctions: Map<String, String>,
-)
-
-class ${desktopClassName} {
-    @OptIn(ExperimentalTestApi::class)
-    @Test
-    fun renderPreviews() = runDesktopComposeUiTest {
-        val previews = AndroidComposablePreviewScanner()
-            .scanPackageTrees("${scanPackage}")
-            .includePrivatePreviews()
-            .getPreviews()
-            .filterForSourceFile()
-        writeManifest(previews)
-        val outputDir = File(COMPOSE_PREVIEW_OUTPUT_DIR)
-        outputDir.deleteRecursively()
-        outputDir.mkdirs()
-        previews.forEach { preview ->
-            setContent {
-                preview()
-            }
-            val file = File(outputDir, screenshotId(preview) + ".png")
-            onRoot().captureRoboImage(file = file)
-        }
-        println("compose-preview: desktop renderer wrote \${previews.size} preview(s) to \${outputDir}")
-    }
-
-    private fun List<ComposablePreview<AndroidPreviewInfo>>.filterForSourceFile(): List<ComposablePreview<AndroidPreviewInfo>> {
-        if (COMPOSE_PREVIEW_SOURCE_FILE.isBlank() && COMPOSE_PREVIEW_METHOD.isBlank()) return this
-        return filter { preview ->
-            (COMPOSE_PREVIEW_SOURCE_FILE.isBlank() ||
-                File(sourceFile(preview)).normalize() == File(COMPOSE_PREVIEW_SOURCE_FILE).normalize()) &&
-                (COMPOSE_PREVIEW_METHOD.isBlank() || preview.methodName == COMPOSE_PREVIEW_METHOD)
+        def output = modelFile.get().asFile
+        output.parentFile.mkdirs()
+        output.text = JsonOutput.prettyPrint(JsonOutput.toJson(model))
+        logger.lifecycle("compose-preview: wrote ${previews.size()} preview declarations to ${output}")
+        if (resourceApk == null) {
+            logger.warn("compose-preview: no resource apk found for ${modulePath.get()}; rendering will fail")
         }
     }
 
-    private fun writeManifest(previews: List<ComposablePreview<AndroidPreviewInfo>>) {
-        val manifest = File(COMPOSE_PREVIEW_MANIFEST_FILE)
-        manifest.parentFile?.mkdirs()
-        manifest.writeText(
-            previews.joinToString(separator = "\\n") { preview ->
-                listOf(
-                    screenshotId(preview),
-                    displayName(preview),
-                    preview.declaringClass,
-                    preview.methodName,
-                    preview.previewInfo.name,
-                    preview.previewInfo.group,
-                    sourceFile(preview),
-                ).joinToString(separator = "\\t", transform = ::escape)
-            },
-        )
-    }
+    // Mirrors AGP's layoutlib extraction: unpack layoutlib-runtime and drop the
+    // framework resources jar in as data/framework_res.jar.
+    private File prepareLayoutlibData() {
+        def target = layoutlibDataDir.get().asFile
+        def runtimeJar = layoutlibRuntimeJar.files.find { it.name.endsWith(".jar") }
+        def resourcesJar = layoutlibResourcesJar.files.find { it.name.endsWith(".jar") }
+        if (runtimeJar == null) {
+            throw new IllegalStateException("Could not resolve the layoutlib runtime jar")
+        }
+        if (resourcesJar == null) {
+            throw new IllegalStateException("Could not resolve the layoutlib resources jar")
+        }
 
-    private fun screenshotId(preview: ComposablePreview<AndroidPreviewInfo>): String =
-        AndroidPreviewScreenshotIdBuilder(preview)
-            .ignoreClassName()
-            .ignoreMethodName()
-            .build()
+        def stamp = new File(target, ".compose-preview-stamp")
+        def expected = "${runtimeJar.name}:${runtimeJar.length()}:${resourcesJar.name}:${resourcesJar.length()}"
+        if (stamp.isFile() && stamp.text == expected) {
+            return target
+        }
 
-    private fun displayName(preview: ComposablePreview<AndroidPreviewInfo>): String =
-        preview.previewInfo.name.ifBlank { preview.methodName }
-
-    private fun sourceFile(preview: ComposablePreview<AndroidPreviewInfo>): String {
-        val index = sourceIndex
-        val declaringClass = preview.declaringClass
-        val methodKey = "\$declaringClass#\${preview.methodName}"
-        val outerClass = declaringClass.substringBefore('\$')
-        return index.topLevelFunctions[methodKey]
-            ?: index.classes[declaringClass]
-            ?: index.classes[outerClass]
-            ?: ""
-    }
-
-    private val sourceIndex: SourceIndex by lazy {
-        val classes = linkedMapOf<String, String>()
-        val topLevelFunctions = linkedMapOf<String, String>()
-        COMPOSE_PREVIEW_SOURCE_ROOTS
-            .map(::File)
-            .filter { it.isDirectory }
-            .flatMap { root -> root.walkTopDown().filter { it.isFile && it.extension == "kt" } }
-            .forEach { file ->
-                val text = file.readText()
-                val packageName = packageRegex.find(text)?.groupValues?.get(1).orEmpty()
-                val prefix = packageName.takeIf { it.isNotBlank() }?.let { "\$it." }.orEmpty()
-                val path = file.absolutePath
-                classRegex.findAll(text).forEach { match ->
-                    classes.putIfAbsent(prefix + match.groupValues[1], path)
-                }
-                val facade = prefix + file.nameWithoutExtension + "Kt"
-                functionRegex.findAll(text).forEach { match ->
-                    topLevelFunctions.putIfAbsent("\$facade#\${match.groupValues[1]}", path)
+        target.deleteDir()
+        Path root = target.toPath()
+        Files.createDirectories(root)
+        def safeEntryName = { String name ->
+            !name.contains(":") &&
+                    !name.tokenize("/\\").contains("..") &&
+                    name.toCharArray().every { (it as int) >= 32 }
+        }
+        runtimeJar.withInputStream { rawStream ->
+            new ZipInputStream(rawStream).withCloseable { zip ->
+                def entry
+                while ((entry = zip.nextEntry) != null) {
+                    if (entry.directory || !safeEntryName(entry.name)) {
+                        continue
+                    }
+                    Path destination = root.resolve(entry.name).normalize()
+                    if (!destination.startsWith(root)) {
+                        continue
+                    }
+                    Files.createDirectories(destination.parent)
+                    Files.copy(zip, destination, StandardCopyOption.REPLACE_EXISTING)
                 }
             }
-        SourceIndex(classes, topLevelFunctions)
+        }
+        Path frameworkRes = root.resolve("data").resolve("framework_res.jar")
+        Files.createDirectories(frameworkRes.parent)
+        Files.copy(resourcesJar.toPath(), frameworkRes, StandardCopyOption.REPLACE_EXISTING)
+        stamp.text = expected
+        return target
     }
-
-    private val packageRegex = Regex(\"\"\"(?m)^\\s*package\\s+([A-Za-z_][A-Za-z0-9_.]*)\"\"\")
-    private val classRegex = Regex(\"\"\"(?m)^\\s*(?:private\\s+|internal\\s+|public\\s+)?(?:data\\s+|sealed\\s+|value\\s+|enum\\s+|annotation\\s+)*(?:class|object|interface)\\s+([A-Za-z_][A-Za-z0-9_]*)\"\"\")
-    private val functionRegex = Regex(\"\"\"(?m)^\\s*(?:private\\s+|internal\\s+|public\\s+)?(?:@[A-Za-z_][A-Za-z0-9_.]*(?:\\([^)]*\\))?\\s*)*fun\\s+([A-Za-z_][A-Za-z0-9_]*)\\s*\\(\"\"\")
-
-    private fun escape(value: String): String =
-        value
-            .replace("\\\\", "\\\\\\\\")
-            .replace("\\t", "\\\\t")
-            .replace("\\n", "\\\\n")
-            .replace("\\r", "\\\\r")
 }
-"""
-  def file = new File(outputDir, packageName.replace(".", "/") + "/${desktopClassName}.kt")
-  file.parentFile.mkdirs()
-  file.text = source
-  project.logger.lifecycle("compose-preview: generated scanner-backed desktop source for ${scanPackage} at ${file}")
+
+// Adapts a Groovy closure to kotlin.jvm.functions.Function1 as loaded by AGP's
+// own classloader, so no AGP artifact has to be on the init script classpath.
+static Object asFunction1(ClassLoader loader, Closure body) {
+    def function1Class = loader.loadClass("kotlin.jvm.functions.Function1")
+    def handler = { Object proxy, Method method, Object[] args ->
+        switch (method.name) {
+            case "invoke":
+                return body.call(args[0])
+            case "equals":
+                return proxy.is(args[0])
+            case "hashCode":
+                return System.identityHashCode(proxy)
+            case "toString":
+                return "compose-preview Function1"
+            default:
+                return null
+        }
+    } as InvocationHandler
+    return Proxy.newProxyInstance(loader, [function1Class] as Class[], handler)
 }
+
+// variant.artifacts.forScope(SCOPE).use(task).toGet(CLASSES, jars, dirs)
+static void wireScopedClasses(Object variant, Object taskProvider, String scopeName,
+                              Closure jarsGetter, Closure dirsGetter) {
+    def loader = variant.getClass().getClassLoader()
+    def scope = Enum.valueOf(
+            loader.loadClass('com.android.build.api.variant.ScopedArtifacts$Scope'), scopeName)
+    def classesArtifact = loader
+            .loadClass('com.android.build.api.artifact.ScopedArtifact$CLASSES')
+            .getField("INSTANCE")
+            .get(null)
+    def operation = variant.artifacts.forScope(scope).use(taskProvider)
+    def toGet = operation.getClass().getMethods().find { it.name == "toGet" }
+    toGet.invoke(operation, classesArtifact,
+            asFunction1(loader, jarsGetter),
+            asFunction1(loader, dirsGetter))
+}
+
+static Object dependencyClassesView(Object project, String configurationName, String artifactType) {
+    return project.provider {
+        def configuration = project.configurations.findByName(configurationName)
+        if (configuration == null) {
+            return project.files()
+        }
+        return configuration.incoming.artifactView { view ->
+            view.lenient(true)
+            view.attributes {
+                it.attribute(Attribute.of("artifactType", String), artifactType)
+            }
+        }.files
+    }
+}
+
+if (targetModulePath == null || modelFilePath == null) {
+    return
+}
+
+def variantSuffix = targetVariant.substring(0, 1).toUpperCase(Locale.ROOT) + targetVariant.substring(1)
 
 gradle.beforeProject { project ->
-  if (!selectedPath || project.path == selectedPath) {
-    project.buildscript.repositories {
-      google()
-      mavenCentral()
+    if (project.path != targetModulePath) {
+        return
     }
-    project.buildscript.dependencies.add(
-      "classpath",
-      "app.cash.paparazzi:paparazzi-gradle-plugin:${paparazziVersion}"
-    )
-  }
-}
-
-allprojects { project ->
-  if (selectedPath && project.path != selectedPath) {
-    return
-  }
-
-  project.plugins.withId(androidKmpPluginId) {
-    def sourceDir = generatedRoot
-      ? new File(new File(generatedRoot, sanitize(project.path)), "src/desktopTest/kotlin")
-      : new File(project.rootProject.projectDir, ".gradle/compose-preview/generated/${sanitize(project.path)}/src/desktopTest/kotlin")
-    def currentSourceRoots = kotlinMultiplatformSourceRoots(project)
-
-    project.afterEvaluate {
-      def kotlin = project.extensions.findByName("kotlin")
-      def sourceSets = kotlin?.sourceSets
-      def jvmTarget = kotlin?.targets?.find { target ->
-        def platformType = target.hasProperty("platformType") ? target.platformType?.name : null
-        platformType == "jvm"
-      }
-      def jvmTestSourceSetName = jvmTarget == null ? null : "${jvmTarget.name}Test"
-      def jvmTestSourceSet = jvmTestSourceSetName == null
-        ? null
-        : sourceSets?.findByName(jvmTestSourceSetName)
-      if (jvmTestSourceSet == null) {
-        throw new GradleException(
-          "compose-preview: ${project.path} uses ${androidKmpPluginId}, but no Kotlin JVM test source set exists. " +
-          "Add a Kotlin JVM target so compose-preview can render KMP previews."
-        )
-      }
-      def jvmTargetName = jvmTarget.name
-      def jvmTargetNameCapitalized = jvmTargetName.capitalize()
-      def actualJvmTestTaskName = "${jvmTargetName}Test"
-      def jvmTestImplementation = "${jvmTestSourceSetName}Implementation"
-      def compileJvmTestTaskName = "compileTestKotlin${jvmTargetNameCapitalized}"
-      def jvmTestClassesTaskName = "${jvmTargetName}TestClasses"
-      def kspJvmTestTaskName = "kspTestKotlin${jvmTargetNameCapitalized}"
-
-      jvmTestSourceSet.kotlin.srcDir(sourceDir)
-      project.dependencies.add(
-        jvmTestImplementation,
-        "io.github.sergio-sastre.ComposablePreviewScanner:android:${previewScannerVersion}"
-      )
-      project.dependencies.add(
-        jvmTestImplementation,
-        "io.github.takahirom.roborazzi:roborazzi-compose-desktop:${roborazziVersion}"
-      )
-      project.dependencies.add(jvmTestImplementation, "junit:junit:${junit4Version}")
-
-      def generateTask = project.tasks.register("generateComposePreviewDesktopTest") {
-        inputs.property("composePreviewPackageName", generatedPackageName(project))
-        inputs.property("composePreviewSourceFile", selectedSourceFile)
-        inputs.property("composePreviewSourceRoots", currentSourceRoots.join(File.pathSeparator))
-        outputs.dir(sourceDir)
-        doLast {
-          project.delete(sourceDir)
-          generateDesktopTestSource(project, sourceDir, currentSourceRoots)
-        }
-      }
-
-      project.tasks.matching { it.name == actualJvmTestTaskName }.configureEach { task ->
-        dependsOn(generateTask)
-        outputs.upToDateWhen { false }
-        if (task.hasProperty("filter")) {
-          task.filter {
-            includeTestsMatching(generatedDesktopTestClassName(project))
-          }
-        }
-      }
-      project.tasks.matching {
-        it.name == kspJvmTestTaskName ||
-          it.name == compileJvmTestTaskName ||
-          it.name == jvmTestClassesTaskName
-      }.configureEach { task ->
-        dependsOn(generateTask)
-      }
-      project.tasks.matching { it.name == compileJvmTestTaskName }.configureEach { task ->
-        task.setSource(project.files(sourceDir))
-      }
-      if (actualJvmTestTaskName != "desktopTest") {
-        project.tasks.register("desktopTest") { task ->
-          task.group = "verification"
-          task.description = "Renders Compose previews using the ${actualJvmTestTaskName} JVM test task."
-          task.dependsOn(actualJvmTestTaskName)
-        }
-      }
-      project.logger.lifecycle(
-        "compose-preview: generated KMP JVM sources for ${actualJvmTestTaskName} will be written to ${sourceDir}"
-      )
-    }
-  }
-
-  androidPluginIds.each { pluginId ->
-    project.plugins.withId(pluginId) {
-      project.apply plugin: "app.cash.paparazzi"
-
-      def sourceDir = generatedRoot
-        ? new File(new File(generatedRoot, sanitize(project.path)), "src/test/kotlin")
-        : new File(project.rootProject.projectDir, ".gradle/compose-preview/generated/${sanitize(project.path)}/src/test/kotlin")
-      def currentSourceRoots = sourceRoots(project)
-
-      project.dependencies.add("testImplementation", "app.cash.paparazzi:paparazzi:${paparazziVersion}")
-      project.dependencies.add(
-        "testImplementation",
-        "io.github.sergio-sastre.ComposablePreviewScanner:android:${previewScannerVersion}"
-      )
-      project.dependencies.add(
-        "testImplementation",
-        "com.google.testparameterinjector:test-parameter-injector:${testParameterInjectorVersion}"
-      )
-      project.dependencies.add("testImplementation", "junit:junit:${junit4Version}")
-      project.dependencies.add("testRuntimeOnly", "org.junit.vintage:junit-vintage-engine:${junitVintageVersion}")
-
-      project.extensions.configure("android") { android ->
-        android.sourceSets {
-          test.java.srcDir(sourceDir)
-          test.kotlin.srcDir(sourceDir)
-        }
-      }
-
-      def generateTask = project.tasks.register("generateComposePreviewPaparazziTest") {
-        inputs.file(sourceTemplateFile)
-        inputs.property("composePreviewPackageName", generatedPackageName(project))
-        inputs.property("composePreviewSourceFile", selectedSourceFile)
-        inputs.property("composePreviewSourceRoots", currentSourceRoots.join(File.pathSeparator))
-        outputs.dir(sourceDir)
-        doLast {
-          project.delete(sourceDir)
-          generateTestSource(project, sourceDir, currentSourceRoots)
-        }
-      }
-
-      def prepareBuildDirsTask = project.tasks.register("prepareComposePreviewBuildDirs") {
-        doLast {
-          ensureBuildState(project)
-        }
-      }
-
-      def snapshotBuildStateTask = project.tasks.register("snapshotComposePreviewBuildState") {
-        doLast {
-          snapshotBuildState(project)
-        }
-      }
-
-      def restoreBuildStateAction = {
-        restoreBuildState(project)
-      }
-
-      def restoreBefore = { String taskName, List<String> previousTaskNames ->
-        def restoreTask = project.tasks.register(
-          "restoreComposePreviewBuildStateFor${taskName.capitalize()}"
-        ) {
-          dependsOn(snapshotBuildStateTask)
-          dependsOn(project.tasks.matching { previousTaskNames.contains(it.name) })
-          doLast {
-            restoreBuildState(project)
-          }
-        }
-        project.tasks.matching { it.name == taskName }.configureEach { task ->
-          task.dependsOn(restoreTask)
-          task.doFirst {
-            restoreBuildStateAction()
-          }
-        }
-      }
-
-      def dependentTaskNames = [
-          "compile${selectedVariantName}UnitTestKotlin",
-          "compile${selectedVariantName}UnitTestJavaWithJavac",
-          "test${selectedVariantName}UnitTest",
-          "recordPaparazzi${selectedVariantName}",
-          "verifyPaparazzi${selectedVariantName}"
-      ]
-
-      project.afterEvaluate {
-        [
-          "process${selectedVariantName}Resources",
-          "generate${selectedVariantName}BuildConfig"
-        ].each { taskName ->
-          def task = project.tasks.findByName(taskName)
-          if (task != null) {
-            snapshotBuildStateTask.configure {
-              dependsOn(task)
+    ["com.android.application", "com.android.library", "com.android.dynamic-feature"].each { pluginId ->
+        project.plugins.withId(pluginId) {
+            // AGP only links a resource apk for a local test component when
+            // Android resources are requested, and that apk is what layoutlib
+            // resolves resources against.
+            def android = project.extensions.findByName("android")
+            if (android != null) {
+                android.testOptions.unitTests.includeAndroidResources = true
             }
-          }
+
+            def androidComponents = project.extensions.findByName("androidComponents")
+            if (androidComponents == null) {
+                return
+            }
+
+            def layoutlibRuntime = project.configurations.detachedConfiguration(
+                    project.dependencies.create("com.android.tools.layoutlib:layoutlib-runtime:${layoutlibVersion}"))
+            def layoutlibResources = project.configurations.detachedConfiguration(
+                    project.dependencies.create("com.android.tools.layoutlib:layoutlib-resources:${layoutlibVersion}"))
+            def renderer = project.configurations.detachedConfiguration(
+                    project.dependencies.create("com.android.tools.layoutlib:layoutlib:${layoutlibVersion}"),
+                    project.dependencies.create("com.android.tools.compose:compose-preview-renderer:${rendererVersion}"))
+            [layoutlibRuntime, layoutlibResources, renderer].each { it.transitive = true }
+
+            androidComponents.onVariants(androidComponents.selector().withName(targetVariant)) { variant ->
+                def provider = project.tasks.register("composePreviewModel", ComposePreviewModelTask) { task ->
+                    task.group = "compose preview"
+                    task.description = "Collects Compose preview metadata for Emacs"
+                    task.namespace.set(variant.namespace)
+                    task.modulePath.set(targetModulePath)
+                    task.projectRootPath.set(project.rootDir.absolutePath)
+                    task.moduleRootPath.set(project.projectDir.absolutePath)
+                    task.variantName.set(targetVariant)
+                    task.modelFile.set(new File(modelFilePath))
+                    task.layoutlibDataDir.set(
+                            project.layout.buildDirectory.dir("compose-preview/layoutlib-${layoutlibVersion}"))
+                    task.layoutlibRuntimeJar.from(layoutlibRuntime)
+                    task.layoutlibResourcesJar.from(layoutlibResources)
+                    task.rendererClasspath.from(renderer)
+                    // Mirrors AGP's Compose screenshot support: dependency
+                    // classes and dependency R classes are separate artifacts,
+                    // and both the runtime and compile classpaths contribute.
+                    ["${targetVariant}RuntimeClasspath", "${targetVariant}CompileClasspath"].each { name ->
+                        task.dependencyClasses.from(dependencyClassesView(project, name, "android-classes-jar"))
+                        task.dependencyRClasses.from(dependencyClassesView(project, name, "r-class-jar"))
+                    }
+
+                    def resourceApkTask = "package${variantSuffix}UnitTestForUnitTest"
+                    if (project.tasks.names.contains(resourceApkTask)) {
+                        task.resourceApkCandidates.from(project.tasks.named(resourceApkTask))
+                    } else {
+                        task.logger.warn("compose-preview: ${resourceApkTask} is not available in ${project.path}")
+                    }
+
+                    def rClassTask = "process${variantSuffix}UnitTestResources"
+                    if (project.tasks.names.contains(rClassTask)) {
+                        task.aggregatedRClassJar.from(project.tasks.named(rClassTask))
+                    }
+                }
+
+                wireScopedClasses(variant, provider, "ALL", { it.allJars }, { it.allDirs })
+                wireScopedClasses(variant, provider, "PROJECT", { it.projectJars }, { it.projectDirs })
+            }
         }
-
-        dependentTaskNames.each { taskName ->
-          def task = project.tasks.findByName(taskName)
-          task?.dependsOn(generateTask, prepareBuildDirsTask, snapshotBuildStateTask)
-          if (taskName.startsWith("recordPaparazzi") || taskName.startsWith("verifyPaparazzi")) {
-            task?.outputs?.upToDateWhen { false }
-          }
-        }
-
-        project.tasks.matching { it.name == "test${selectedVariantName}UnitTest" }.configureEach { task ->
-          task.filter {
-            includeTestsMatching(generatedTestClassName(project))
-          }
-        }
-
-        project.tasks.matching { it.name == "finalizeTestRoborazzi${selectedVariantName}" }.configureEach { task ->
-          task.enabled = false
-        }
-
-        restoreBefore("ksp${selectedVariantName}Kotlin", ["snapshotComposePreviewBuildState"])
-        restoreBefore("compile${selectedVariantName}Kotlin", ["ksp${selectedVariantName}Kotlin"])
-        restoreBefore("compile${selectedVariantName}JavaWithJavac", ["compile${selectedVariantName}Kotlin"])
-        restoreBefore("hiltAggregateDeps${selectedVariantName}", ["compile${selectedVariantName}JavaWithJavac"])
-        restoreBefore("hiltJavaCompile${selectedVariantName}", ["hiltAggregateDeps${selectedVariantName}"])
-        restoreBefore("ksp${selectedVariantName}UnitTestKotlin", ["hiltJavaCompile${selectedVariantName}"])
-        restoreBefore("compile${selectedVariantName}UnitTestKotlin", ["ksp${selectedVariantName}UnitTestKotlin"])
-        restoreBefore("compile${selectedVariantName}UnitTestJavaWithJavac", ["compile${selectedVariantName}UnitTestKotlin"])
-        restoreBefore("hiltAggregateDeps${selectedVariantName}UnitTest", ["compile${selectedVariantName}UnitTestJavaWithJavac"])
-        restoreBefore("hiltJavaCompile${selectedVariantName}UnitTest", ["hiltAggregateDeps${selectedVariantName}UnitTest"])
-
-        [
-          "ksp${selectedVariantName}Kotlin",
-          "compile${selectedVariantName}Kotlin",
-          "compile${selectedVariantName}JavaWithJavac"
-        ].each { taskName ->
-          project.tasks.findByName(taskName)?.doLast {
-            snapshotBuildState(project)
-          }
-        }
-      }
-
-      project.logger.lifecycle("compose-preview: generated sources will be written to ${sourceDir}")
     }
-  }
 }

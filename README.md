@@ -2,132 +2,93 @@
 
 Android Studio-style Jetpack Compose `@Preview` browsing from Emacs.
 
-Paparazzi is used as the rendering engine because it can render Compose without
-an emulator. The Emacs experience is centered on refreshing and viewing previews,
-not on running UI tests. Snapshot record/verify commands remain available as
-secondary Paparazzi utilities.
+Previews are rendered by `compose-preview-renderer`, the standalone layoutlib
+renderer that Android Studio publishes and uses for its own Compose screenshot
+support. Nothing is injected into the project: no generated sources, no extra
+test plugins, no build file rewriting, no snapshot testing framework.
 
-## Installation
+## Status
 
-With `use-package` and `package-vc`:
-
-```elisp
-(use-package compose-preview
-  :vc (:url "https://github.com/cat-emacs/compose-preview")
-  :commands (compose-preview
-             compose-preview-refresh
-             compose-preview-record
-             compose-preview-verify
-             compose-preview-open-results
-             compose-preview-set-variant))
-```
-
-From a local checkout:
-
-```elisp
-(add-to-list 'load-path "/path/to/android-mode")
-(add-to-list 'load-path "/path/to/compose-preview")
-(require 'compose-preview)
-```
-
-`compose-preview` can run without `android-mode`, but it reuses android-mode's
-module and variant discovery when `android-mode` is available.
-That discovery follows Android Studio's model more closely: it uses the Gradle
-project path, Android Components variants, and source-set roots reported by
-Gradle. This lets Kotlin Multiplatform files under source sets such as
-`src/commonMain/kotlin` map back to the Android module that owns the preview.
-
-## Commands
-
-- `M-x compose-preview`
-  - opens a Transient menu for preview refresh, result browsing, variant
-    selection, and snapshot operations.
-- `M-x compose-preview-refresh`
-  - refreshes previews in the background for the current Android module, writes
-    Gradle output to `*compose-preview-log*`, and opens the image gallery for
-    the current Kotlin buffer's `@Preview` functions. When point is inside a
-    `@Preview` function, only that preview function is rendered.
-- `C-u M-x compose-preview-refresh`
-  - prompts for module and variant using android-mode's cached flavor data.
-- `M-x compose-preview-open-results`
-  - opens generated preview PNGs. From a Kotlin buffer, it filters to that
-    buffer's previews; elsewhere it falls back to the module gallery.
-- `M-x compose-preview-set-variant`
-  - changes the default variant using android-mode's variant list when present.
-- `M-x compose-preview-record`
-  - secondary snapshot command: records Paparazzi golden images.
-- `M-x compose-preview-verify`
-  - secondary snapshot command: verifies Paparazzi golden images.
+The Gradle side and the renderer invocation are implemented and verified. The
+Emacs side has not been ported yet, so `compose-preview.el` still drives the
+previous Paparazzi-based flow and does not match `preview.init.gradle`.
 
 ## How It Works
 
-`compose-preview-refresh` runs Gradle in the background with a temporary init
-script. The script injects Paparazzi into the current Android module, generates a
-temporary scanner-backed preview runner, runs `test<Variant>UnitTest`, and
-opens the resulting PNGs in an Emacs gallery buffer. Build output stays in
-`*compose-preview-log*`; failed refreshes display that buffer automatically.
-`compose-preview-record` and `compose-preview-verify` use the visible
-`*compose-preview*` compilation buffer.
+Rendering happens in three steps.
 
-The gallery is source-focused: when refresh is launched from a Kotlin file, it
-shows only previews declared in that buffer and labels each section with the
-preview display name rather than the Paparazzi PNG filename.
-If point is inside a function directly annotated with `@Preview`, refresh is
-further narrowed to that function. This mirrors Android Studio's run
-configuration behavior, where a preview run is produced from the containing
-preview function instead of the whole file.
-Preview metadata comes from `AndroidComposablePreviewScanner`, not Emacs-side
-annotation parsing, so custom multipreview annotations such as `@DevicePreview`,
-`@PreviewBackground`, and AndroidX templates like `@PreviewScreenSizes` follow
-the same discovery path as Android Studio-style previews.
-When invoked from a Kotlin buffer, the gallery does not fall back to module-wide
-images; if the scanner manifest cannot attribute a preview to that source file,
-the command reports that no current-buffer previews were found.
+1. A Gradle init script registers `composePreviewModel` on the target module.
+   The task resolves layoutlib and the renderer from Google's Maven repository,
+   collects the module's classpath through AGP's public `ScopedArtifacts` API,
+   discovers `@Preview` functions from compiled bytecode, and writes everything
+   to a JSON model file.
+2. Emacs picks the previews to render and writes a rendering settings file.
+3. A small launcher renders them in a separate JVM and writes a results file
+   with one PNG per preview.
 
-The generated runner uses `AndroidComposablePreviewScanner`,
-`TestParameterInjector`, and `AndroidPreviewScreenshotIdBuilder`, so preview
-discovery is closer to Android Studio than a hand-written regex. Refresh passes
-the current Kotlin file to the runner, so it scans with the same scanner path but
-renders only previews attributed to that file or, when a direct `@Preview`
-function is selected, that function.
+### Preview discovery
+
+Discovery uses `compose-preview-detector`, the same bytecode scanner AGP uses.
+Multipreview annotations expand exactly as they do in Studio, so
+`@PreviewScreenSizes`, `@PreviewFontScale`, `@PreviewLightDark` and custom
+multipreview annotations all work, and `@PreviewParameter` providers are
+expanded by the renderer itself.
+
+### Why a launcher instead of the renderer's own CLI
+
+The renderer ships a CLI entry point, but it constructs
+`RenderEnvironmentBootstrapper` without `rClassJars`. That leaves the renderer
+with no registered resource packages, so `ViewLoader` never parses any R class.
+Because the renderer runs with final resource ids, every id a library reads
+through its own R class then resolves to `0`. In practice this means previews
+render as blank images, and `ComposeViewAdapter` fails while attaching the
+lifecycle owner.
+
+`ComposePreviewRenderLauncher.java` calls the eight-argument bootstrapper with
+`rClassJars`, which is the same entry point Studio's screenshot test engine
+uses. Everything else reuses the renderer's own model classes and JSON
+serialization. The launcher is compiled once against the resolved renderer jars.
+
+A future renderer release will make the launcher unnecessary for discovery:
+`Renderer.render` on Studio's main branch expands multipreview itself, so only a
+method name has to be passed. That change is not in `0.0.1-alpha16`.
+
+### Resource apk
+
+layoutlib resolves resources against a resource apk whose ids must match the R
+classes on the classpath. The module's local test component provides both from
+the same `aapt2` link, so the task uses `APK_FOR_LOCAL_TEST` and the matching
+non-namespaced R jar. AGP only links that apk when Android resources are
+requested for local tests, so the init script enables
+`testOptions.unitTests.includeAndroidResources` for the target module.
+
+## Verified Against
+
+- `Android-screenshot-testing-playground`, AGP 8.11.1 / Gradle 8.13, library
+  module. Rendered sizes match the official
+  `com.android.compose.screenshot` plugin output for every shared preview, and
+  the shared preview is 99.94% pixel-identical.
+- `nowinandroid`, AGP 9.3.2 / Gradle 9.7.1, with Isolated Projects and the
+  configuration cache enabled and a flavored variant (`demoDebug`). 21 preview
+  declarations expanded to 40 renders with no errors.
 
 ## Configuration
 
-```elisp
-(setq compose-preview-default-variant "debug"
-      compose-preview-paparazzi-version "2.0.0-alpha02"
-      compose-preview-image-width 420)
-```
+The init script reads these environment variables:
 
-Set `compose-preview-disable-ksp2` to non-nil only for projects that still need
-KSP1. Recent KSP versions fail configuration when `ksp.useKSP2=false` is passed.
+| Variable | Meaning |
+| --- | --- |
+| `COMPOSE_PREVIEW_MODULE_PATH` | Gradle path of the target module, required |
+| `COMPOSE_PREVIEW_MODEL_FILE` | Where to write the JSON model, required |
+| `COMPOSE_PREVIEW_VARIANT` | Variant name, defaults to `debug` |
+| `COMPOSE_PREVIEW_LAYOUTLIB_VERSION` | Defaults to the version AGP pins |
+| `COMPOSE_PREVIEW_RENDERER_VERSION` | Standalone renderer version |
+| `COMPOSE_PREVIEW_DETECTOR_VERSION` | Preview detector version |
 
-`compose-preview-use-legacy-android-dsl` defaults to non-nil because Paparazzi
-`2.0.0-alpha02` still needs AGP's legacy Android extension for resource tasks in
-AGP 9 projects.
-
-Refresh uses Gradle build cache, parallel execution, Kotlin incremental
-compilation, and KSP incremental processing by default. Configuration cache is
-disabled because the preview init script injects dynamic task actions. If a
-project hits stale generated state while previewing, temporarily set
-`compose-preview-force-clean-build` to non-nil to run a slower clean-style
-preview build.
-
-## Notes
-
-- Projects with product flavors usually need a full variant name, for example
-  `demoDebug`, because Paparazzi creates tasks like `recordPaparazziDemoDebug`.
-  compose-preview reuses android-mode's flavor cache and selection helpers.
-- The selected module and variant are cached per Gradle project, so refreshes
-  from Kotlin buffers, the preview gallery, or the log buffer reuse the same
-  target until you select another one with `C-u M-x compose-preview-refresh` or
-  `M-x compose-preview-set-variant`.
-- If Gradle reports an ambiguous task such as `recordPaparazziDebug`, the Emacs
-  command offers the candidate variants and retries with the selected one.
-- Refresh runs the generated preview test through the normal unit-test task and
-  reads Paparazzi's HTML report images. It does not record golden snapshots.
-- `compose-preview-record` still uses `recordPaparazzi<Variant>`, so recorded
-  golden snapshots use Paparazzi's normal `src/test/snapshots` location.
+Projects with product flavors need a full variant name, for example
+`demoDebug`. Projects using Isolated Projects reject
+`--no-configuration-cache`, so the task is configuration-cache compatible and
+that flag must not be passed.
 
 ## Development
 
@@ -139,8 +100,5 @@ make lint
 make build
 make test
 ```
-
-`make install-deps` checks out `android-mode` as a test dependency. It remains
-an optional runtime integration.
 
 Licensed under GPL-3.0-or-later.
