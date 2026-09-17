@@ -9,9 +9,12 @@ test plugins, no build file rewriting, no snapshot testing framework.
 
 ## Status
 
-The Gradle side and the renderer invocation are implemented and verified. The
-Emacs side has not been ported yet, so `compose-preview.el` still drives the
-previous Paparazzi-based flow and does not match `preview.init.gradle`.
+The Emacs, Gradle, and renderer paths are implemented end to end. A refresh
+returns immediately, builds and renders in background processes, and updates a
+persistent side-window panel without clearing the last successful images while
+work is in progress. The panel shows build, render, ready, and failure status.
+Saving can also trigger a debounced refresh when
+`compose-preview-auto-refresh-mode` is enabled in the source buffer.
 
 ## How It Works
 
@@ -22,9 +25,26 @@ Rendering happens in three steps.
    collects the module's classpath through AGP's public `ScopedArtifacts` API,
    discovers `@Preview` functions from compiled bytecode, and writes everything
    to a JSON model file.
-2. Emacs picks the previews to render and writes a rendering settings file.
-3. A small launcher renders them in a separate JVM and writes a results file
-   with one PNG per preview.
+2. Emacs filters the model to the current Kotlin file or containing preview
+   function, writes a rendering settings file, and compiles the fixed launcher
+   once per renderer version under `compose-preview-cache-directory`.
+3. The launcher renders in a separate JVM and writes a results file with one
+   PNG per preview. Gradle and the renderer run asynchronously; a newer refresh
+   cancels and supersedes an older one.
+
+## Emacs UI
+
+Run `M-x compose-preview-refresh` from a Kotlin source buffer. The command opens
+a panel on the right and returns immediately. Inside the panel:
+
+- `g` refreshes from its associated source buffer;
+- `l` opens the Gradle and renderer log;
+- `q` closes the side window.
+
+Run `M-x compose-preview-auto-refresh-mode` in a source buffer to refresh all
+previews in that file after each save. Saves are debounced by
+`compose-preview-auto-refresh-delay`; automatic refresh is buffer-local and is
+off by default. `compose-preview-panel-width` controls the side-window width.
 
 ### Preview discovery
 

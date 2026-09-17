@@ -48,21 +48,28 @@
     (search-forward "Helper")
     (should-not (compose-preview--current-preview-method))))
 
-(ert-deftest compose-preview-gradle-context-includes-preview-method ()
-  "Gradle context exports a selected preview method when the target has one."
-  (cl-letf (((symbol-function 'compose-preview--get-init-script)
-             (lambda () "/tmp/compose-preview/preview.init.gradle"))
-            ((symbol-function 'compose-preview--gradle-executable)
-             (lambda (_project-root) "/tmp/project/gradlew")))
-    (let* ((target (list :project-root "/tmp/project/"
-                         :module-root "/tmp/project/app/"
-                         :module-path ":app"
-                         :source-file "/tmp/project/app/src/main/java/example/Foo.kt"
-                         :preview-method "MainPreview"))
-           (context (compose-preview--gradle-context
-                     "testDebugUnitTest" "debug" target)))
-      (should (member "COMPOSE_PREVIEW_METHOD=MainPreview"
-                      (plist-get context :env))))))
+(ert-deftest compose-preview-select-model-previews ()
+  "Model previews are narrowed to source functions and the selected method."
+  (let* ((source (make-temp-file "compose-preview-source" nil ".kt"))
+         (previews (mapcar (lambda (fqn)
+                             (list (cons "methodFQN" fqn)))
+                           '("com.example.FooKt.First"
+                             "com.example.FooKt.Second"
+                             "com.other.BarKt.First")))
+         (model (list (cons "previews" previews))))
+    (unwind-protect
+        (progn
+          (with-temp-file source
+            (insert "package com.example\nfun First() {}\nfun Helper() {}\n"))
+          (should (equal
+                   (mapcar (lambda (preview)
+                             (compose-preview--json-get preview "methodFQN"))
+                           (compose-preview--select-model-previews
+                            model source nil))
+                   '("com.example.FooKt.First")))
+          (should-not (compose-preview--select-model-previews
+                       model source "Second")))
+      (delete-file source))))
 
 (ert-deftest compose-preview-target-prefers-android-mode-source-metadata ()
   "Target lookup follows Android Studio-style module metadata for KMP files."
@@ -211,61 +218,103 @@
               :variant "debug"
               :preview-task "testDebugUnitTest"))))))
 
-(ert-deftest compose-preview-preview-task-uses-desktop-test-for-kmp ()
-  "KMP AndroidMain variants use a desktop test renderer when available."
-  (should (equal (compose-preview--preview-task
-                  "androidMain"
-                  (list :variant "androidMain"
-                        :preview-task "desktopTest"))
-                 "desktopTest"))
-  (should (equal (compose-preview--preview-task
-                  "debug"
-                  (list :variant "debug"))
-                 "testDebugUnitTest"))
-  (should (equal (compose-preview--preview-task
-                  "androidMain"
-                  (list :variant "androidMain"
-                        :preview-task "compileAndroidMain"))
-                 "compileAndroidMain")))
-
-(ert-deftest compose-preview-preview-task-ignores-empty-metadata ()
-  "Missing preview task metadata should fall back to the variant task shape."
-  (should (equal (compose-preview--preview-task
-                  "debug"
-                  (list :variant "debug"
-                        :preview-task ""))
-                 "testDebugUnitTest")))
-
-(ert-deftest compose-preview-preview-task-rendering-p-detects-test-task ()
-  "Only preview test tasks are expected to produce screenshots."
-  (should (compose-preview--preview-task-rendering-p "testDebugUnitTest"))
-  (should (compose-preview--preview-task-rendering-p "desktopTest"))
-  (should-not (compose-preview--preview-task-rendering-p "assembleAndroidMain"))
-  (should-not (compose-preview--preview-task-rendering-p "compileAndroidMain")))
-
-(ert-deftest compose-preview-image-files-include-kmp-render-output ()
-  "KMP desktop renderer PNGs are discovered with Android outputs."
+(ert-deftest compose-preview-render-settings-expands-annotations ()
+  "Renderer settings expand annotations and preserve parameter providers."
   (let* ((root (make-temp-file "compose-preview-module" t))
-         (image (expand-file-name "build/compose-preview/foo.png" root)))
-    (make-directory (file-name-directory image) t)
-    (with-temp-file image
-      (insert "png"))
-    (should (equal (compose-preview--image-files root) (list image)))))
+         (target (list :module-root root))
+         (model '(("layoutlibPath" . "/layoutlib")
+                  ("fontsPath" . "/layoutlib/data/fonts")
+                  ("classPath" . ("/classes"))
+                  ("projectClassPath" . ("/classes"))
+                  ("rClassJars" . ("/R.jar"))
+                  ("namespace" . "com.example")
+                  ("resourceApkPath" . "/resources.ap_")))
+         (previews
+          (list
+           (list
+            (cons "methodFQN" "com.example.FooKt.Preview")
+            (cons "previewWrapperFQN" nil)
+            (cons "methodParams"
+                  (list (list (cons "provider" "com.example.Provider"))))
+            (cons "annotations"
+                  (list nil (list (cons "name" "Phone"))))))))
+    (unwind-protect
+        (let* ((render (compose-preview--render-settings model previews target))
+               (settings (compose-preview--read-json (plist-get render :settings)))
+               (screenshots (compose-preview--json-get settings "screenshots")))
+          (should (= (length screenshots) 2))
+          (should (equal (compose-preview--json-get settings "rClassJars")
+                         '("/R.jar")))
+          (should (equal (compose-preview--json-get
+                          (car (compose-preview--json-get
+                                (car screenshots) "methodParams"))
+                          "provider")
+                         "com.example.Provider")))
+      (delete-directory root t))))
 
-(ert-deftest compose-preview-init-script-configures-kmp-desktop-renderer ()
-  "AGP KMP Android modules render through desktopTest with Roborazzi."
+(ert-deftest compose-preview-init-script-configures-layoutlib-model ()
+  "Init script collects Studio renderer inputs without snapshot frameworks."
   (with-temp-buffer
     (insert-file-contents (expand-file-name "preview.init.gradle"))
     (let ((script (buffer-string)))
-      (should (string-match-p "com.android.kotlin.multiplatform.library" script))
-      (should (string-match-p "generateComposePreviewDesktopTest" script))
-      (should (string-match-p "platformType == \"jvm\"" script))
-      (should (string-match-p "jvmTestSourceSetName" script))
-      (should (string-match-p "actualJvmTestTaskName" script))
-      (should (string-match-p "project.tasks.register(\"desktopTest\")" script))
-      (should (string-match-p "roborazzi-compose-desktop" script))
-      (should (string-match-p "runDesktopComposeUiTest" script))
-      (should-not (string-match-p "ImageComposeScene" script)))))
+      (should (string-match-p "compose-preview-renderer" script))
+      (should (string-match-p "PreviewMethodFinder" script))
+      (should (string-match-p "composePreviewModel" script))
+      (should (string-match-p "rClassJars" script))
+      (should (string-match-p "includeAndroidResources" script))
+      (should-not (string-match-p "Paparazzi\\|Roborazzi" script)))))
+
+(ert-deftest compose-preview-launcher-passes-r-class-jars ()
+  "Launcher uses Studio's bootstrapper entry point with R class jars."
+  (with-temp-buffer
+    (insert-file-contents (expand-file-name "ComposePreviewRenderLauncher.java"))
+    (let ((source (buffer-string)))
+      (should (string-match-p "RenderEnvironmentBootstrapper" source))
+      (should (string-match-p "readStrings(settings, \"rClassJars\")" source))))
+  (with-temp-buffer
+    (insert-file-contents (expand-file-name "compose-preview.el"))
+    (should (string-match-p "layoutlib.thread.profile.timeoutms"
+                            (buffer-string)))))
+
+(ert-deftest compose-preview-result-items-preserve-preview-labels ()
+  "Renderer results map to panel items and retain multipreview labels."
+  (let* ((results '((("methodFQN" . "com.example.FooKt.CardPreview")
+                     ("previewId" . "com.example.FooKt.CardPreview_Phone")
+                     ("imagePath" . "phone.png"))))
+         (items (compose-preview--result-items results "/tmp/rendered/"))
+         (item (car items)))
+    (should (equal (compose-preview-item-name item) "CardPreview - Phone"))
+    (should (equal (compose-preview-item-files item)
+                   '("/tmp/rendered/phone.png")))))
+
+(ert-deftest compose-preview-stale-render-sentinel-is-ignored ()
+  "A superseded renderer process cannot replace current panel results."
+  (let ((compose-preview--generation 2)
+        finished)
+    (cl-letf (((symbol-function 'process-status) (lambda (_process) 'exit))
+              ((symbol-function 'process-get)
+               (lambda (_process _property) '(:generation 1)))
+              ((symbol-function 'compose-preview--finish-render)
+               (lambda (_context) (setq finished t))))
+      (compose-preview--render-sentinel 'process "finished\n")
+      (should-not finished))))
+
+(ert-deftest compose-preview-auto-refresh-uses-source-buffer ()
+  "Debounced refresh runs in its original source buffer."
+  (let ((source (generate-new-buffer " *compose-preview-source*"))
+        refreshed all-in-file)
+    (unwind-protect
+        (with-current-buffer source
+          (compose-preview-auto-refresh-mode 1)
+          (cl-letf (((symbol-function 'compose-preview-refresh)
+                     (lambda (&optional _variant)
+                       (setq refreshed (current-buffer)
+                             all-in-file compose-preview--refresh-all-in-file))))
+            (compose-preview--auto-refresh-buffer source))
+          (should (eq refreshed source))
+          (should all-in-file))
+      (when (buffer-live-p source)
+        (kill-buffer source)))))
 
 (provide 'compose-preview-tests)
 
