@@ -116,17 +116,26 @@ abstract class ComposePreviewModelTask extends DefaultTask {
         def projectDirFiles = projectDirs.get().collect { it.asFile }
         def projectJarFiles = projectJars.get().collect { it.asFile }
         def scopedFiles = allDirs.get().collect { it.asFile } + allJars.get().collect { it.asFile }
-        def projectClassPath = (projectDirFiles + projectJarFiles).findAll { it.exists() }
-        // Dependency R classes are a separate artifact from dependency classes,
-        // and layoutlib needs both to inflate library-provided views. The local
-        // test component's non-namespaced R jar carries every dependency's R
-        // class, which is what the renderer resolves resource ids against.
-        def aggregatedRJars = aggregatedRClassJar.files.findAll { it.name == "R.jar" }
-        def rClassJars = ((dependencyRClasses.files.toList() + aggregatedRJars) as Set)
+        def aggregatedRJars = aggregatedRClassJar.files.findAll {
+            it.name == "R.jar" && it.exists()
+        }
+        // Match AGP's Compose Preview runfiles: the linked R jar belongs to the
+        // project classpath, ahead of module classes, while dependency classes
+        // come only from the runtime configuration.
+        def projectClassPath = (aggregatedRJars + projectDirFiles + projectJarFiles)
+                .findAll { it.exists() }
+        def allRClassJars = new LinkedHashSet(
+                dependencyRClasses.files.toList() + aggregatedRJars)
                 .findAll { it.exists() }
                 .toList()
-        def dependencyJars = ((scopedFiles + dependencyClasses.files.toList() + rClassJars) as Set)
-                .findAll { it.exists() && !projectClassPath.contains(it) }
+        def rClassJars = aggregatedRJars ?: allRClassJars
+        def dependencyJars = new LinkedHashSet(
+                scopedFiles + dependencyClasses.files.toList())
+                .findAll {
+                    it.exists() &&
+                            !projectClassPath.contains(it) &&
+                            !allRClassJars.contains(it)
+                }
                 .toList()
 
         // The finder scans its first two arguments; the rest only resolve
@@ -376,7 +385,7 @@ gradle.ext.composePreviewRegisterKmp = { project, variant, resourceApk, runtimeR
         task.rendererClasspath.from(renderer)
         task.allJars.set([])
         task.allDirs.set([])
-        [variant.runtimeConfiguration, variant.compileConfiguration].each { configuration ->
+        [variant.runtimeConfiguration].each { configuration ->
             ["android-classes-jar", "jar", "processed-jar"].each { artifactType ->
                 task.dependencyClasses.from(
                         dependencyClassesFromConfiguration(configuration, artifactType))
@@ -439,13 +448,14 @@ gradle.beforeProject { project ->
                     task.layoutlibRuntimeJar.from(layoutlibRuntime)
                     task.layoutlibResourcesJar.from(layoutlibResources)
                     task.rendererClasspath.from(renderer)
-                    // Mirrors AGP's Compose screenshot support: dependency
-                    // classes and dependency R classes are separate artifacts,
-                    // and both the runtime and compile classpaths contribute.
-                    ["${targetVariant}RuntimeClasspath", "${targetVariant}CompileClasspath"].each { name ->
-                        task.dependencyClasses.from(dependencyClassesView(project, name, "android-classes-jar"))
-                        task.dependencyRClasses.from(dependencyClassesView(project, name, "r-class-jar"))
-                    }
+                    // Match AGP's Compose Preview runfiles task: only the
+                    // runtime configuration contributes dependency classes.
+                    task.dependencyClasses.from(
+                            dependencyClassesView(project,
+                                    "${targetVariant}RuntimeClasspath", "android-classes-jar"))
+                    task.dependencyRClasses.from(
+                            dependencyClassesView(project,
+                                    "${targetVariant}RuntimeClasspath", "r-class-jar"))
 
                     def resourceApkTask = "package${variantSuffix}UnitTestForUnitTest"
                     if (project.tasks.names.contains(resourceApkTask)) {

@@ -90,14 +90,21 @@ variant path. Modules using the newer
 `com.android.kotlin.multiplatform.library` plugin are supported on AGP 9.3.x by
 a version-gated adapter under `adapters/`.
 
-The KMP module must create an Android host test, include Android resources, and
-put the Android Compose tooling runtime on the Android target's runtime
-classpath:
+The adapter creates a temporary Android host-test compilation when the module
+does not already define one, then enables Android resources for that compilation.
+It also supplies neutral values for otherwise-unset placeholders found in
+dependency AAR manifests, since layoutlib only needs the linked resources. This
+only changes the in-memory Gradle model for the preview invocation; it does not
+edit the project's build file. If the module already defines a host test, it
+must include Android resources. The Android Compose tooling runtime must also be
+on the Android target's runtime classpath:
 
 ```kotlin
 kotlin {
     android {
         androidResources.enable = true
+
+        // Optional: compose-preview creates this temporarily when absent.
         withHostTestBuilder {}.configure {
             isIncludeAndroidResources = true
         }
@@ -133,8 +140,12 @@ specific compatibility error rather than guessing intermediate paths.
   Preview reading a string through the module R class and a Compose
   Multiplatform Preview declared in `commonMain` rendered through layoutlib as
   non-empty 630 x 263 PNGs. The model task reused Gradle's configuration cache;
-  removing the host test produced the expected `withHostTestBuilder {}`
-  diagnostic.
+  removing the host test verified that the adapter creates it temporarily.
+- A production AGP 9.3 Android KMP module without a declared host test, whose
+  dependency manifests contain unset placeholders. The adapter created the
+  temporary resource host test without changing the build file, collected 427
+  Preview declarations, and rendered all six `@PreviewParameter` values for the
+  selected Preview.
 
 These checks are focused runtime validation rather than repository test
 fixtures: this personal configuration repository does not add new test files.

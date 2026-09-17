@@ -27,13 +27,43 @@ static Object internalArtifact(Object component, String name) {
     }
 }
 
+static Object previewPlaceholderDefaults(Object project, Object variant) {
+    def aarFiles = variant.runtimeConfiguration.incoming.artifactView { view ->
+        view.lenient(true)
+        view.attributes {
+            it.attribute(
+                    org.gradle.api.attributes.Attribute.of("artifactType", String), "aar")
+        }
+    }.files
+    return project.providers.provider {
+        def placeholders = [:]
+        aarFiles.files.findAll { it.isFile() }.each { aar ->
+            new java.util.zip.ZipFile(aar).withCloseable { zip ->
+                def manifest = zip.getEntry("AndroidManifest.xml")
+                if (manifest != null) {
+                    def text = zip.getInputStream(manifest).withCloseable {
+                        new String(it.bytes, java.nio.charset.StandardCharsets.UTF_8)
+                    }
+                    (text =~ /\$\{([A-Za-z_][A-Za-z0-9_.-]*)\}/).each { match ->
+                        def name = match[1]
+                        if (name != "applicationId") {
+                            placeholders.putIfAbsent(name, "compose-preview")
+                        }
+                    }
+                }
+            }
+        }
+        return placeholders
+    }
+}
+
 static Object requiredHostTest(Object variant) {
     def host = variant.hostTests.values().find {
         it.name == "androidHostTest" || it.name.toLowerCase(Locale.ROOT).contains("host")
     }
     if (host == null) {
         throw new GradleException(
-                "compose-preview: Android KMP requires withHostTestBuilder {}")
+                "compose-preview: could not create the temporary Android KMP host test")
     }
     if (!host.androidResourcesIncluded) {
         throw new GradleException(
@@ -55,13 +85,34 @@ gradle.beforeProject { project ->
         if (androidComponents == null) {
             return
         }
-        androidComponents.onVariants(androidComponents.selector().withName(targetVariant)) { variant ->
-            def version = androidGradlePluginVersion(variant)
-            if (!(version ==~ /9\.3(?:\..*)?/)) {
+        def version = androidGradlePluginVersion(androidComponents)
+        if (!(version ==~ /9\.3(?:\..*)?/)) {
+            throw new GradleException(
+                    "compose-preview: Android KMP supports AGP 9.3.x; found ${version}")
+        }
+        def automaticHostTest = "composePreviewAutomaticHostTest"
+        project.extensions.extraProperties.set(automaticHostTest, false)
+        androidComponents.finalizeDsl {
+            def android = project.extensions.findByName("kotlin")
+                    ?.targets?.findByName("android")
+            if (android == null) {
                 throw new GradleException(
-                        "compose-preview: Android KMP supports AGP 9.3.x; found ${version}")
+                        "compose-preview: could not find the Android KMP target")
             }
+            if (android.compilations.findByName("hostTest") == null) {
+                android.withHostTest {
+                    setIncludeAndroidResources(true)
+                }
+                project.extensions.extraProperties.set(automaticHostTest, true)
+            }
+        }
+        androidComponents.onVariants(androidComponents.selector().withName(targetVariant)) { variant ->
             def host = requiredHostTest(variant)
+            if (project.extensions.extraProperties.get(automaticHostTest)) {
+                host.manifestPlaceholders.putAll(
+                        previewPlaceholderDefaults(project, variant))
+                host.manifestPlaceholders.putAll(variant.manifestPlaceholders)
+            }
             def resourceApk = host.artifacts.get(internalArtifact(host, "APK_FOR_LOCAL_TEST"))
             def runtimeRJar = host.artifacts.get(
                     internalArtifact(host, "COMPILE_AND_RUNTIME_R_CLASS_JAR"))

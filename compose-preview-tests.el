@@ -308,6 +308,9 @@
       (should (string-match-p "COMPOSE_PREVIEW_ADAPTER_DIRECTORY" script))
       (should-not (string-match-p "InternalArtifactType" script))
       (should (string-match-p "rClassJars" script))
+      (should (string-search "aggregatedRJars + projectDirFiles" script))
+      (should (string-match-p "runtime configuration" script))
+      (should-not (string-match-p "targetVariant}CompileClasspath" script))
       (should (string-match-p "includeAndroidResources" script))
       (should-not (string-match-p "Paparazzi\\|Roborazzi" script)))))
 
@@ -322,8 +325,13 @@
       (should (string-match-p "9\\\\.3" adapter))
       (should (string-match-p "APK_FOR_LOCAL_TEST" adapter))
       (should (string-match-p "COMPILE_AND_RUNTIME_R_CLASS_JAR" adapter))
-      (should (string-match-p "withHostTestBuilder" adapter))
-      (should (string-match-p "isIncludeAndroidResources" adapter)))))
+      (should (string-match-p "withHostTest" adapter))
+      (should (string-match-p "previewPlaceholderDefaults" adapter))
+      (should (string-match-p "manifestPlaceholders.putAll" adapter))
+      (should (string-match-p "finalizeDsl" adapter))
+      (should (string-match-p "setIncludeAndroidResources" adapter))
+      (should (string-match-p "isIncludeAndroidResources" adapter))
+      (should-not (string-match-p "requires withHostTestBuilder" adapter)))))
 
 (ert-deftest compose-preview-launcher-passes-r-class-jars ()
   "Launcher uses Studio's bootstrapper entry point with R class jars."
@@ -377,6 +385,20 @@
       (when (buffer-live-p source)
         (kill-buffer source)))))
 
+(ert-deftest compose-preview-failure-normalizes-package-prefix ()
+  "Panel failures do not repeat an existing compose-preview prefix."
+  (let (status logged)
+    (cl-letf (((symbol-function 'compose-preview--panel-status)
+               (lambda (_source _root message &optional _face)
+                 (setq status message)))
+              ((symbol-function 'compose-preview--log)
+               (lambda (_format message) (setq logged message))))
+      (compose-preview--fail
+       '(:target (:module-root "/tmp/")) "%s"
+       "compose-preview: Android KMP failed")
+      (should (equal status "failed — Android KMP failed"))
+      (should (equal logged "Android KMP failed")))))
+
 (ert-deftest compose-preview-gradle-failure-prefers-specific-diagnostic ()
   "Gradle failures surface compose-preview diagnostics in the panel."
   (with-temp-buffer
@@ -411,6 +433,8 @@
                   ((symbol-function 'compose-preview--panel-status) #'ignore))
           (compose-preview--compile-launcher context)))
       (should (equal (car command) "/jdk/bin/javac"))
+      (should (equal (seq-take (cdr command) 3)
+                     '("-nowarn" "--release" "17")))
       (should (eq sentinel #'compose-preview--launcher-sentinel))))
 
 (provide 'compose-preview-tests)

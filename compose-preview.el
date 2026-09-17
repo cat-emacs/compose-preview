@@ -684,7 +684,7 @@ METHOD may be an unqualified name or a full JVM method name."
 
 (defun compose-preview--launcher-directory ()
   "Return cache directory for the compiled renderer launcher."
-  (expand-file-name (concat "launcher-" compose-preview-renderer-version "/")
+  (expand-file-name (concat "launcher-v2-" compose-preview-renderer-version "/")
                     compose-preview-cache-directory))
 
 (defun compose-preview--launcher-spec (model)
@@ -837,7 +837,8 @@ MODULE-ROOT and PREVIEWS are accepted for compatibility with older callers."
 FORMAT-STRING and ARGS are passed to `format'."
   (let* ((source (plist-get context :source-buffer))
          (target (plist-get context :target))
-         (message (apply #'format format-string args)))
+         (message (apply #'format format-string args))
+         (message (string-remove-prefix "compose-preview: " message)))
     (compose-preview--panel-status source (plist-get target :module-root)
                                    (concat "failed — " message) 'error)
     (compose-preview--log "%s" message)))
@@ -969,7 +970,7 @@ FORMAT-STRING and ARGS are passed to `format'."
            (make-process
             :name "compose-preview-launcher-compiler"
             :buffer log-buffer :stderr log-buffer :noquery t
-            :command (list (plist-get launcher :javac) "-nowarn"
+            :command (list (plist-get launcher :javac) "-nowarn" "--release" "17"
                            "-cp" (plist-get launcher :classpath)
                            "-d" directory (plist-get launcher :source))
             :sentinel #'ignore)))
