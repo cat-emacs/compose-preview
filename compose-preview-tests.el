@@ -385,6 +385,57 @@
     (should (equal (mapcar #'compose-preview-item-name (cdr (assoc "Phones" groups)))
                    '("Phone")))))
 
+(ert-deftest compose-preview-panel-filters-compose-name-and-group ()
+  "Text and group filters compose without changing the result model."
+  (with-temp-buffer
+    (compose-preview-results-mode)
+    (setq-local compose-preview--items
+                (list (make-compose-preview-item
+                       :name "Phone Card" :method-fqn "example.Phone"
+                       :group "Devices")
+                      (make-compose-preview-item
+                       :name "Tablet Card" :method-fqn "example.Tablet"
+                       :group "Devices")
+                      (make-compose-preview-item
+                       :name "Phone Dark" :method-fqn "example.Dark"
+                       :group "Themes"))
+                compose-preview--search-query "PHONE"
+                compose-preview--group-filter "Devices")
+    (should (equal (mapcar #'compose-preview-item-name
+                           (compose-preview--visible-items))
+                   '("Phone Card")))))
+
+(ert-deftest compose-preview-focus-navigation-wraps-filtered-items ()
+  "Focus navigation cycles through only currently visible items."
+  (with-temp-buffer
+    (compose-preview-results-mode)
+    (setq-local compose-preview--items
+                (list (make-compose-preview-item :id "one" :name "One")
+                      (make-compose-preview-item :id "two" :name "Two"))
+                compose-preview--module-root "/tmp/"
+                compose-preview--view-mode 'focus
+                compose-preview--focus-id "two")
+    (cl-letf (((symbol-function 'compose-preview--redraw) #'ignore))
+      (compose-preview-next)
+      (should (equal compose-preview--focus-id "one"))
+      (compose-preview-previous)
+      (should (equal compose-preview--focus-id "two")))))
+
+(ert-deftest compose-preview-scale-commands-update-panel-state ()
+  "Fit, original size, and zoom commands update scale without rendering."
+  (with-temp-buffer
+    (compose-preview-results-mode)
+    (cl-letf (((symbol-function 'compose-preview--redraw) #'ignore))
+      (compose-preview-original-size)
+      (should-not compose-preview--fit-images)
+      (should (= compose-preview--image-zoom 1.0))
+      (compose-preview-zoom-in)
+      (should (= compose-preview--image-zoom 1.25))
+      (compose-preview-zoom-out)
+      (should (= compose-preview--image-zoom 1.0))
+      (compose-preview-fit)
+      (should compose-preview--fit-images))))
+
 (ert-deftest compose-preview-group-sections-toggle-visibility ()
   "Group headers hide and reveal their Preview body without rebuilding it."
   (with-temp-buffer
@@ -406,6 +457,25 @@
     (should-not (seq-some (lambda (overlay) (overlay-get overlay 'invisible))
                           (overlays-in (point-min) (point-max))))))
 
+(ert-deftest compose-preview-render-results-restores-status-and-validates-group ()
+  "Rendering restores issue status and clears a stale group filter."
+  (let ((items (list (make-compose-preview-item
+                      :id "broken" :name "Broken" :group "Current"
+                      :error '(("message" . "boom"))))))
+    (unwind-protect
+        (cl-letf (((symbol-function 'compose-preview--insert-image) #'ignore)
+                  ((symbol-function 'compose-preview--display-panel) #'ignore))
+          (with-current-buffer (get-buffer-create compose-preview-results-buffer-name)
+            (compose-preview-results-mode)
+            (setq compose-preview--group-filter "Previous"))
+          (compose-preview--render-results "/tmp/" nil items nil)
+          (with-current-buffer compose-preview-results-buffer-name
+            (should-not compose-preview--group-filter)
+            (should (string-match-p
+                     "1 issue" (substring-no-properties header-line-format)))))
+      (when-let* ((buffer (get-buffer compose-preview-results-buffer-name)))
+        (kill-buffer buffer)))))
+
 (ert-deftest compose-preview-render-results-preserves-fold-state ()
   "Refreshing the panel preserves collapsed Preview groups."
   (let ((items (list (make-compose-preview-item
@@ -417,10 +487,14 @@
           (compose-preview--render-results "/tmp/" nil items nil)
           (with-current-buffer compose-preview-results-buffer-name
             (compose-preview-toggle-group "Devices")
+            (setq compose-preview--view-mode 'focus)
             (should (gethash "Devices" compose-preview--collapsed-groups)))
           (compose-preview--render-results "/tmp/" nil items nil)
           (with-current-buffer compose-preview-results-buffer-name
+            (should (eq compose-preview--view-mode 'focus))
             (should (gethash "Devices" compose-preview--collapsed-groups))
+            (setq compose-preview--view-mode 'gallery)
+            (compose-preview--redraw)
             (should (eq (overlay-get
                          (gethash "Devices" compose-preview--group-overlays)
                          'invisible)
@@ -488,7 +562,7 @@
   "Individual render failures do not discard successful Preview results."
   (let* ((results-file (make-temp-file "compose-preview-results" nil ".json"))
          (compose-preview--last-result-items nil)
-         rendered status)
+         rendered)
     (unwind-protect
         (progn
           (with-temp-file results-file
@@ -507,13 +581,10 @@
                     ((symbol-function 'compose-preview--log) #'ignore))
             (compose-preview--finish-render
              `(:target (:module-root "/tmp/")
-               :render (:results ,results-file :output "/tmp/")))
-            (with-current-buffer compose-preview-results-buffer-name
-              (setq status header-line-format)))
+               :render (:results ,results-file :output "/tmp/"))))
           (should (= (length rendered) 2))
           (should-not (compose-preview-item-error (car rendered)))
-          (should (compose-preview-item-error (cadr rendered)))
-          (should (string-match-p "1 issue" (substring-no-properties status))))
+          (should (compose-preview-item-error (cadr rendered))))
       (delete-file results-file)
       (when-let* ((buffer (get-buffer compose-preview-results-buffer-name)))
         (kill-buffer buffer)))))
