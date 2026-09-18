@@ -436,20 +436,56 @@
       (compose-preview-fit)
       (should compose-preview--fit-images))))
 
+(ert-deftest compose-preview-actual-size-follows-density-and-host-scale ()
+  "Actual size maps renderer pixels to Studio surface coordinates."
+  (cl-letf (((symbol-function 'compose-preview--image-width)
+             (lambda (_image) 1080))
+            ((symbol-function 'compose-preview--frame-scale-factor)
+             (lambda () 2.0)))
+    (should (= (compose-preview--actual-image-width 'image 480) 180))
+    (should (= (compose-preview--actual-image-width 'image nil) 1080))))
+
+(ert-deftest compose-preview-image-spec-fits-without-upscaling ()
+  "Fit mode only shrinks images from their Studio-style actual size."
+  (let ((compose-preview--fit-images t)
+        created-widths)
+    (cl-letf (((symbol-function 'create-image)
+               (lambda (_file _type _data-p &rest properties)
+                 (push (plist-get properties :width) created-widths)
+                 'image))
+              ((symbol-function 'compose-preview--actual-image-width)
+               (lambda (_image _density) 180))
+              ((symbol-function 'compose-preview--fit-width) (lambda () 320)))
+      (compose-preview--image-spec "phone.png" 480)
+      (should (equal created-widths '(180 nil))))
+    (setq created-widths nil)
+    (cl-letf (((symbol-function 'create-image)
+               (lambda (_file _type _data-p &rest properties)
+                 (push (plist-get properties :width) created-widths)
+                 'image))
+              ((symbol-function 'compose-preview--actual-image-width)
+               (lambda (_image _density) 600))
+              ((symbol-function 'compose-preview--fit-width) (lambda () 320)))
+      (compose-preview--image-spec "tablet.png" 320)
+      (should (equal created-widths '(320 nil))))))
+
 (ert-deftest compose-preview-group-sections-toggle-visibility ()
   "Group headers hide and reveal their Preview body without rebuilding it."
   (with-temp-buffer
     (compose-preview-results-mode)
     (let ((inhibit-read-only t))
       (cl-letf (((symbol-function 'compose-preview--insert-image)
-                 (lambda (_file) (insert "[image]"))))
+                 (lambda (&rest _args) (insert "[image]"))))
         (compose-preview--insert-group
          "Devices"
          (list (make-compose-preview-item :name "Phone" :files '("phone.png"))))))
     (goto-char (point-min))
     (should (equal (compose-preview--group-at-point) "Devices"))
+    (search-forward "Phone")
+    (should (equal (compose-preview--group-at-point) "Devices"))
     (compose-preview-toggle-group)
     (should (gethash "Devices" compose-preview--collapsed-groups))
+    (should (get-text-property (point) 'compose-preview-group))
     (should (seq-some (lambda (overlay) (overlay-get overlay 'invisible))
                       (overlays-in (point-min) (point-max))))
     (compose-preview-toggle-group "Devices")
@@ -482,7 +518,7 @@
                       :name "Phone" :group "Devices" :files '("phone.png")))))
     (unwind-protect
         (cl-letf (((symbol-function 'compose-preview--insert-image)
-                   (lambda (_file) (insert "[image]")))
+                   (lambda (&rest _args) (insert "[image]")))
                   ((symbol-function 'compose-preview--display-panel) #'ignore))
           (compose-preview--render-results "/tmp/" nil items nil)
           (with-current-buffer compose-preview-results-buffer-name
@@ -508,7 +544,8 @@
          (metadata (make-hash-table :test #'equal))
          (results `((("methodFQN" . "com.example.FooKt.CardPreview")
                      ("previewId" . ,id)
-                     ("imagePath" . "phone.png"))))
+                     ("imagePath" . "phone.png")
+                     ("densityDpi" . 480))))
          (_ (puthash id '(:preview-name "Phone" :group "Devices"
                           :source-file "Foo.kt") metadata))
          (items (compose-preview--result-items results "/tmp/rendered/" metadata))
@@ -517,6 +554,7 @@
     (should (equal (compose-preview-item-preview-name item) "Phone"))
     (should (equal (compose-preview-item-group item) "Devices"))
     (should (equal (compose-preview-item-source-file item) "Foo.kt"))
+    (should (= (compose-preview-item-density-dpi item) 480))
     (should (equal (compose-preview-item-files item)
                    '("/tmp/rendered/phone.png")))))
 
@@ -538,7 +576,7 @@
   (with-temp-buffer
     (cl-letf (((symbol-function 'file-readable-p) (lambda (_file) t))
               ((symbol-function 'compose-preview--insert-image)
-               (lambda (_file) (insert "[image]"))))
+               (lambda (&rest _args) (insert "[image]"))))
       (compose-preview--insert-preview
        (make-compose-preview-item
         :name "Broken" :files '("broken.png")

@@ -18,6 +18,8 @@ import com.android.tools.render.common.PreviewScreenshot;
 import com.android.tools.render.common.PreviewScreenshotResult;
 import com.android.tools.render.compose.ComposeScreenshot;
 import com.android.tools.render.framework.IJFramework;
+import com.android.tools.configurations.Configuration;
+import com.android.tools.preview.PreviewConfigurationKt;
 import com.google.gson.JsonArray;
 import com.google.gson.JsonElement;
 import com.google.gson.JsonObject;
@@ -26,7 +28,9 @@ import com.intellij.openapi.util.Disposer;
 
 import java.io.BufferedReader;
 import java.io.File;
+import java.io.StringWriter;
 import java.io.Writer;
+import java.lang.reflect.Field;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.util.ArrayList;
@@ -64,6 +68,7 @@ public final class ComposePreviewRenderLauncher {
         List<PreviewScreenshot> screenshots = readScreenshots(settings.getAsJsonArray("screenshots"));
 
         PreviewRenderingResult result;
+        List<Integer> densityDpis = new ArrayList<>();
         try {
             RenderEnvironmentBootstrapper bootstrapper = new RenderEnvironmentBootstrapper(
                     optionalString(settings, "fontsPath"),
@@ -77,21 +82,22 @@ public final class ComposePreviewRenderLauncher {
             List<PreviewScreenshotResult> results = new ArrayList<>();
             try (Renderer renderer = bootstrapper.bootstrap()) {
                 for (PreviewScreenshot screenshot : screenshots) {
-                    results.addAll(renderer.render(screenshot, outputFolder));
+                    Integer densityDpi = resolveDensityDpi(renderer, screenshot);
+                    List<PreviewScreenshotResult> screenshotResults =
+                            renderer.render(screenshot, outputFolder);
+                    results.addAll(screenshotResults);
+                    for (int index = 0; index < screenshotResults.size(); index++) {
+                        densityDpis.add(densityDpi);
+                    }
                 }
             }
             result = new PreviewRenderingResult(null, results);
         } catch (Throwable failure) {
             result = new PreviewRenderingResult(stackTraceOf(failure), new ArrayList<>());
+            densityDpis.clear();
         }
 
-        File resultsFile = new File(resultsFilePath);
-        if (resultsFile.getParentFile() != null) {
-            resultsFile.getParentFile().mkdirs();
-        }
-        try (Writer writer = Files.newBufferedWriter(resultsFile.toPath(), StandardCharsets.UTF_8)) {
-            com.android.tools.render.common.JsonSerializationKt.writePreviewRenderingResult(writer, result);
-        }
+        writeResult(resultsFilePath, result, densityDpis);
 
         int failures = 0;
         if (result.getGlobalError() != null) {
@@ -107,6 +113,49 @@ public final class ComposePreviewRenderLauncher {
             }
         }
         return failures == 0 ? 0 : 1;
+    }
+
+    private static Integer resolveDensityDpi(Renderer renderer, PreviewScreenshot screenshot) {
+        try {
+            Field baseConfiguration = Renderer.class.getDeclaredField("baseConfiguration");
+            baseConfiguration.setAccessible(true);
+            Configuration configuration =
+                    ((Configuration) baseConfiguration.get(renderer)).clone();
+            PreviewConfigurationKt.applyTo(
+                    screenshot.toPreviewElement(renderer.getModule()),
+                    configuration,
+                    ignored -> null);
+            int densityDpi = configuration.getDensity().getDpiValue();
+            return densityDpi > 0 ? densityDpi : null;
+        } catch (Throwable ignored) {
+            return null;
+        }
+    }
+
+    private static void writeResult(
+            String resultsFilePath,
+            PreviewRenderingResult result,
+            List<Integer> densityDpis) throws Exception {
+        StringWriter serialized = new StringWriter();
+        com.android.tools.render.common.JsonSerializationKt.writePreviewRenderingResult(serialized, result);
+        JsonObject json = JsonParser.parseString(serialized.toString()).getAsJsonObject();
+        JsonArray screenshotResults = json.getAsJsonArray("screenshotResults");
+        if (screenshotResults != null) {
+            for (int index = 0; index < screenshotResults.size() && index < densityDpis.size(); index++) {
+                Integer densityDpi = densityDpis.get(index);
+                if (densityDpi != null) {
+                    screenshotResults.get(index).getAsJsonObject().addProperty("densityDpi", densityDpi);
+                }
+            }
+        }
+
+        File resultsFile = new File(resultsFilePath);
+        if (resultsFile.getParentFile() != null) {
+            resultsFile.getParentFile().mkdirs();
+        }
+        try (Writer writer = Files.newBufferedWriter(resultsFile.toPath(), StandardCharsets.UTF_8)) {
+            writer.write(json.toString());
+        }
     }
 
     private static List<PreviewScreenshot> readScreenshots(JsonArray array) {

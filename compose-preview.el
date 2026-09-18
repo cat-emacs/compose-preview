@@ -175,8 +175,14 @@ Each entry is (PROJECT-ROOT . TARGET), where TARGET is a plist containing
   preview-name
   group
   source-file
+  density-dpi
   files
   error)
+
+(defface compose-preview-section-heading
+  '((t :inherit font-lock-function-name-face :weight bold :extend t))
+  "Face for Compose Preview section headings."
+  :group 'compose-preview)
 
 (defconst compose-preview--default-group "Default"
   "Display name for Preview annotations without an explicit group.")
@@ -189,6 +195,12 @@ Each entry is (PROJECT-ROOT . TARGET), where TARGET is a plist containing
 
 (defvar-local compose-preview--group-overlays nil
   "Hash table of Preview group body overlays in the results buffer.")
+
+(defvar-local compose-preview--group-header-overlays nil
+  "Hash table of Preview group heading overlays in the results buffer.")
+
+(defvar-local compose-preview--section-highlight-overlay nil
+  "Overlay highlighting the Preview section at point.")
 
 (defvar-local compose-preview--items nil
   "All items available to the current Preview panel.")
@@ -211,8 +223,8 @@ Each entry is (PROJECT-ROOT . TARGET), where TARGET is a plist containing
 (defvar-local compose-preview--group-filter nil
   "Preview group to display, or nil to display every group.")
 
-(defvar-local compose-preview--fit-images t
-  "Non-nil when Preview images should fit the panel width.")
+(defvar-local compose-preview--fit-images nil
+  "Non-nil when oversized Preview images should fit the panel width.")
 
 (defvar-local compose-preview--image-zoom 1.0
   "Image scale used when `compose-preview--fit-images' is nil.")
@@ -247,8 +259,11 @@ Each entry is (PROJECT-ROOT . TARGET), where TARGET is a plist containing
   :group 'compose-preview
   (unless (hash-table-p compose-preview--collapsed-groups)
     (setq-local compose-preview--collapsed-groups (make-hash-table :test #'equal)))
-  (setq-local compose-preview--group-overlays (make-hash-table :test #'equal))
+  (setq-local compose-preview--group-overlays (make-hash-table :test #'equal)
+              compose-preview--group-header-overlays
+              (make-hash-table :test #'equal))
   (add-to-invisibility-spec 'compose-preview-fold)
+  (add-hook 'post-command-hook #'compose-preview--highlight-section nil t)
   (add-hook 'window-state-change-functions
             #'compose-preview--window-state-change nil t))
 
@@ -902,7 +917,7 @@ METHOD may be an unqualified name or a full JVM method name."
 
 (defun compose-preview--launcher-directory ()
   "Return cache directory for the compiled renderer launcher."
-  (expand-file-name (concat "launcher-v2-" compose-preview-renderer-version "/")
+  (expand-file-name (concat "launcher-v3-" compose-preview-renderer-version "/")
                     compose-preview-cache-directory))
 
 (defun compose-preview--launcher-spec (model)
@@ -982,29 +997,55 @@ Use GENERATION to isolate concurrent or superseded render attempts."
       (max 64 (- (window-body-width window t) 32))
     compose-preview-image-width))
 
-(defun compose-preview--image-spec (file)
-  "Return an image spec for FILE using the current panel scale."
-  (let ((original (create-image file 'png nil)))
-    (cond
-     (compose-preview--fit-images
-      (create-image file 'png nil :width (compose-preview--fit-width)))
-     ((= compose-preview--image-zoom 1.0) original)
-     (t
-      (condition-case nil
-          (create-image file 'png nil
-                        :width (round (* (car (image-size original t))
-                                         compose-preview--image-zoom)))
-        (error
-         (create-image file 'png nil
-                       :width (round (* compose-preview-image-width
-                                        compose-preview--image-zoom)))))))))
+(defun compose-preview--image-width (image)
+  "Return pixel width of IMAGE, or nil when it cannot be measured."
+  (condition-case nil
+      (car (image-size image t))
+    (error nil)))
 
-(defun compose-preview--insert-image (file)
-  "Insert FILE as an image preview using the current panel scale."
+(defun compose-preview--frame-scale-factor ()
+  "Return the current frame's physical-to-logical pixel scale."
+  (if (fboundp 'frame-scale-factor)
+      (float (frame-scale-factor
+              (window-frame (or (get-buffer-window (current-buffer) t)
+                                (selected-window)))))
+    1.0))
+
+(defun compose-preview--actual-image-width (image density-dpi)
+  "Return IMAGE width at Studio-style actual size for DENSITY-DPI."
+  (when-let* ((width (compose-preview--image-width image)))
+    (if (and density-dpi (> density-dpi 0))
+        (round (/ (* width 160.0)
+                  density-dpi
+                  (max 1.0 (compose-preview--frame-scale-factor))))
+      width)))
+
+(defun compose-preview--image-spec (file &optional density-dpi)
+  "Return an image spec for FILE using Android Studio scale semantics.
+At actual size, convert renderer pixels to Android dp using DENSITY-DPI and
+compensate for the host frame scale, matching Studio's design surface.  Fit
+mode only shrinks images that exceed the available panel width."
+  (let* ((original (create-image file 'png nil))
+         (width (compose-preview--actual-image-width original density-dpi))
+         (fit-width (compose-preview--fit-width))
+         (display-width
+          (cond
+           ((and width compose-preview--fit-images)
+            (min width fit-width))
+           (width (round (* width compose-preview--image-zoom)))
+           ((= compose-preview--image-zoom 1.0) nil)
+           (t (round (* compose-preview-image-width
+                        compose-preview--image-zoom))))))
+    (if display-width
+        (create-image file 'png nil :width display-width)
+      original)))
+
+(defun compose-preview--insert-image (file &optional density-dpi)
+  "Insert FILE using Studio-style scale for DENSITY-DPI."
   (if (and (display-images-p)
            (image-type-available-p 'png))
       (condition-case err
-          (insert-image (compose-preview--image-spec file))
+          (insert-image (compose-preview--image-spec file density-dpi))
         (error
          (insert (format "Could not render image: %s" (error-message-string err)))))
     (insert "Image display is not available in this Emacs session.")))
@@ -1097,12 +1138,27 @@ Use GENERATION to isolate concurrent or superseded render attempts."
           (if compose-preview--search-query
               (format " · /%s/" compose-preview--search-query) "")))
 
+(defun compose-preview--delete-section-overlays ()
+  "Delete section overlays owned by the current Preview panel."
+  (dolist (table (list compose-preview--group-overlays
+                       compose-preview--group-header-overlays))
+    (when (hash-table-p table)
+      (maphash (lambda (_group overlay)
+                 (when (overlayp overlay)
+                   (delete-overlay overlay)))
+               table)))
+  (when (overlayp compose-preview--section-highlight-overlay)
+    (delete-overlay compose-preview--section-highlight-overlay)))
+
 (defun compose-preview--redraw ()
   "Redraw the current Preview panel without rerendering images."
   (let ((inhibit-read-only t)
         (visible (compose-preview--visible-items)))
+    (compose-preview--delete-section-overlays)
     (erase-buffer)
     (setq compose-preview--group-overlays (make-hash-table :test #'equal)
+          compose-preview--group-header-overlays (make-hash-table :test #'equal)
+          compose-preview--section-highlight-overlay nil
           compose-preview--group-names
           (mapcar #'car (compose-preview--group-items visible)))
     (insert (format "Compose Preview  %s\n" compose-preview--module-root))
@@ -1130,8 +1186,24 @@ Use GENERATION to isolate concurrent or superseded render attempts."
         (insert "\n\n"))))))
 
 (defun compose-preview--group-at-point ()
-  "Return Preview group name at point, or nil outside a group header."
-  (get-text-property (line-beginning-position) 'compose-preview-group))
+  "Return the Preview group containing point, like a Magit section."
+  (or (get-text-property (point) 'compose-preview-group)
+      (get-text-property (point) 'compose-preview-section-group)
+      (and (> (point) (point-min))
+           (get-text-property (1- (point)) 'compose-preview-section-group))))
+
+(defun compose-preview--highlight-section ()
+  "Highlight the heading of the Preview section containing point."
+  (when (overlayp compose-preview--section-highlight-overlay)
+    (delete-overlay compose-preview--section-highlight-overlay))
+  (setq compose-preview--section-highlight-overlay nil)
+  (when-let* ((group (compose-preview--group-at-point))
+              (header (gethash group compose-preview--group-header-overlays))
+              ((overlay-buffer header)))
+    (let ((overlay (make-overlay (overlay-start header) (overlay-end header))))
+      (overlay-put overlay 'face 'highlight)
+      (overlay-put overlay 'priority 10)
+      (setq compose-preview--section-highlight-overlay overlay))))
 
 (defun compose-preview--property-position (property value)
   "Return first position whose PROPERTY is equal to VALUE."
@@ -1161,21 +1233,36 @@ Use GENERATION to isolate concurrent or superseded render attempts."
                           existing
                         (make-overlay body-start body-end))))
         (move-overlay overlay body-start body-end)
+        (overlay-put overlay 'evaporate t)
         (overlay-put overlay 'invisible (and collapsed 'compose-preview-fold))
         (overlay-put overlay 'isearch-open-invisible #'delete-overlay)
         (puthash group overlay compose-preview--group-overlays)
-        (let ((inhibit-read-only t))
-          (put-text-property header-start (1+ header-start)
-                             'display (if collapsed ">" "v")))))))
+        (when-let* ((header (gethash group compose-preview--group-header-overlays)))
+          (overlay-put header 'before-string
+                       (when (display-graphic-p)
+                         (propertize " " 'display
+                                     `(left-fringe
+                                       ,(if collapsed 'right-triangle
+                                          'down-triangle)
+                                       font-lock-function-name-face))))
+          (overlay-put header 'after-string
+                       (when (and collapsed (not (display-graphic-p)))
+                         (propertize " …" 'face 'shadow))))))))
 
 (defun compose-preview-toggle-group (&optional group)
-  "Toggle GROUP, or the Preview group header at point."
+  "Toggle GROUP or the Preview section containing point."
   (interactive)
-  (let ((group (or group (compose-preview--group-at-point))))
+  (let* ((group (or group (compose-preview--group-at-point)))
+         (collapsed (and group
+                         (not (gethash group
+                                       compose-preview--collapsed-groups))))
+         (header (and group
+                      (gethash group compose-preview--group-header-overlays))))
     (unless group
-      (user-error "Point is not on a Preview group header"))
-    (compose-preview--set-group-collapsed
-     group (not (gethash group compose-preview--collapsed-groups)))))
+      (user-error "Point is not in a Preview section"))
+    (compose-preview--set-group-collapsed group collapsed)
+    (when (and collapsed (overlayp header) (overlay-buffer header))
+      (goto-char (overlay-start header)))))
 
 (defun compose-preview-toggle-all-groups ()
   "Expand all Preview groups, or collapse all when all are expanded."
@@ -1326,7 +1413,8 @@ An empty QUERY clears the current text filter."
       (insert-button "open image" 'follow-link t
                      'action (lambda (_button) (find-file file)))
       (insert "\n")
-      (compose-preview--insert-image file)
+      (compose-preview--insert-image
+       file (compose-preview-item-density-dpi preview))
       (insert "\n"))
     (when error
       (insert (propertize (concat "Issue: " (compose-preview--error-summary error))
@@ -1341,23 +1429,26 @@ An empty QUERY clears the current text filter."
     (put-text-property start (point) 'compose-preview-item preview)))
 
 (defun compose-preview--insert-group (name previews)
-  "Insert collapsible group NAME containing PREVIEWS."
+  "Insert Magit-style collapsible section NAME containing PREVIEWS."
   (let ((header-start (point))
         (collapsed (gethash name compose-preview--collapsed-groups)))
-    (insert-text-button (format "%s  %s  %d\n" (if collapsed ">" "v") name
-                                (length previews))
-                        'face 'font-lock-function-name-face
+    (insert-text-button (format "%s  %d\n" name (length previews))
+                        'face 'compose-preview-section-heading
                         'follow-link t
-                        'help-echo "Toggle group (TAB or RET)"
+                        'help-echo "Toggle section (TAB or RET)"
                         'compose-preview-group name
                         'action (lambda (button)
                                   (compose-preview-toggle-group
                                    (button-get button 'compose-preview-group))))
     (put-text-property header-start (point) 'compose-preview-group name)
+    (let ((header (make-overlay header-start (point))))
+      (overlay-put header 'evaporate t)
+      (puthash name header compose-preview--group-header-overlays))
     (let ((body-start (point)))
       (dolist (preview previews)
         (compose-preview--insert-preview preview))
       (put-text-property body-start (point) 'compose-preview-group-body name)
+      (put-text-property body-start (point) 'compose-preview-section-group name)
       (compose-preview--set-group-collapsed name collapsed))))
 
 (defun compose-preview--render-results (module-root images &optional previews source-buffer)
@@ -1441,6 +1532,7 @@ Use METADATA keyed by preview id to preserve annotation display settings."
         :preview-name (plist-get details :preview-name)
         :group (plist-get details :group)
         :source-file (plist-get details :source-file)
+        :density-dpi (compose-preview--json-get result "densityDpi")
         :files (and path (list (expand-file-name path output)))
         :error (compose-preview--json-get result "error"))))
    results))

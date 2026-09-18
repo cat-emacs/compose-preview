@@ -39,13 +39,14 @@ Rendering happens in three steps.
 Run `M-x compose-preview-refresh` from a Kotlin source buffer. The command opens
 a panel on the right and returns immediately. Inside the panel:
 
-- click a group title, or press `TAB` / `RET` on it, to fold or unfold it;
+- click a group title, or press `TAB` / `RET` anywhere in its section, to fold
+  or unfold it with Magit-style section highlighting;
 - `S-TAB` folds all groups when all are open, otherwise it unfolds all groups;
 - `v` switches between the grouped Gallery and single-item Focus view;
 - `n` / `p` select the next or previous filtered Preview in Focus view;
 - `/` filters by Preview name, function, or group, and `G` selects one group;
-- `f` fits images to the panel, `1` restores original size, and `+` / `-`
-  zoom;
+- `f` fits oversized images to the panel without enlarging smaller previews,
+  `1` restores Android Studio-style Actual Size, and `+` / `-` zoom;
 - click a Preview title, or press `o` on its card, to visit the exact source
   declaration;
 - `g` refreshes from its associated source buffer;
@@ -55,7 +56,10 @@ a panel on the right and returns immediately. Inside the panel:
 Groups follow Android Studio Preview semantics: explicit `@Preview(group =
 "...")` values are sorted by display name and ungrouped previews use `Default`.
 Fold state, view mode, filters, focused item, and zoom are preserved across
-automatic and manual refreshes. Fit mode responds to side-window width changes.
+automatic and manual refreshes. Actual Size maps the rendered PNG back through
+the Preview device density and the host display scale, matching Android
+Studio's design-surface coordinates. Fit mode responds to side-window width
+changes and only shrinks previews that exceed the available width.
 Renderer issues are isolated to their Preview cards: successful images remain
 visible, and a card can show both its image and a fidelity warning with a link
 to the render log.
