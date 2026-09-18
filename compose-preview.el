@@ -335,7 +335,7 @@ Each entry is (PROJECT-ROOT . TARGET), where TARGET is a plist containing
            (,(kbd "n") . compose-preview-next)
            (,(kbd "p") . compose-preview-previous)
            (,(kbd "f") . compose-preview-fit)
-           (,(kbd "1") . compose-preview-original-size)
+           (,(kbd "0") . compose-preview-original-size)
            (,(kbd "+") . compose-preview-zoom-in)
            (,(kbd "=") . compose-preview-zoom-in)
            (,(kbd "-") . compose-preview-zoom-out)
@@ -370,9 +370,11 @@ Each entry is (PROJECT-ROOT . TARGET), where TARGET is a plist containing
        (string-match-p "\\.kt\\'" (buffer-local-value 'buffer-file-name buffer))))
 
 (defun compose-preview--hide-panel ()
-  "Hide the Preview side window without ending its follow session."
-  (when-let* ((window (get-buffer-window compose-preview-results-buffer-name t)))
-    (quit-window nil window)))
+  "Hide the Preview side window without ending its follow session.
+Preserve the selected window because this can run from `post-command-hook'."
+  (save-selected-window
+    (when-let* ((window (get-buffer-window compose-preview-results-buffer-name t)))
+      (quit-window nil window))))
 
 (defun compose-preview--cancel-process ()
   "Cancel active Preview work and invalidate its sentinels."
@@ -1390,7 +1392,7 @@ mode uses one scale shared by every visible Preview, like Studio's surface."
              'face (or compose-preview--status-face 'mode-line-emphasis))))
     (when compose-preview-show-key-hints
       (insert (propertize
-               "TAB fold  n/p browse  v view  / search  G group  f/1/+/- scale  o source\n\n"
+               "TAB fold  n/p browse  v view  / search  G group  f/0/+/- scale  o source\n\n"
                'face 'shadow)))
     (cond
      ((and (null visible) compose-preview--items)

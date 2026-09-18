@@ -49,7 +49,7 @@ a panel on the right and returns immediately. Inside the panel:
   cards, and `TAB` folds the section at point; in Focus they cycle items;
 - `/` filters by Preview name, function, or group, and `G` selects one group;
 - `f` applies Android Studio-style Zoom to Fit to the complete visible layout,
-  `1` restores Android Studio-style Actual Size, and `+` / `-` zoom;
+  `0` restores Android Studio-style Actual Size, and `+` / `-` zoom;
 - click a Preview title, or press `o` on its card, to visit the exact source
   declaration;
 - `g` refreshes from its associated source buffer;

@@ -505,7 +505,11 @@
       (compose-preview-zoom-out)
       (should (= compose-preview--image-zoom 1.0))
       (compose-preview-fit)
-      (should compose-preview--fit-images))))
+      (should compose-preview--fit-images)))
+  (should (eq (lookup-key compose-preview-results-mode-map (kbd "0"))
+              #'compose-preview-original-size))
+  (should-not (eq (lookup-key compose-preview-results-mode-map (kbd "1"))
+                  #'compose-preview-original-size)))
 
 (ert-deftest compose-preview-key-hints-can-be-hidden ()
   "Keybinding hints are shown by default and can be disabled."
@@ -870,6 +874,23 @@
          :target (:module-path ":app")))
       (should hidden)
       (should-not failed))))
+
+(ert-deftest compose-preview-hide-panel-preserves-selected-window ()
+  "Background panel hiding never steals focus from a newly opened window."
+  (let ((preview (generate-new-buffer " *compose-preview-hide-panel*")))
+    (unwind-protect
+        (save-window-excursion
+          (delete-other-windows)
+          (let ((selected (selected-window))
+                (preview-window (split-window-right)))
+            (set-window-buffer preview-window preview)
+            (cl-letf (((symbol-function 'get-buffer-window)
+                       (lambda (&rest _) preview-window))
+                      ((symbol-function 'quit-window)
+                       (lambda (&rest _) (select-window preview-window))))
+              (compose-preview--hide-panel))
+            (should (eq (selected-window) selected))))
+      (kill-buffer preview))))
 
 (ert-deftest compose-preview-following-hides-panel-for-non-kotlin-buffer ()
   "An active Preview session closes its panel outside Kotlin files."
