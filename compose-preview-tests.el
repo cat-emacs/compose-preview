@@ -749,6 +749,47 @@
     (should (string-match-p "\\[image\\]" (buffer-string)))
     (should (string-match-p "Issue: Missing dependency" (buffer-string)))))
 
+(ert-deftest compose-preview-copy-image-uses-current-card-png ()
+  "Copy image sends the current card's first readable PNG to clipboard."
+  (let ((file (make-temp-file "compose-preview-copy-" nil ".png")) copied)
+    (unwind-protect
+        (with-temp-buffer
+          (let ((item (make-compose-preview-item :name "Phone" :files (list file))))
+            (insert (propertize "preview" 'compose-preview-item item))
+            (goto-char (point-min))
+            (cl-letf (((symbol-function 'compose-preview--copy-png-to-clipboard)
+                       (lambda (image) (setq copied image)))
+                      ((symbol-function 'message) #'ignore))
+              (compose-preview-copy-image))
+            (should (equal copied file))))
+      (delete-file file))))
+
+(ert-deftest compose-preview-copy-image-requires-card-at-point ()
+  "Copy image reports when point is not on a Preview card."
+  (with-temp-buffer
+    (should-error (compose-preview-copy-image) :type 'user-error)))
+
+(ert-deftest compose-preview-png-clipboard-method-follows-platform ()
+  "PNG clipboard backend selection follows the current desktop."
+  (cl-letf (((symbol-function 'executable-find)
+             (lambda (program)
+               (member program '("osascript" "wl-copy" "xclip" "powershell.exe")))))
+    (let ((system-type 'darwin))
+      (should (eq (compose-preview--png-clipboard-method) 'osascript)))
+    (let ((system-type 'windows-nt))
+      (should (eq (compose-preview--png-clipboard-method) 'powershell)))
+    (let ((system-type 'gnu/linux)
+          (process-environment (cons "WAYLAND_DISPLAY=wayland-0"
+                                     process-environment)))
+      (should (eq (compose-preview--png-clipboard-method) 'wl-copy)))
+    (let ((system-type 'gnu/linux)
+          (process-environment
+           (cons "WAYLAND_DISPLAY="
+                 (seq-remove (lambda (entry)
+                               (string-prefix-p "WAYLAND_DISPLAY=" entry))
+                             process-environment))))
+      (should (eq (compose-preview--png-clipboard-method) 'xclip)))))
+
 (ert-deftest compose-preview-goto-preview-method-selects-exact-owner ()
   "Source navigation disambiguates methods with identical names."
   (with-temp-buffer

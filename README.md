@@ -50,6 +50,8 @@ a panel on the right and returns immediately. Inside the panel:
 - `/` filters by Preview name, function, or group, and `G` selects one group;
 - `f` applies Android Studio-style Zoom to Fit to the complete visible layout,
   `0` restores Android Studio-style Actual Size, and `+` / `-` zoom;
+- `w` copies the current card's original PNG data to the system clipboard
+  (macOS, Windows, and Linux via `wl-copy` or `xclip`);
 - click a Preview title, or press `o` on its card, to visit the exact source
   declaration;
 - `g` refreshes from its associated source buffer;

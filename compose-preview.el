@@ -317,6 +317,7 @@ Each entry is (PROJECT-ROOT . TARGET), where TARGET is a plist containing
     (define-key map (kbd "TAB") #'compose-preview-toggle-group)
     (define-key map [backtab] #'compose-preview-toggle-all-groups)
     (define-key map (kbd "<backtab>") #'compose-preview-toggle-all-groups)
+    (define-key map (kbd "w") #'compose-preview-copy-image)
     map)
   "Button map that keeps TAB as section toggle.")
 
@@ -327,6 +328,7 @@ Each entry is (PROJECT-ROOT . TARGET), where TARGET is a plist containing
            (,(kbd "<backtab>") . compose-preview-toggle-all-groups)
            (,(kbd "RET") . compose-preview-toggle-group)
            (,(kbd "o") . compose-preview-goto-source)
+           (,(kbd "w") . compose-preview-copy-image)
            (,(kbd "g") . compose-preview-panel-refresh)
            (,(kbd "l") . compose-preview-open-log)
            (,(kbd "v") . compose-preview-toggle-view)
@@ -1267,6 +1269,99 @@ mode uses one scale shared by every visible Preview, like Studio's surface."
   "Return the Preview item at point, if any."
   (get-text-property (point) 'compose-preview-item))
 
+(defun compose-preview--png-clipboard-method ()
+  "Return the backend used to copy PNG data, or nil when unavailable."
+  (cond
+   ((eq system-type 'darwin)
+    (and (executable-find "osascript") 'osascript))
+   ((memq system-type '(windows-nt cygwin ms-dos))
+    (and (or (executable-find "powershell.exe") (executable-find "pwsh"))
+         'powershell))
+   ((and (let ((display (getenv "WAYLAND_DISPLAY")))
+           (and display (not (string-empty-p display))))
+         (executable-find "wl-copy"))
+    'wl-copy)
+   ((executable-find "xclip") 'xclip)
+   ((executable-find "wl-copy") 'wl-copy)))
+
+(defun compose-preview--png-clipboard-unavailable ()
+  "Return a user-facing error when no PNG clipboard backend is available."
+  (user-error
+   (pcase system-type
+     ('darwin "Copying Preview images requires osascript")
+     ((or 'windows-nt 'cygwin 'ms-dos)
+      "Copying Preview images requires PowerShell")
+     (_ "Copying Preview images requires wl-copy or xclip"))))
+
+(defun compose-preview--run-clipboard-process (program infile &rest args)
+  "Run PROGRAM with ARGS, optionally feeding INFILE on stdin."
+  (let ((output (generate-new-buffer " *compose-preview-clipboard*")))
+    (unwind-protect
+        (let ((status (apply #'call-process program infile output nil args)))
+          (unless (and (integerp status) (zerop status))
+            (user-error "Could not copy Preview image: %s"
+                        (string-trim (with-current-buffer output
+                                         (buffer-string))))))
+      (kill-buffer output))))
+
+(defun compose-preview--copy-png-osascript (file)
+  "Copy PNG FILE to the macOS clipboard as image data."
+  (with-temp-buffer
+    (insert "on run argv\n"
+            "  set imageFile to POSIX file (item 1 of argv)\n"
+            "  set the clipboard to (read imageFile as «class PNGf»)\n"
+            "end run\n")
+    (let ((output (generate-new-buffer " *compose-preview-clipboard*")))
+      (unwind-protect
+          (let ((status (call-process-region
+                         (point-min) (point-max) "osascript" nil output nil
+                         "-" file)))
+            (unless (and (integerp status) (zerop status))
+              (user-error "Could not copy Preview image: %s"
+                          (string-trim (with-current-buffer output
+                                           (buffer-string))))))
+        (kill-buffer output)))))
+
+(defun compose-preview--copy-png-powershell (file)
+  "Copy PNG FILE to the Windows clipboard as image data."
+  (let ((shell (or (executable-find "powershell.exe") (executable-find "pwsh")))
+        (escaped (replace-regexp-in-string "'" "''" file t t)))
+    (compose-preview--run-clipboard-process
+     shell nil "-NoProfile" "-STA" "-Command"
+     (format (concat "Add-Type -AssemblyName System.Windows.Forms; "
+                     "Add-Type -AssemblyName System.Drawing; "
+                     "$img = [System.Drawing.Image]::FromFile('%s'); "
+                     "[System.Windows.Forms.Clipboard]::SetImage($img); "
+                     "$img.Dispose()")
+             escaped))))
+
+(defun compose-preview--copy-png-to-clipboard (file)
+  "Copy PNG FILE data to the system clipboard."
+  (let ((file (expand-file-name file))
+        (method (compose-preview--png-clipboard-method)))
+    (pcase method
+      ('osascript (compose-preview--copy-png-osascript file))
+      ('wl-copy (compose-preview--run-clipboard-process
+                 "wl-copy" file "--type" "image/png"))
+      ('xclip (compose-preview--run-clipboard-process
+               "xclip" nil "-selection" "clipboard" "-t" "image/png" "-i" file))
+      ('powershell (compose-preview--copy-png-powershell file))
+      (_ (compose-preview--png-clipboard-unavailable)))))
+
+(defun compose-preview-copy-image (&optional preview)
+  "Copy PREVIEW's original PNG image data to the system clipboard.
+When PREVIEW is nil, use the Preview card at point."
+  (interactive)
+  (let ((preview (or preview (compose-preview--current-item))))
+    (unless preview
+      (user-error "Point is not on a Compose Preview image"))
+    (let ((file (seq-find #'file-readable-p
+                          (compose-preview-item-files preview))))
+      (unless file
+        (user-error "This Compose Preview has no image to copy"))
+      (compose-preview--copy-png-to-clipboard file)
+      (message "Copied Preview image: %s" (file-name-nondirectory file)))))
+
 (defun compose-preview--fit-item-size (item scale)
   "Return ITEM card size at SCALE as a pixel cons cell."
   (let* ((file (seq-find #'file-readable-p (compose-preview-item-files item)))
@@ -1392,7 +1487,7 @@ mode uses one scale shared by every visible Preview, like Studio's surface."
              'face (or compose-preview--status-face 'mode-line-emphasis))))
     (when compose-preview-show-key-hints
       (insert (propertize
-               "TAB fold  n/p browse  v view  / search  G group  f/0/+/- scale  o source\n\n"
+               "TAB fold  n/p browse  v view  / search  G group  f/0/+/- scale  w copy  o source\n\n"
                'face 'shadow)))
     (cond
      ((and (null visible) compose-preview--items)
