@@ -45,8 +45,8 @@ a panel on the right and returns immediately. Inside the panel:
 - `v` switches between the grouped Grid and single-item Focus view.
   Grid packs previews into wrapping rows by their displayed width, matching
   Android Studio's Preview grid;
-- `n` / `p` move between filtered Previews: in Grid they jump to each
-  visible title, and in Focus they cycle the current item;
+- `n` / `p` move like Magit: in Grid they visit section headings then visible
+  cards, and `TAB` folds the section at point; in Focus they cycle items;
 - `/` filters by Preview name, function, or group, and `G` selects one group;
 - `f` fits oversized images to the panel without enlarging smaller previews,
   `1` restores Android Studio-style Actual Size, and `+` / `-` zoom;
@@ -79,7 +79,8 @@ refreshes it after `compose-preview-file-switch-delay`; selecting a non-Kotlin
 buffer hides the panel. Pressing `q` ends this follow session, and the next
 manual refresh starts it again. Set `compose-preview-follow-current-file` to nil
 to disable file following. `compose-preview-panel-width` controls the side-window
-width.
+width. Keybinding hints are shown at the top of the panel by default; set
+`compose-preview-show-key-hints` to nil to hide them.
 
 ### Preview discovery
 

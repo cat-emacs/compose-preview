@@ -13,6 +13,7 @@
 ;;; Code:
 
 (require 'cl-lib)
+(require 'button)
 (require 'json)
 (require 'seq)
 (require 'subr-x)
@@ -61,11 +62,16 @@
   :type 'integer
   :group 'compose-preview)
 
-(defcustom compose-preview-panel-width 0.4
+(defcustom compose-preview-panel-width 0.35
   "Width of the Compose preview side window.
 A float means a fraction of the frame width; an integer means columns."
   :type '(choice (float :tag "Frame fraction")
                  (integer :tag "Columns"))
+  :group 'compose-preview)
+
+(defcustom compose-preview-show-key-hints t
+  "Whether to show keybinding hints at the top of the Preview panel."
+  :type 'boolean
   :group 'compose-preview)
 
 (defcustom compose-preview-auto-refresh-delay 0.75
@@ -231,6 +237,12 @@ Each entry is (PROJECT-ROOT . TARGET), where TARGET is a plist containing
 (defvar-local compose-preview--module-root nil
   "Module root associated with the current Preview panel.")
 
+(defvar-local compose-preview--status nil
+  "Status text shown in the Preview panel header line.")
+
+(defvar-local compose-preview--status-face nil
+  "Face for `compose-preview--status'.")
+
 (defvar-local compose-preview--legacy-images nil
   "Images supplied without Preview metadata to the current panel.")
 
@@ -259,27 +271,51 @@ Each entry is (PROJECT-ROOT . TARGET), where TARGET is a plist containing
 (defvar-local compose-preview--last-fit-width nil
   "Last image width used by fit mode in the current panel.")
 
-(defvar compose-preview-results-mode-map
+(defvar compose-preview-results-mode-map (make-sparse-keymap)
+  "Keymap for `compose-preview-results-mode'.")
+
+(defvar compose-preview-section-map
   (let ((map (make-sparse-keymap)))
+    (define-key map [tab] #'compose-preview-toggle-group)
     (define-key map (kbd "TAB") #'compose-preview-toggle-group)
+    (define-key map [backtab] #'compose-preview-toggle-all-groups)
     (define-key map (kbd "<backtab>") #'compose-preview-toggle-all-groups)
     (define-key map (kbd "RET") #'compose-preview-toggle-group)
-    (define-key map (kbd "o") #'compose-preview-goto-source)
-    (define-key map (kbd "g") #'compose-preview-panel-refresh)
-    (define-key map (kbd "l") #'compose-preview-open-log)
-    (define-key map (kbd "v") #'compose-preview-toggle-view)
-    (define-key map (kbd "/") #'compose-preview-search)
-    (define-key map (kbd "G") #'compose-preview-filter-group)
-    (define-key map (kbd "n") #'compose-preview-next)
-    (define-key map (kbd "p") #'compose-preview-previous)
-    (define-key map (kbd "f") #'compose-preview-fit)
-    (define-key map (kbd "1") #'compose-preview-original-size)
-    (define-key map (kbd "+") #'compose-preview-zoom-in)
-    (define-key map (kbd "=") #'compose-preview-zoom-in)
-    (define-key map (kbd "-") #'compose-preview-zoom-out)
-    (define-key map (kbd "q") #'compose-preview-panel-quit)
+    (define-key map [mouse-1] #'compose-preview-mouse-toggle-group)
     map)
-  "Keymap for `compose-preview-results-mode'.")
+  "Keymap for Preview section headings.")
+
+(defvar compose-preview-button-map
+  (let ((map (make-sparse-keymap)))
+    (set-keymap-parent map button-map)
+    (define-key map [tab] #'compose-preview-toggle-group)
+    (define-key map (kbd "TAB") #'compose-preview-toggle-group)
+    (define-key map [backtab] #'compose-preview-toggle-all-groups)
+    (define-key map (kbd "<backtab>") #'compose-preview-toggle-all-groups)
+    map)
+  "Button map that keeps TAB as section toggle.")
+
+(dolist (binding
+         `(([tab] . compose-preview-toggle-group)
+           (,(kbd "TAB") . compose-preview-toggle-group)
+           ([backtab] . compose-preview-toggle-all-groups)
+           (,(kbd "<backtab>") . compose-preview-toggle-all-groups)
+           (,(kbd "RET") . compose-preview-toggle-group)
+           (,(kbd "o") . compose-preview-goto-source)
+           (,(kbd "g") . compose-preview-panel-refresh)
+           (,(kbd "l") . compose-preview-open-log)
+           (,(kbd "v") . compose-preview-toggle-view)
+           (,(kbd "/") . compose-preview-search)
+           (,(kbd "G") . compose-preview-filter-group)
+           (,(kbd "n") . compose-preview-next)
+           (,(kbd "p") . compose-preview-previous)
+           (,(kbd "f") . compose-preview-fit)
+           (,(kbd "1") . compose-preview-original-size)
+           (,(kbd "+") . compose-preview-zoom-in)
+           (,(kbd "=") . compose-preview-zoom-in)
+           (,(kbd "-") . compose-preview-zoom-out)
+           (,(kbd "q") . compose-preview-panel-quit)))
+  (define-key compose-preview-results-mode-map (car binding) (cdr binding)))
 
 (define-derived-mode compose-preview-results-mode special-mode "ComposePreview"
   "Major mode for browsing Compose preview images."
@@ -1107,11 +1143,13 @@ mode only shrinks images that exceed the available panel width."
         (compose-preview-results-mode))
       (setq-local compose-preview--source-buffer source-buffer
                   default-directory module-root
-                  header-line-format (propertize (concat " Compose Preview: " status)
+                  compose-preview--status status
+                  compose-preview--status-face (or face 'mode-line-emphasis)
+                  header-line-format (propertize (concat " " status)
                                                   'face (or face 'mode-line-emphasis)))
       (when (= (buffer-size) 0)
         (let ((inhibit-read-only t))
-          (insert "Compose Preview\n\nWaiting for the first render...\n"))))
+          (insert "Waiting for the first render...\n"))))
     (compose-preview--display-panel buffer)))
 
 (defun compose-preview--group-name (preview)
@@ -1153,6 +1191,7 @@ mode only shrinks images that exceed the available panel width."
   "Return searchable display text for Preview ITEM."
   (string-join
    (delq nil (list (compose-preview-item-name item)
+                   (compose-preview--card-title item)
                    (compose-preview-item-preview-name item)
                    (compose-preview-item-parameter-name item)
                    (compose-preview-item-method-fqn item)
@@ -1219,12 +1258,16 @@ mode only shrinks images that exceed the available panel width."
           compose-preview--section-highlight-overlay nil
           compose-preview--group-names
           (mapcar #'car (compose-preview--group-items visible)))
-    (insert (format "Compose Preview  %s\n" compose-preview--module-root))
-    (insert (propertize (concat (compose-preview--view-description visible) "\n")
-                        'face 'mode-line-emphasis))
-    (insert (propertize
-             "v view  n/p browse  / search  G group  f/1/+/- scale  o source\n\n"
-             'face 'shadow))
+    (when compose-preview--status
+      (setq header-line-format
+            (propertize
+             (format " %s · %s" compose-preview--status
+                     (compose-preview--view-description visible))
+             'face (or compose-preview--status-face 'mode-line-emphasis))))
+    (when compose-preview-show-key-hints
+      (insert (propertize
+               "TAB fold  n/p browse  v view  / search  G group  f/1/+/- scale  o source\n\n"
+               'face 'shadow)))
     (setq compose-preview--last-fit-width
           (and compose-preview--fit-images (compose-preview--fit-width))
           compose-preview--last-layout-width (compose-preview--fit-width))
@@ -1312,6 +1355,16 @@ mode only shrinks images that exceed the available panel width."
           (overlay-put header 'before-string (car indicator))
           (overlay-put header 'after-string (cadr indicator)))))))
 
+(defun compose-preview-mouse-toggle-group (event)
+  "Toggle the Preview section at the mouse EVENT."
+  (interactive "e")
+  (let ((window (posn-window (event-start event)))
+        (pos (posn-point (event-start event))))
+    (when (and (windowp window) pos)
+      (select-window window)
+      (goto-char pos)
+      (compose-preview-toggle-group))))
+
 (defun compose-preview-toggle-group (&optional group)
   "Toggle GROUP or the Preview section containing point."
   (interactive)
@@ -1357,56 +1410,122 @@ mode only shrinks images that exceed the available panel width."
        (compose-preview--visible-items))
     (compose-preview--visible-items)))
 
-(defun compose-preview--item-title-position (item)
-  "Return buffer position of ITEM's title button, if any."
+(defun compose-preview--item-position (item)
+  "Return first buffer position of ITEM, if any."
   (let ((position (point-min))
         found)
     (while (and (< position (point-max)) (not found))
-      (when-let* ((button (button-at position))
-                  (current (button-get button 'compose-preview-item))
-                  ((equal (compose-preview-item-id current)
-                          (compose-preview-item-id item))))
-        (setq found (button-start button)))
-      (setq position (or (next-single-property-change
-                          position 'button nil (point-max))
-                         (point-max))))
+      (let ((current (get-text-property position 'compose-preview-item)))
+        (if (and current
+                 (equal (compose-preview-item-id current)
+                        (compose-preview-item-id item)))
+            (setq found position)
+          (setq position (or (next-single-property-change
+                              position 'compose-preview-item nil (point-max))
+                             (point-max))))))
     found))
 
 (defun compose-preview--goto-item (item)
-  "Move point to ITEM's title in the current Preview panel."
-  (when-let* ((position (compose-preview--item-title-position item)))
+  "Move point to ITEM in the current Preview panel."
+  (when-let* ((position (compose-preview--item-position item)))
     (goto-char position)))
 
-(defun compose-preview--move-focus (step)
-  "Move to the Preview STEP items away among currently browsable items."
-  (let ((items (compose-preview--navigable-items)))
+(defun compose-preview--heading-at-point-p ()
+  "Return non-nil when point is on a Preview section heading."
+  (get-text-property (point) 'compose-preview-group))
+
+(defun compose-preview--current-target ()
+  "Return the Magit-style navigation target at point."
+  (cond
+   ((compose-preview--heading-at-point-p)
+    (cons 'section (get-text-property (point) 'compose-preview-group)))
+   ((compose-preview--current-item)
+    (cons 'item (compose-preview--current-item)))))
+
+(defun compose-preview--target-equal (left right)
+  "Return non-nil when navigation targets LEFT and RIGHT are the same."
+  (and left right
+       (eq (car left) (car right))
+       (if (eq (car left) 'section)
+           (equal (cdr left) (cdr right))
+         (equal (compose-preview-item-id (cdr left))
+                (compose-preview-item-id (cdr right))))))
+
+(defun compose-preview--navigation-targets ()
+  "Return Magit-style n/p targets: section headings then visible cards."
+  (let (targets)
+    (dolist (section (compose-preview--group-items
+                      (compose-preview--visible-items)))
+      (let ((id (car section))
+            (items (cdr section)))
+        (push (cons 'section id) targets)
+        (unless (gethash id compose-preview--collapsed-groups)
+          (dolist (item items)
+            (push (cons 'item item) targets)))))
+    (nreverse targets)))
+
+(defun compose-preview--goto-target (target)
+  "Move point to Magit-style navigation TARGET."
+  (pcase (car target)
+    ('section
+     (when-let* ((position (compose-preview--property-position
+                            'compose-preview-group (cdr target))))
+       (goto-char position)))
+    ('item
+     (setq compose-preview--focus-id (compose-preview-item-id (cdr target)))
+     (compose-preview--goto-item (cdr target)))))
+
+(defun compose-preview--move-focus-item (step)
+  "Move Focus view by STEP among filtered Preview items."
+  (let ((items (compose-preview--visible-items)))
     (unless items
       (user-error "No visible Compose Previews"))
-    (let* ((current (compose-preview--current-item))
+    (let* ((current (or (compose-preview--current-item)
+                        (compose-preview--focused-item items)))
            (index (or (and current
                            (seq-position
                             items current
                             (lambda (left right)
                               (equal (compose-preview-item-id left)
                                      (compose-preview-item-id right)))))
-                      (if (> step 0) -1 (length items))))
+                      0))
            (next (nth (mod (+ index step) (length items)) items)))
       (setq compose-preview--focus-id (compose-preview-item-id next))
-      (when (eq compose-preview--view-mode 'focus)
-        (compose-preview--redraw))
+      (compose-preview--redraw)
       (compose-preview--goto-item next))))
 
+(defun compose-preview--move-section (step)
+  "Move Grid view by STEP among Magit-style section targets."
+  (let ((targets (compose-preview--navigation-targets)))
+    (unless targets
+      (user-error "No visible Compose Previews"))
+    (let* ((current (compose-preview--current-target))
+           (index (or (and current
+                           (seq-position targets current
+                                         #'compose-preview--target-equal))
+                      (if (> step 0) -1 (length targets))))
+           (next-index (+ index step)))
+      (when (or (< next-index 0) (>= next-index (length targets)))
+        (user-error (if (> step 0) "No next section" "No previous section")))
+      (compose-preview--goto-target (nth next-index targets)))))
+
+(defun compose-preview--move-focus (step)
+  "Move to the next Magit-style section or Focus item by STEP."
+  (if (eq compose-preview--view-mode 'focus)
+      (compose-preview--move-focus-item step)
+    (compose-preview--move-section step)))
+
 (defun compose-preview-next ()
-  "Move to the next filtered Preview.
-In Grid view, jump to the next visible title.  In Focus view, show
-the next Preview."
+  "Move to the next section or Preview.
+In Grid view, visit section headings then visible cards, like Magit.
+In Focus view, show the next Preview."
   (interactive)
   (compose-preview--move-focus 1))
 
 (defun compose-preview-previous ()
-  "Move to the previous filtered Preview.
-In Grid view, jump to the previous visible title.  In Focus view, show
-the previous Preview."
+  "Move to the previous section or Preview.
+In Grid view, visit section headings then visible cards, like Magit.
+In Focus view, show the previous Preview."
   (interactive)
   (compose-preview--move-focus -1))
 
@@ -1502,13 +1621,20 @@ An empty QUERY clears the current text filter."
 
 (defun compose-preview--insert-preview-title (preview)
   "Insert PREVIEW's source-linked display title."
-  (insert-text-button (compose-preview-item-name preview)
-                      'face 'bold 'follow-link t
-                      'help-echo "Visit Preview source (o)"
-                      'compose-preview-item preview
-                      'action (lambda (button)
-                                (compose-preview-goto-source
-                                 (button-get button 'compose-preview-item)))))
+  (let ((title (if (eq compose-preview--view-mode 'focus)
+                   (compose-preview-item-name preview)
+                 (compose-preview--card-title preview))))
+    (when (and title (not (string-empty-p title)))
+      (insert-text-button title
+                          'face 'bold 'follow-link t
+                          'help-echo (or (compose-preview-item-name preview)
+                                         "Visit Preview source (o)")
+                          'keymap compose-preview-button-map
+                          'compose-preview-item preview
+                          'action (lambda (button)
+                                    (compose-preview-goto-source
+                                     (button-get button
+                                                 'compose-preview-item)))))))
 
 (defun compose-preview--grid-entry (preview)
   "Return measured Grid entry for PREVIEW."
@@ -1520,8 +1646,10 @@ An empty QUERY clears the current text filter."
                           file (compose-preview-item-density-dpi preview))
                        (error nil))))
          (image-width (and image (compose-preview--image-width image)))
-         (title-width (compose-preview--string-pixel-width
-                       (compose-preview-item-name preview)))
+         (card-title (compose-preview--card-title preview))
+         (title-width (if card-title
+                          (compose-preview--string-pixel-width card-title)
+                        0))
          (width (max 96 (or image-width 0) title-width)))
     (list :item preview :file file :image image :width width)))
 
@@ -1557,12 +1685,15 @@ An empty QUERY clears the current text filter."
 
 (defun compose-preview--insert-grid-row (entries)
   "Insert one Grid row of measured ENTRIES."
-  (dolist (entry entries)
-    (compose-preview--insert-grid-cell
-     entry (lambda (cell)
-             (compose-preview--insert-preview-title
-              (plist-get cell :item)))))
-  (insert "\n")
+  (when (seq-some (lambda (entry)
+                    (compose-preview--card-title (plist-get entry :item)))
+                  entries)
+    (dolist (entry entries)
+      (compose-preview--insert-grid-cell
+       entry (lambda (cell)
+               (compose-preview--insert-preview-title
+                (plist-get cell :item)))))
+    (insert "\n"))
   (dolist (entry entries)
     (compose-preview--insert-grid-cell
      entry
@@ -1596,6 +1727,7 @@ An empty QUERY clears the current text filter."
     (insert "\n")
     (dolist (file files)
       (insert-button "open image" 'follow-link t
+                     'keymap compose-preview-button-map
                      'action (lambda (_button) (find-file file)))
       (insert "\n")
       (compose-preview--insert-image
@@ -1606,6 +1738,7 @@ An empty QUERY clears the current text filter."
                           'face 'error)
               "\n")
       (insert-text-button "open render log" 'follow-link t
+                          'keymap compose-preview-button-map
                           'action (lambda (_button) (compose-preview-open-log)))
       (insert "\n"))
     (unless (or files error)
@@ -1620,15 +1753,12 @@ An empty QUERY clears the current text filter."
                         (compose-preview--section-title (car previews)))
                    name))
         (collapsed (gethash name compose-preview--collapsed-groups)))
-    (insert-text-button (format "%s  %d\n" title (length previews))
+    (insert (propertize (format "%s\n" title)
                         'face 'compose-preview-section-heading
-                        'follow-link t
+                        'keymap compose-preview-section-map
+                        'mouse-face 'highlight
                         'help-echo "Toggle section (TAB or RET)"
-                        'compose-preview-group name
-                        'action (lambda (button)
-                                  (compose-preview-toggle-group
-                                   (button-get button 'compose-preview-group))))
-    (put-text-property header-start (point) 'compose-preview-group name)
+                        'compose-preview-group name))
     (let ((header (make-overlay header-start (point))))
       (overlay-put header 'evaporate t)
       (puthash name header compose-preview--group-header-overlays))
@@ -1654,13 +1784,12 @@ An empty QUERY clears the current text filter."
                       (compose-preview--annotation-group-names previews))
         (setq compose-preview--group-filter nil))
       (let ((issue-count (seq-count #'compose-preview-item-error previews)))
-        (setq header-line-format
+        (setq compose-preview--status
               (if (> issue-count 0)
-                  (propertize
-                   (format " Compose Preview: ready — %d issue%s"
-                           issue-count (if (= issue-count 1) "" "s"))
-                   'face 'warning)
-                (propertize " Compose Preview: ready" 'face 'success))))
+                  (format "ready — %d issue%s"
+                          issue-count (if (= issue-count 1) "" "s"))
+                "ready")
+              compose-preview--status-face (if (> issue-count 0) 'warning 'success)))
       (compose-preview--redraw))
     (compose-preview--display-panel buffer)
     (with-current-buffer buffer
@@ -1719,7 +1848,7 @@ FORMAT-STRING and ARGS are passed to `format'."
        renderer-name))
 
 (defun compose-preview--parameter-display-name (parameter-name index count renderer-name)
-  "Return Studio's parameter label for one PreviewParameter instance."
+  "Format PARAMETER-NAME at INDEX of COUNT, preferring RENDERER-NAME."
   (or (compose-preview--custom-parameter-display-name renderer-name)
       (and parameter-name
            (format "%s %s" parameter-name
@@ -1727,8 +1856,22 @@ FORMAT-STRING and ARGS are passed to `format'."
                     index (max 0 (1- (or count 1))))))
       renderer-name))
 
+(defun compose-preview--studio-parameter-label (preview-name parameter-name index count renderer-name)
+  "Build a Grid label from PREVIEW-NAME and PARAMETER-NAME at INDEX of COUNT.
+Prefer RENDERER-NAME when the provider supplies a custom display name."
+  (let ((instance (and index
+                       (compose-preview--parameter-display-name
+                        parameter-name index count renderer-name))))
+    (cond
+     ((and preview-name (not (string-empty-p preview-name)) instance)
+      (format "%s - %s" preview-name instance))
+     (instance instance)
+     ((and preview-name (not (string-empty-p preview-name))) preview-name)
+     (t nil))))
+
 (defun compose-preview--studio-item-name (method-name preview-name parameter-name index count renderer-name)
-  "Return Studio Grid title for one Preview instance."
+  "Build a full name from METHOD-NAME, PREVIEW-NAME, and PARAMETER-NAME.
+INDEX and COUNT identify the provider value; RENDERER-NAME may override it."
   (let ((base (compose-preview--preview-base-name method-name preview-name))
         (param (and index
                     (compose-preview--parameter-display-name
@@ -1736,6 +1879,18 @@ FORMAT-STRING and ARGS are passed to `format'."
     (if param
         (format "%s (%s)" base param)
       base)))
+
+(defun compose-preview--card-title (preview)
+  "Return PREVIEW's Grid card title without its organization section name."
+  (or (compose-preview--studio-parameter-label
+       (compose-preview-item-preview-name preview)
+       (compose-preview-item-parameter-name preview)
+       (compose-preview-item-parameter-index preview)
+       (compose-preview-item-parameter-count preview)
+       nil)
+      (let ((full (compose-preview-item-name preview))
+            (section (compose-preview--section-title preview)))
+        (and full (not (string= full section)) full))))
 
 (defun compose-preview--result-items (results output &optional metadata)
   "Convert renderer RESULTS into preview items rooted at OUTPUT.

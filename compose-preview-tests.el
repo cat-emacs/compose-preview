@@ -453,35 +453,43 @@
       (compose-preview-previous)
       (should (equal compose-preview--focus-id "two")))))
 
-(ert-deftest compose-preview-grid-navigation-jumps-titles ()
-  "Grid n/p move point between titles without entering Focus."
+(ert-deftest compose-preview-grid-navigation-visits-section-headings ()
+  "Grid n/p visit Magit-style section headings then visible cards."
   (with-temp-buffer
     (compose-preview-results-mode)
-    (let ((one (make-compose-preview-item :id "one" :name "One"))
-          (two (make-compose-preview-item :id "two" :name "Two"))
+    (let ((one (make-compose-preview-item
+                :id "one" :name "Card - One" :method "Card"
+                :method-fqn "ex.Card" :preview-name "One"))
+          (two (make-compose-preview-item
+                :id "two" :name "Card - Two" :method "Card"
+                :method-fqn "ex.Card" :preview-name "Two"))
           (inhibit-read-only t))
       (setq-local compose-preview--items (list one two)
                   compose-preview--module-root "/tmp/"
                   compose-preview--view-mode 'grid)
-      (insert "Compose Preview\n\n")
-      (compose-preview--insert-preview-title one)
-      (insert "\n")
-      (compose-preview--insert-preview-title two)
-      (insert "\n")
+      (cl-letf (((symbol-function 'compose-preview--insert-image)
+                 (lambda (&rest _args) (insert "[image]"))))
+        (insert "Compose Preview\n\n")
+        (compose-preview--insert-group "ex.Card" (list one two)))
       (goto-char (point-min))
       (compose-preview-next)
       (should (eq compose-preview--view-mode 'grid))
+      (should (equal (compose-preview--group-at-point) "ex.Card"))
+      (should (get-text-property (point) 'compose-preview-group))
+      (compose-preview-next)
       (should (equal (compose-preview-item-id (compose-preview--current-item))
                      "one"))
       (compose-preview-next)
       (should (equal (compose-preview-item-id (compose-preview--current-item))
                      "two"))
-      (compose-preview-next)
+      (should-error (compose-preview-next))
+      (compose-preview-previous)
       (should (equal (compose-preview-item-id (compose-preview--current-item))
                      "one"))
       (compose-preview-previous)
-      (should (equal (compose-preview-item-id (compose-preview--current-item))
-                     "two")))))
+      (should (get-text-property (point) 'compose-preview-group))
+      (compose-preview-toggle-group)
+      (should (gethash "ex.Card" compose-preview--collapsed-groups)))))
 
 (ert-deftest compose-preview-scale-commands-update-panel-state ()
   "Fit, original size, and zoom commands update scale without rendering."
@@ -497,6 +505,23 @@
       (should (= compose-preview--image-zoom 1.0))
       (compose-preview-fit)
       (should compose-preview--fit-images))))
+
+(ert-deftest compose-preview-key-hints-can-be-hidden ()
+  "Keybinding hints are shown by default and can be disabled."
+  (with-temp-buffer
+    (compose-preview-results-mode)
+    (setq-local compose-preview--items
+                (list (make-compose-preview-item
+                       :name "Phone" :method "Phone" :method-fqn "ex.Phone"))
+                compose-preview--status "ready"
+                compose-preview--module-root "/tmp/")
+    (cl-letf (((symbol-function 'compose-preview--insert-image) #'ignore))
+      (let ((compose-preview-show-key-hints t))
+        (compose-preview--redraw)
+        (should (string-match-p "TAB fold" (buffer-string))))
+      (let ((compose-preview-show-key-hints nil))
+        (compose-preview--redraw)
+        (should-not (string-match-p "TAB fold" (buffer-string)))))))
 
 (ert-deftest compose-preview-actual-size-follows-density-and-host-scale ()
   "Actual size maps renderer pixels to Studio surface coordinates."
@@ -543,6 +568,8 @@
          (list (make-compose-preview-item :name "Phone" :files '("phone.png"))))))
     (goto-char (point-min))
     (should (equal (compose-preview--group-at-point) "Devices"))
+    (should (eq (lookup-key (get-char-property (point) 'keymap) [tab])
+                #'compose-preview-toggle-group))
     (let ((header (gethash "Devices" compose-preview--group-header-overlays)))
       (should (overlay-get header 'before-string)))
     (search-forward "Phone")
@@ -620,6 +647,7 @@
          (items (compose-preview--result-items results "/tmp/rendered/" metadata))
          (item (car items)))
     (should (equal (compose-preview-item-name item) "CardPreview - Phone"))
+    (should (equal (compose-preview--card-title item) "Phone"))
     (should (equal (compose-preview-item-preview-name item) "Phone"))
     (should (equal (compose-preview-item-group item) "Devices"))
     (should (equal (compose-preview-item-source-file item) "Foo.kt"))
@@ -657,6 +685,8 @@
     (should (equal (mapcar #'compose-preview-item-name items)
                    '("LoginPreview - Login (user 0)"
                      "LoginPreview - Login (user 1)")))
+    (should (equal (mapcar #'compose-preview--card-title items)
+                   '("Login - user 0" "Login - user 1")))
     (should (equal (compose-preview-item-parameter-name (car items)) "user"))
     (should (equal (compose-preview-item-group (car items)) "Auth"))
     (should (= (compose-preview-item-parameter-index (cadr items)) 1))
