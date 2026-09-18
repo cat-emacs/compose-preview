@@ -317,6 +317,7 @@
             (cons "previewWrapperFQN" nil)
             (cons "methodParams"
                   (list (list (cons "provider" "com.example.Provider"))))
+            (cons "parameterNames" (list "user"))
             (cons "annotations"
                   (list nil (list (cons "name" "Phone")
                                   (cons "group" "Devices"))))))))
@@ -333,6 +334,8 @@
                          "Devices"))
           (should (equal (plist-get (gethash phone-id metadata) :preview-name)
                          "Phone"))
+          (should (equal (plist-get (gethash phone-id metadata) :parameter-name)
+                         "user"))
           (should (equal (compose-preview--json-get
                           (car (compose-preview--json-get
                                 (car screenshots) "methodParams"))
@@ -349,6 +352,8 @@
       (should (string-match-p "PreviewMethodFinder" script))
       (should (string-match-p "composePreviewModel" script))
       (should (string-match-p "sourceFileForMethod" script))
+      (should (string-match-p "parameterNames" script))
+      (should (string-match-p "previewParameterNames" script))
       (should (string-match-p "composePreviewRegisterKmp" script))
       (should (string-match-p "COMPOSE_PREVIEW_ADAPTER_DIRECTORY" script))
       (should-not (string-match-p "InternalArtifactType" script))
@@ -384,21 +389,32 @@
     (insert-file-contents (expand-file-name "ComposePreviewRenderLauncher.java"))
     (let ((source (buffer-string)))
       (should (string-match-p "RenderEnvironmentBootstrapper" source))
-      (should (string-match-p "readStrings(settings, \"rClassJars\")" source))))
+      (should (string-match-p "readStrings(settings, \"rClassJars\")" source))
+      (should (string-match-p "displayName" source))
+      (should (string-match-p "instanceId" source))))
   (with-temp-buffer
     (insert-file-contents (expand-file-name "compose-preview.el"))
     (should (string-match-p "layoutlib.thread.profile.timeoutms"
                             (buffer-string)))))
 
-(ert-deftest compose-preview-groups-use-annotation-names-and-default-group ()
-  "Preview items are grouped and sorted by annotation group name."
-  (let* ((ungrouped (make-compose-preview-item :name "Plain"))
-         (tablet (make-compose-preview-item :name "Tablet" :group "Tablets"))
-         (phone (make-compose-preview-item :name "Phone" :group "Phones"))
-         (groups (compose-preview--group-items (list tablet ungrouped phone))))
-    (should (equal (mapcar #'car groups) '("Default" "Phones" "Tablets")))
-    (should (equal (mapcar #'compose-preview-item-name (cdr (assoc "Phones" groups)))
-                   '("Phone")))))
+(ert-deftest compose-preview-sections-group-the-same-preview-method ()
+  "Grid sections follow Studio organization groups by composable method."
+  (let* ((phone (make-compose-preview-item
+                 :name "Phone" :method "CardPreview"
+                 :method-fqn "example.CardPreview" :group "Devices"))
+         (tablet (make-compose-preview-item
+                  :name "Tablet" :method "CardPreview"
+                  :method-fqn "example.CardPreview" :group "Tablets"))
+         (other (make-compose-preview-item
+                 :name "Plain" :method "OtherPreview"
+                 :method-fqn "example.OtherPreview"))
+         (groups (compose-preview--group-items (list phone other tablet))))
+    (should (equal (mapcar #'car groups)
+                   '("example.CardPreview" "example.OtherPreview")))
+    (should (equal (mapcar #'compose-preview-item-name
+                           (cdr (assoc "example.CardPreview" groups)))
+                   '("Phone" "Tablet")))
+    (should (equal (compose-preview--section-title phone) "CardPreview"))))
 
 (ert-deftest compose-preview-panel-filters-compose-name-and-group ()
   "Text and group filters compose without changing the result model."
@@ -432,9 +448,40 @@
                 compose-preview--focus-id "two")
     (cl-letf (((symbol-function 'compose-preview--redraw) #'ignore))
       (compose-preview-next)
+      (should (eq compose-preview--view-mode 'focus))
       (should (equal compose-preview--focus-id "one"))
       (compose-preview-previous)
       (should (equal compose-preview--focus-id "two")))))
+
+(ert-deftest compose-preview-grid-navigation-jumps-titles ()
+  "Grid n/p move point between titles without entering Focus."
+  (with-temp-buffer
+    (compose-preview-results-mode)
+    (let ((one (make-compose-preview-item :id "one" :name "One"))
+          (two (make-compose-preview-item :id "two" :name "Two"))
+          (inhibit-read-only t))
+      (setq-local compose-preview--items (list one two)
+                  compose-preview--module-root "/tmp/"
+                  compose-preview--view-mode 'grid)
+      (insert "Compose Preview\n\n")
+      (compose-preview--insert-preview-title one)
+      (insert "\n")
+      (compose-preview--insert-preview-title two)
+      (insert "\n")
+      (goto-char (point-min))
+      (compose-preview-next)
+      (should (eq compose-preview--view-mode 'grid))
+      (should (equal (compose-preview-item-id (compose-preview--current-item))
+                     "one"))
+      (compose-preview-next)
+      (should (equal (compose-preview-item-id (compose-preview--current-item))
+                     "two"))
+      (compose-preview-next)
+      (should (equal (compose-preview-item-id (compose-preview--current-item))
+                     "one"))
+      (compose-preview-previous)
+      (should (equal (compose-preview-item-id (compose-preview--current-item))
+                     "two")))))
 
 (ert-deftest compose-preview-scale-commands-update-panel-state ()
   "Fit, original size, and zoom commands update scale without rendering."
@@ -496,10 +543,14 @@
          (list (make-compose-preview-item :name "Phone" :files '("phone.png"))))))
     (goto-char (point-min))
     (should (equal (compose-preview--group-at-point) "Devices"))
+    (let ((header (gethash "Devices" compose-preview--group-header-overlays)))
+      (should (overlay-get header 'before-string)))
     (search-forward "Phone")
     (should (equal (compose-preview--group-at-point) "Devices"))
     (compose-preview-toggle-group)
     (should (gethash "Devices" compose-preview--collapsed-groups))
+    (should (overlay-get (gethash "Devices" compose-preview--group-header-overlays)
+                         'before-string))
     (should (get-text-property (point) 'compose-preview-group))
     (should (seq-some (lambda (overlay) (overlay-get overlay 'invisible))
                       (overlays-in (point-min) (point-max))))
@@ -522,6 +573,7 @@
           (compose-preview--render-results "/tmp/" nil items nil)
           (with-current-buffer compose-preview-results-buffer-name
             (should-not compose-preview--group-filter)
+            (should (= (point) (point-min)))
             (should (string-match-p
                      "1 issue" (substring-no-properties header-line-format)))))
       (when-let* ((buffer (get-buffer compose-preview-results-buffer-name)))
@@ -530,24 +582,26 @@
 (ert-deftest compose-preview-render-results-preserves-fold-state ()
   "Refreshing the panel preserves collapsed Preview groups."
   (let ((items (list (make-compose-preview-item
-                      :name "Phone" :group "Devices" :files '("phone.png")))))
+                      :name "Phone" :method "CardPreview"
+                      :method-fqn "example.CardPreview" :group "Devices"
+                      :files '("phone.png")))))
     (unwind-protect
         (cl-letf (((symbol-function 'compose-preview--insert-image)
                    (lambda (&rest _args) (insert "[image]")))
                   ((symbol-function 'compose-preview--display-panel) #'ignore))
           (compose-preview--render-results "/tmp/" nil items nil)
           (with-current-buffer compose-preview-results-buffer-name
-            (compose-preview-toggle-group "Devices")
+            (compose-preview-toggle-group "example.CardPreview")
             (setq compose-preview--view-mode 'focus)
-            (should (gethash "Devices" compose-preview--collapsed-groups)))
+            (should (gethash "example.CardPreview" compose-preview--collapsed-groups)))
           (compose-preview--render-results "/tmp/" nil items nil)
           (with-current-buffer compose-preview-results-buffer-name
             (should (eq compose-preview--view-mode 'focus))
-            (should (gethash "Devices" compose-preview--collapsed-groups))
-            (setq compose-preview--view-mode 'gallery)
+            (should (gethash "example.CardPreview" compose-preview--collapsed-groups))
+            (setq compose-preview--view-mode 'grid)
             (compose-preview--redraw)
             (should (eq (overlay-get
-                         (gethash "Devices" compose-preview--group-overlays)
+                         (gethash "example.CardPreview" compose-preview--group-overlays)
                          'invisible)
                         'compose-preview-fold))))
       (when-let* ((buffer (get-buffer compose-preview-results-buffer-name)))
@@ -572,6 +626,60 @@
     (should (= (compose-preview-item-density-dpi item) 480))
     (should (equal (compose-preview-item-files item)
                    '("/tmp/rendered/phone.png")))))
+
+(ert-deftest compose-preview-result-items-expand-parameterized-previews ()
+  "Each @PreviewParameter value becomes a uniquely identified Grid item."
+  (let* ((id "com.example.FooKt.LoginPreview_Login")
+         (metadata (make-hash-table :test #'equal))
+         (results `((("methodFQN" . "com.example.FooKt.LoginPreview")
+                     ("previewId" . ,id)
+                     ("imagePath" . "a.png")
+                     ("parameterIndex" . 0)
+                     ("parameterCount" . 2)
+                     ("instanceId" . "com.example.FooKt.LoginPreview#param00")
+                     ("displayName" . "LoginPreview - Login (param0 0)")
+                     ("parameterName" . "param0 0"))
+                    (("methodFQN" . "com.example.FooKt.LoginPreview")
+                     ("previewId" . ,id)
+                     ("imagePath" . "b.png")
+                     ("parameterIndex" . 1)
+                     ("parameterCount" . 2)
+                     ("instanceId" . "com.example.FooKt.LoginPreview#param01")
+                     ("displayName" . "LoginPreview - Login (param0 1)")
+                     ("parameterName" . "param0 1"))))
+         (_ (puthash id '(:preview-name "Login" :group "Auth"
+                          :source-file "Foo.kt" :parameter-name "user")
+                     metadata))
+         (items (compose-preview--result-items results "/tmp/rendered/" metadata)))
+    (should (equal (mapcar #'compose-preview-item-id items)
+                   '("com.example.FooKt.LoginPreview_Login#com.example.FooKt.LoginPreview#param00"
+                     "com.example.FooKt.LoginPreview_Login#com.example.FooKt.LoginPreview#param01")))
+    (should (equal (mapcar #'compose-preview-item-name items)
+                   '("LoginPreview - Login (user 0)"
+                     "LoginPreview - Login (user 1)")))
+    (should (equal (compose-preview-item-parameter-name (car items)) "user"))
+    (should (equal (compose-preview-item-group (car items)) "Auth"))
+    (should (= (compose-preview-item-parameter-index (cadr items)) 1))
+    (should (equal (mapcar #'car (compose-preview--group-items items))
+                   '("com.example.FooKt.LoginPreview")))))
+
+(ert-deftest compose-preview-grid-rows-wrap-to-available-width ()
+  "Grid rows wrap when the next Preview would exceed the panel width."
+  (cl-letf (((symbol-function 'compose-preview--fit-width) (lambda () 250))
+            ((symbol-function 'compose-preview--grid-entry)
+             (lambda (preview)
+               (list :item preview :file nil :image nil :width 100))))
+    (should (equal
+             (mapcar (lambda (row)
+                       (mapcar (lambda (entry)
+                                 (compose-preview-item-name
+                                  (plist-get entry :item)))
+                               row))
+                     (compose-preview--grid-rows
+                      (list (make-compose-preview-item :name "A")
+                            (make-compose-preview-item :name "B")
+                            (make-compose-preview-item :name "C"))))
+             '(("A" "B") ("C"))))))
 
 (ert-deftest compose-preview-result-items-preserve-render-issues ()
   "Renderer issues stay attached to their individual Preview item."

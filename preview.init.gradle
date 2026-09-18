@@ -24,6 +24,7 @@ import org.gradle.api.tasks.Optional
 import org.gradle.api.tasks.OutputFile
 import org.gradle.api.tasks.TaskAction
 import org.objectweb.asm.ClassReader
+import org.objectweb.asm.Opcodes
 import org.objectweb.asm.tree.ClassNode
 
 import java.lang.reflect.InvocationHandler
@@ -149,33 +150,34 @@ abstract class ComposePreviewModelTask extends DefaultTask {
                     ? text.substring(1, text.length() - 1).replace('/', '.')
                     : text
         }
-        def sourceFileForMethod = { String methodFqn ->
-            def owner = methodFqn.substring(0, methodFqn.lastIndexOf('.'))
+        def classBytesFor = { String owner ->
             def entryName = owner.replace('.', '/') + ".class"
-            byte[] bytes = null
             for (File directory : projectDirFiles) {
                 def classFile = new File(directory, entryName)
                 if (classFile.isFile()) {
-                    bytes = classFile.bytes
-                    break
+                    return classFile.bytes
                 }
             }
-            if (bytes == null) {
-                for (File jar : projectJarFiles) {
-                    if (!jar.isFile()) {
-                        continue
-                    }
-                    new ZipFile(jar).withCloseable { zip ->
-                        def entry = zip.getEntry(entryName)
-                        if (entry != null) {
-                            bytes = zip.getInputStream(entry).withCloseable { it.bytes }
-                        }
-                    }
-                    if (bytes != null) {
-                        break
+            for (File jar : projectJarFiles) {
+                if (!jar.isFile()) {
+                    continue
+                }
+                byte[] bytes = null
+                new ZipFile(jar).withCloseable { zip ->
+                    def entry = zip.getEntry(entryName)
+                    if (entry != null) {
+                        bytes = zip.getInputStream(entry).withCloseable { it.bytes }
                     }
                 }
+                if (bytes != null) {
+                    return bytes
+                }
             }
+            return null
+        }
+        def sourceFileForMethod = { String methodFqn ->
+            def owner = methodFqn.substring(0, methodFqn.lastIndexOf('.'))
+            byte[] bytes = classBytesFor(owner)
             if (bytes == null) {
                 return null
             }
@@ -183,6 +185,48 @@ abstract class ComposePreviewModelTask extends DefaultTask {
             new ClassReader(bytes).accept(node,
                     ClassReader.SKIP_CODE | ClassReader.SKIP_FRAMES)
             return node.sourceFile
+        }
+        // Studio's PSI path uses the Kotlin parameter name (`user`). The
+        // standalone renderer only sees `param0`, so recover the real name
+        // from MethodParameters or the LocalVariableTable.
+        def previewParameterNames = { String methodFqn ->
+            def lastDot = methodFqn.lastIndexOf('.')
+            def owner = methodFqn.substring(0, lastDot)
+            def methodName = methodFqn.substring(lastDot + 1)
+            byte[] bytes = classBytesFor(owner)
+            if (bytes == null) {
+                return []
+            }
+            def node = new ClassNode()
+            new ClassReader(bytes).accept(node, ClassReader.SKIP_FRAMES)
+            def method = node.methods.find { it.name == methodName }
+            if (method == null) {
+                return []
+            }
+            def previewDesc = "Landroidx/compose/ui/tooling/preview/PreviewParameter;"
+            def nameAt = { int index ->
+                if (method.parameters && index < method.parameters.size() &&
+                        method.parameters[index].name) {
+                    return method.parameters[index].name
+                }
+                if (method.localVariables) {
+                    int slot = ((method.access & Opcodes.ACC_STATIC) != 0) ? index : index + 1
+                    def local = method.localVariables.find { it.index == slot }
+                    if (local?.name && !local.name.startsWith("\$") && local.name != "this") {
+                        return local.name
+                    }
+                }
+                return null
+            }
+            def names = []
+            [method.invisibleParameterAnnotations, method.visibleParameterAnnotations].each { annotations ->
+                annotations?.eachWithIndex { anns, index ->
+                    if (anns?.any { it.desc == previewDesc }) {
+                        names << nameAt(index)
+                    }
+                }
+            }
+            return names
         }
         def previews = finder.findAllPreviewMethods().collect { preview ->
             [
@@ -198,6 +242,7 @@ abstract class ComposePreviewModelTask extends DefaultTask {
                             [(key.toString()): className(value)]
                         }
                     },
+                    parameterNames : previewParameterNames(preview.method.methodFqn),
                     annotations    : preview.previewAnnotations.collect { annotation ->
                         annotation.parameters.collectEntries { key, value ->
                             [(key.toString()): String.valueOf(value)]

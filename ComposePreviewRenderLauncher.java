@@ -16,9 +16,12 @@ import com.android.tools.render.Renderer;
 import com.android.tools.render.common.PreviewRenderingResult;
 import com.android.tools.render.common.PreviewScreenshot;
 import com.android.tools.render.common.PreviewScreenshotResult;
+import com.android.tools.render.common.ScreenshotPreviewElement;
 import com.android.tools.render.compose.ComposeScreenshot;
 import com.android.tools.render.framework.IJFramework;
 import com.android.tools.configurations.Configuration;
+import com.android.tools.preview.ComposePreviewElement;
+import com.android.tools.preview.ComposePreviewElementInstance;
 import com.android.tools.preview.PreviewConfigurationKt;
 import com.google.gson.JsonArray;
 import com.google.gson.JsonElement;
@@ -34,6 +37,7 @@ import java.lang.reflect.Field;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.util.ArrayList;
+import java.util.Iterator;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
@@ -69,6 +73,12 @@ public final class ComposePreviewRenderLauncher {
 
         PreviewRenderingResult result;
         List<Integer> densityDpis = new ArrayList<>();
+        List<Integer> parameterIndices = new ArrayList<>();
+        List<Integer> parameterCounts = new ArrayList<>();
+        List<Boolean> parameterizedResults = new ArrayList<>();
+        List<String> instanceIds = new ArrayList<>();
+        List<String> displayNames = new ArrayList<>();
+        List<String> parameterNames = new ArrayList<>();
         try {
             RenderEnvironmentBootstrapper bootstrapper = new RenderEnvironmentBootstrapper(
                     optionalString(settings, "fontsPath"),
@@ -82,12 +92,33 @@ public final class ComposePreviewRenderLauncher {
             List<PreviewScreenshotResult> results = new ArrayList<>();
             try (Renderer renderer = bootstrapper.bootstrap()) {
                 for (PreviewScreenshot screenshot : screenshots) {
-                    Integer densityDpi = resolveDensityDpi(renderer, screenshot);
+                    ScreenshotPreviewElement previewElement = null;
+                    try {
+                        previewElement = screenshot.toPreviewElement(renderer.getModule());
+                    } catch (Throwable ignored) {
+                        // Metadata is optional; rendering still uses the screenshot itself.
+                    }
+                    Integer densityDpi = previewElement == null
+                            ? null : resolveDensityDpi(renderer, previewElement);
+                    List<PreviewInstanceMetadata> previewMetadata =
+                            previewElement == null
+                                    ? new ArrayList<>()
+                                    : resolvePreviewMetadata(previewElement);
                     List<PreviewScreenshotResult> screenshotResults =
                             renderer.render(screenshot, outputFolder);
                     results.addAll(screenshotResults);
+                    boolean parameterized = screenshot instanceof ComposeScreenshot
+                            && !((ComposeScreenshot) screenshot).getMethodParams().isEmpty();
                     for (int index = 0; index < screenshotResults.size(); index++) {
                         densityDpis.add(densityDpi);
+                        parameterIndices.add(index);
+                        parameterCounts.add(screenshotResults.size());
+                        parameterizedResults.add(parameterized);
+                        PreviewInstanceMetadata metadata = index < previewMetadata.size()
+                                ? previewMetadata.get(index) : null;
+                        instanceIds.add(metadata == null ? null : metadata.instanceId);
+                        displayNames.add(metadata == null ? null : metadata.displayName);
+                        parameterNames.add(metadata == null ? null : metadata.parameterName);
                     }
                 }
             }
@@ -95,9 +126,17 @@ public final class ComposePreviewRenderLauncher {
         } catch (Throwable failure) {
             result = new PreviewRenderingResult(stackTraceOf(failure), new ArrayList<>());
             densityDpis.clear();
+            parameterIndices.clear();
+            parameterCounts.clear();
+            parameterizedResults.clear();
+            instanceIds.clear();
+            displayNames.clear();
+            parameterNames.clear();
         }
 
-        writeResult(resultsFilePath, result, densityDpis);
+        writeResult(resultsFilePath, result, densityDpis, parameterIndices,
+                parameterCounts, parameterizedResults, instanceIds, displayNames,
+                parameterNames);
 
         int failures = 0;
         if (result.getGlobalError() != null) {
@@ -115,14 +154,15 @@ public final class ComposePreviewRenderLauncher {
         return failures == 0 ? 0 : 1;
     }
 
-    private static Integer resolveDensityDpi(Renderer renderer, PreviewScreenshot screenshot) {
+    private static Integer resolveDensityDpi(
+            Renderer renderer, ScreenshotPreviewElement previewElement) {
         try {
             Field baseConfiguration = Renderer.class.getDeclaredField("baseConfiguration");
             baseConfiguration.setAccessible(true);
             Configuration configuration =
                     ((Configuration) baseConfiguration.get(renderer)).clone();
             PreviewConfigurationKt.applyTo(
-                    screenshot.toPreviewElement(renderer.getModule()),
+                    previewElement,
                     configuration,
                     ignored -> null);
             int densityDpi = configuration.getDensity().getDpiValue();
@@ -132,10 +172,51 @@ public final class ComposePreviewRenderLauncher {
         }
     }
 
+    private static List<PreviewInstanceMetadata> resolvePreviewMetadata(
+            ScreenshotPreviewElement previewElement) {
+        List<PreviewInstanceMetadata> metadata = new ArrayList<>();
+        try {
+            Field delegate = previewElement.getClass().getDeclaredField("composePreviewElement");
+            delegate.setAccessible(true);
+            ComposePreviewElement<?> element = (ComposePreviewElement<?>) delegate.get(previewElement);
+            Iterator<? extends ComposePreviewElementInstance<?>> instances =
+                    element.resolve().iterator();
+            while (instances.hasNext()) {
+                ComposePreviewElementInstance<?> instance = instances.next();
+                metadata.add(new PreviewInstanceMetadata(
+                        instance.getInstanceId(),
+                        instance.getDisplaySettings().getName(),
+                        instance.getDisplaySettings().getParameterName()));
+            }
+        } catch (Throwable ignored) {
+            metadata.clear();
+        }
+        return metadata;
+    }
+
+    private static final class PreviewInstanceMetadata {
+        private final String instanceId;
+        private final String displayName;
+        private final String parameterName;
+
+        private PreviewInstanceMetadata(
+                String instanceId, String displayName, String parameterName) {
+            this.instanceId = instanceId;
+            this.displayName = displayName;
+            this.parameterName = parameterName;
+        }
+    }
+
     private static void writeResult(
             String resultsFilePath,
             PreviewRenderingResult result,
-            List<Integer> densityDpis) throws Exception {
+            List<Integer> densityDpis,
+            List<Integer> parameterIndices,
+            List<Integer> parameterCounts,
+            List<Boolean> parameterizedResults,
+            List<String> instanceIds,
+            List<String> displayNames,
+            List<String> parameterNames) throws Exception {
         StringWriter serialized = new StringWriter();
         com.android.tools.render.common.JsonSerializationKt.writePreviewRenderingResult(serialized, result);
         JsonObject json = JsonParser.parseString(serialized.toString()).getAsJsonObject();
@@ -143,8 +224,22 @@ public final class ComposePreviewRenderLauncher {
         if (screenshotResults != null) {
             for (int index = 0; index < screenshotResults.size() && index < densityDpis.size(); index++) {
                 Integer densityDpi = densityDpis.get(index);
+                JsonObject screenshotResult = screenshotResults.get(index).getAsJsonObject();
                 if (densityDpi != null) {
-                    screenshotResults.get(index).getAsJsonObject().addProperty("densityDpi", densityDpi);
+                    screenshotResult.addProperty("densityDpi", densityDpi);
+                }
+                if (parameterizedResults.get(index)) {
+                    screenshotResult.addProperty("parameterIndex", parameterIndices.get(index));
+                    screenshotResult.addProperty("parameterCount", parameterCounts.get(index));
+                }
+                if (instanceIds.get(index) != null) {
+                    screenshotResult.addProperty("instanceId", instanceIds.get(index));
+                }
+                if (displayNames.get(index) != null) {
+                    screenshotResult.addProperty("displayName", displayNames.get(index));
+                }
+                if (parameterNames.get(index) != null) {
+                    screenshotResult.addProperty("parameterName", parameterNames.get(index));
                 }
             }
         }

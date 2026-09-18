@@ -176,6 +176,9 @@ Each entry is (PROJECT-ROOT . TARGET), where TARGET is a plist containing
   group
   source-file
   density-dpi
+  parameter-index
+  parameter-count
+  parameter-name
   files
   error)
 
@@ -183,6 +186,26 @@ Each entry is (PROJECT-ROOT . TARGET), where TARGET is a plist containing
   '((t :inherit font-lock-function-name-face :weight bold :extend t))
   "Face for Compose Preview section headings."
   :group 'compose-preview)
+
+(when (fboundp 'define-fringe-bitmap)
+  (define-fringe-bitmap 'compose-preview-fringe>
+    [#b01100000
+     #b00110000
+     #b00011000
+     #b00001100
+     #b00011000
+     #b00110000
+     #b01100000
+     #b00000000])
+  (define-fringe-bitmap 'compose-preview-fringev
+    [#b00000000
+     #b10000010
+     #b11000110
+     #b01101100
+     #b00111000
+     #b00010000
+     #b00000000
+     #b00000000]))
 
 (defconst compose-preview--default-group "Default"
   "Display name for Preview annotations without an explicit group.")
@@ -211,8 +234,9 @@ Each entry is (PROJECT-ROOT . TARGET), where TARGET is a plist containing
 (defvar-local compose-preview--legacy-images nil
   "Images supplied without Preview metadata to the current panel.")
 
-(defvar-local compose-preview--view-mode 'gallery
-  "Current Preview panel view, either `gallery' or `focus'.")
+(defvar-local compose-preview--view-mode 'grid
+  "Current Preview panel view, either `grid' or `focus'.")
+(setq-default compose-preview--view-mode 'grid)
 
 (defvar-local compose-preview--focus-id nil
   "Stable id of the currently focused Preview item.")
@@ -225,6 +249,9 @@ Each entry is (PROJECT-ROOT . TARGET), where TARGET is a plist containing
 
 (defvar-local compose-preview--fit-images nil
   "Non-nil when oversized Preview images should fit the panel width.")
+
+(defvar-local compose-preview--last-layout-width nil
+  "Panel width used for the most recent Grid layout.")
 
 (defvar-local compose-preview--image-zoom 1.0
   "Image scale used when `compose-preview--fit-images' is nil.")
@@ -259,7 +286,9 @@ Each entry is (PROJECT-ROOT . TARGET), where TARGET is a plist containing
   :group 'compose-preview
   (unless (hash-table-p compose-preview--collapsed-groups)
     (setq-local compose-preview--collapsed-groups (make-hash-table :test #'equal)))
-  (setq-local compose-preview--group-overlays (make-hash-table :test #'equal)
+  (setq-local left-fringe-width 8
+              right-fringe-width 0
+              compose-preview--group-overlays (make-hash-table :test #'equal)
               compose-preview--group-header-overlays
               (make-hash-table :test #'equal))
   (add-to-invisibility-spec 'compose-preview-fold)
@@ -917,7 +946,7 @@ METHOD may be an unqualified name or a full JVM method name."
 
 (defun compose-preview--launcher-directory ()
   "Return cache directory for the compiled renderer launcher."
-  (expand-file-name (concat "launcher-v3-" compose-preview-renderer-version "/")
+  (expand-file-name (concat "launcher-v4-" compose-preview-renderer-version "/")
                     compose-preview-cache-directory))
 
 (defun compose-preview--launcher-spec (model)
@@ -969,7 +998,11 @@ Use GENERATION to isolate concurrent or superseded render attempts."
                     (puthash id
                              (list :preview-name (compose-preview--json-get annotation "name")
                                    :group (compose-preview--json-get annotation "group")
-                                   :source-file (compose-preview--json-get preview "sourceFile"))
+                                   :source-file (compose-preview--json-get preview "sourceFile")
+                                   :parameter-name
+                                   (seq-find #'stringp
+                                             (compose-preview--json-get
+                                              preview "parameterNames")))
                              metadata)
                     (when-let* ((wrapper (compose-preview--json-get preview "previewWrapperFQN")))
                       (push (cons "previewWrapperFqn" wrapper) entry))
@@ -996,6 +1029,12 @@ Use GENERATION to isolate concurrent or superseded render attempts."
   (if-let* ((window (get-buffer-window (current-buffer) t)))
       (max 64 (- (window-body-width window t) 32))
     compose-preview-image-width))
+
+(defun compose-preview--string-pixel-width (string)
+  "Return the pixel width of STRING in the current Preview panel."
+  (if (fboundp 'string-pixel-width)
+      (string-pixel-width string)
+    (* (string-width string) (frame-char-width))))
 
 (defun compose-preview--image-width (image)
   "Return pixel width of IMAGE, or nil when it cannot be measured."
@@ -1052,11 +1091,13 @@ mode only shrinks images that exceed the available panel width."
 
 (defun compose-preview--display-panel (buffer)
   "Display BUFFER in the Compose preview side window."
-  (display-buffer-in-side-window
-   buffer
-   `((side . right)
-     (slot . 0)
-     (window-width . ,compose-preview-panel-width))))
+  (when-let* ((window (display-buffer-in-side-window
+                       buffer
+                       `((side . right)
+                         (slot . 0)
+                         (window-width . ,compose-preview-panel-width)))))
+    (set-window-fringes window 8 0)
+    window))
 
 (defun compose-preview--panel-status (source-buffer module-root status &optional face)
   "Show STATUS for SOURCE-BUFFER and MODULE-ROOT in the preview panel."
@@ -1074,31 +1115,46 @@ mode only shrinks images that exceed the available panel width."
     (compose-preview--display-panel buffer)))
 
 (defun compose-preview--group-name (preview)
-  "Return display group name for PREVIEW."
+  "Return @Preview(group) name for PREVIEW, or nil when ungrouped."
   (let ((group (compose-preview-item-group preview)))
-    (if (and (stringp group) (not (string-empty-p group)))
-        group
-      compose-preview--default-group)))
+    (and (stringp group) (not (string-empty-p group)) group)))
+
+(defun compose-preview--annotation-group-names (previews)
+  "Return sorted unique @Preview(group) names from PREVIEWS."
+  (sort (delete-dups (delq nil (mapcar #'compose-preview--group-name previews)))
+        #'string-lessp))
+
+(defun compose-preview--section-id (preview)
+  "Return Studio organization-group id for PREVIEW."
+  (or (compose-preview-item-method-fqn preview)
+      (compose-preview-item-method preview)
+      (compose-preview-item-name preview)
+      "Preview"))
+
+(defun compose-preview--section-title (preview)
+  "Return Studio organization-group title for PREVIEW."
+  (or (compose-preview-item-method preview)
+      (compose-preview-item-name preview)
+      "Preview"))
 
 (defun compose-preview--group-items (previews)
-  "Group PREVIEWS by annotation group in Android Studio display order."
-  (let ((groups (make-hash-table :test #'equal)))
+  "Group PREVIEWS by composable method, like Studio organization groups."
+  (let ((groups (make-hash-table :test #'equal))
+        order)
     (dolist (preview previews)
-      (let ((name (compose-preview--group-name preview)))
-        (puthash name (append (gethash name groups) (list preview)) groups)))
-    (let* ((names (hash-table-keys groups))
-           (named (sort (delete compose-preview--default-group names)
-                        #'string-lessp))
-           (ordered (if (gethash compose-preview--default-group groups)
-                        (cons compose-preview--default-group named)
-                      named)))
-      (mapcar (lambda (name) (cons name (gethash name groups))) ordered))))
+      (let ((id (compose-preview--section-id preview)))
+        (unless (gethash id groups)
+          (push id order))
+        (puthash id (append (gethash id groups) (list preview)) groups)))
+    (mapcar (lambda (id) (cons id (gethash id groups)))
+            (nreverse order))))
 
 (defun compose-preview--item-search-text (item)
   "Return searchable display text for Preview ITEM."
   (string-join
    (delq nil (list (compose-preview-item-name item)
                    (compose-preview-item-preview-name item)
+                   (compose-preview-item-parameter-name item)
                    (compose-preview-item-method-fqn item)
                    (compose-preview--group-name item)))
    " "))
@@ -1154,6 +1210,8 @@ mode only shrinks images that exceed the available panel width."
   "Redraw the current Preview panel without rerendering images."
   (let ((inhibit-read-only t)
         (visible (compose-preview--visible-items)))
+    (when (eq compose-preview--view-mode 'gallery)
+      (setq compose-preview--view-mode 'grid))
     (compose-preview--delete-section-overlays)
     (erase-buffer)
     (setq compose-preview--group-overlays (make-hash-table :test #'equal)
@@ -1168,7 +1226,8 @@ mode only shrinks images that exceed the available panel width."
              "v view  n/p browse  / search  G group  f/1/+/- scale  o source\n\n"
              'face 'shadow))
     (setq compose-preview--last-fit-width
-          (and compose-preview--fit-images (compose-preview--fit-width)))
+          (and compose-preview--fit-images (compose-preview--fit-width))
+          compose-preview--last-layout-width (compose-preview--fit-width))
     (cond
      ((and (null visible) compose-preview--items)
       (insert (propertize "No previews match the current filters.\n" 'face 'shadow)))
@@ -1217,6 +1276,17 @@ mode only shrinks images that exceed the available panel width."
                            (point-max)))))
     found))
 
+(defun compose-preview--section-indicator (collapsed)
+  "Return Magit-style visibility indicator strings for COLLAPSED."
+  (if (display-graphic-p)
+      (list (propertize " " 'display
+                        `(left-fringe
+                          ,(if collapsed 'compose-preview-fringe>
+                             'compose-preview-fringev)
+                          fringe))
+            nil)
+    (list (propertize (if collapsed "> " "v ") 'face 'shadow) nil)))
+
 (defun compose-preview--set-group-collapsed (group collapsed)
   "Set GROUP visibility according to COLLAPSED in the current panel."
   (puthash group collapsed compose-preview--collapsed-groups)
@@ -1231,23 +1301,16 @@ mode only shrinks images that exceed the available panel width."
              (existing (gethash group compose-preview--group-overlays))
              (overlay (if (and (overlayp existing) (overlay-buffer existing))
                           existing
-                        (make-overlay body-start body-end))))
+                        (make-overlay body-start body-end)))
+             (indicator (compose-preview--section-indicator collapsed)))
         (move-overlay overlay body-start body-end)
         (overlay-put overlay 'evaporate t)
         (overlay-put overlay 'invisible (and collapsed 'compose-preview-fold))
         (overlay-put overlay 'isearch-open-invisible #'delete-overlay)
         (puthash group overlay compose-preview--group-overlays)
         (when-let* ((header (gethash group compose-preview--group-header-overlays)))
-          (overlay-put header 'before-string
-                       (when (display-graphic-p)
-                         (propertize " " 'display
-                                     `(left-fringe
-                                       ,(if collapsed 'right-triangle
-                                          'down-triangle)
-                                       font-lock-function-name-face))))
-          (overlay-put header 'after-string
-                       (when (and collapsed (not (display-graphic-p)))
-                         (propertize " …" 'face 'shadow))))))))
+          (overlay-put header 'before-string (car indicator))
+          (overlay-put header 'after-string (cadr indicator)))))))
 
 (defun compose-preview-toggle-group (&optional group)
   "Toggle GROUP or the Preview section containing point."
@@ -1276,33 +1339,74 @@ mode only shrinks images that exceed the available panel width."
       (compose-preview--set-group-collapsed group collapse))))
 
 (defun compose-preview-toggle-view ()
-  "Toggle between Gallery and Focus Preview views."
+  "Toggle between Grid and Focus Preview views."
   (interactive)
   (when-let* ((item (compose-preview--current-item)))
     (setq compose-preview--focus-id (compose-preview-item-id item)))
   (setq compose-preview--view-mode
-        (if (eq compose-preview--view-mode 'gallery) 'focus 'gallery))
+        (if (eq compose-preview--view-mode 'focus) 'grid 'focus))
   (compose-preview--redraw))
 
+(defun compose-preview--navigable-items ()
+  "Return visible Preview items whose Grid section is expanded."
+  (if (eq compose-preview--view-mode 'grid)
+      (seq-filter
+       (lambda (item)
+         (not (gethash (compose-preview--section-id item)
+                       compose-preview--collapsed-groups)))
+       (compose-preview--visible-items))
+    (compose-preview--visible-items)))
+
+(defun compose-preview--item-title-position (item)
+  "Return buffer position of ITEM's title button, if any."
+  (let ((position (point-min))
+        found)
+    (while (and (< position (point-max)) (not found))
+      (when-let* ((button (button-at position))
+                  (current (button-get button 'compose-preview-item))
+                  ((equal (compose-preview-item-id current)
+                          (compose-preview-item-id item))))
+        (setq found (button-start button)))
+      (setq position (or (next-single-property-change
+                          position 'button nil (point-max))
+                         (point-max))))
+    found))
+
+(defun compose-preview--goto-item (item)
+  "Move point to ITEM's title in the current Preview panel."
+  (when-let* ((position (compose-preview--item-title-position item)))
+    (goto-char position)))
+
 (defun compose-preview--move-focus (step)
-  "Move focused Preview by STEP among filtered items."
-  (let ((items (compose-preview--visible-items)))
+  "Move to the Preview STEP items away among currently browsable items."
+  (let ((items (compose-preview--navigable-items)))
     (unless items
       (user-error "No visible Compose Previews"))
-    (let* ((current (compose-preview--focused-item items))
-           (index (or (seq-position items current) 0))
+    (let* ((current (compose-preview--current-item))
+           (index (or (and current
+                           (seq-position
+                            items current
+                            (lambda (left right)
+                              (equal (compose-preview-item-id left)
+                                     (compose-preview-item-id right)))))
+                      (if (> step 0) -1 (length items))))
            (next (nth (mod (+ index step) (length items)) items)))
-      (setq compose-preview--view-mode 'focus
-            compose-preview--focus-id (compose-preview-item-id next))
-      (compose-preview--redraw))))
+      (setq compose-preview--focus-id (compose-preview-item-id next))
+      (when (eq compose-preview--view-mode 'focus)
+        (compose-preview--redraw))
+      (compose-preview--goto-item next))))
 
 (defun compose-preview-next ()
-  "Show the next filtered Preview in Focus view."
+  "Move to the next filtered Preview.
+In Grid view, jump to the next visible title.  In Focus view, show
+the next Preview."
   (interactive)
   (compose-preview--move-focus 1))
 
 (defun compose-preview-previous ()
-  "Show the previous filtered Preview in Focus view."
+  "Move to the previous filtered Preview.
+In Grid view, jump to the previous visible title.  In Focus view, show
+the previous Preview."
   (interactive)
   (compose-preview--move-focus -1))
 
@@ -1319,8 +1423,8 @@ An empty QUERY clears the current text filter."
 (defun compose-preview-filter-group (group)
   "Display Preview GROUP, or every group when GROUP is nil."
   (interactive
-   (let* ((groups (mapcar #'car (compose-preview--group-items
-                                 compose-preview--items)))
+   (let* ((groups (compose-preview--annotation-group-names
+                   compose-preview--items))
           (choice (completing-read "Preview group: " (cons "All" groups)
                                    nil t nil nil
                                    (or compose-preview--group-filter "All"))))
@@ -1359,12 +1463,13 @@ An empty QUERY clears the current text filter."
   (compose-preview--zoom 0.8))
 
 (defun compose-preview--window-state-change (&optional _frame)
-  "Refit Preview images after the panel window width changes."
-  (when (and compose-preview--fit-images
-             compose-preview--items
-             (get-buffer-window (current-buffer) t))
+  "Reflow Grid rows and refit images after the panel width changes."
+  (when (and compose-preview--items
+             (get-buffer-window (current-buffer) t)
+             (or compose-preview--fit-images
+                 (eq compose-preview--view-mode 'grid)))
     (let ((width (compose-preview--fit-width)))
-      (unless (equal width compose-preview--last-fit-width)
+      (unless (equal width compose-preview--last-layout-width)
         (compose-preview--redraw)))))
 
 (defun compose-preview-goto-source (&optional preview)
@@ -1395,19 +1500,99 @@ An empty QUERY clears the current text filter."
       (compose-preview--json-get error "status")
       "Unknown rendering issue"))
 
+(defun compose-preview--insert-preview-title (preview)
+  "Insert PREVIEW's source-linked display title."
+  (insert-text-button (compose-preview-item-name preview)
+                      'face 'bold 'follow-link t
+                      'help-echo "Visit Preview source (o)"
+                      'compose-preview-item preview
+                      'action (lambda (button)
+                                (compose-preview-goto-source
+                                 (button-get button 'compose-preview-item)))))
+
+(defun compose-preview--grid-entry (preview)
+  "Return measured Grid entry for PREVIEW."
+  (let* ((file (seq-find #'file-readable-p
+                         (compose-preview-item-files preview)))
+         (image (and file (display-images-p) (image-type-available-p 'png)
+                     (condition-case nil
+                         (compose-preview--image-spec
+                          file (compose-preview-item-density-dpi preview))
+                       (error nil))))
+         (image-width (and image (compose-preview--image-width image)))
+         (title-width (compose-preview--string-pixel-width
+                       (compose-preview-item-name preview)))
+         (width (max 96 (or image-width 0) title-width)))
+    (list :item preview :file file :image image :width width)))
+
+(defun compose-preview--grid-rows (previews)
+  "Pack PREVIEWS into Studio-style Grid rows for the current width."
+  (let ((available (compose-preview--fit-width))
+        (gap 24)
+        (x 0)
+        rows row)
+    (dolist (preview previews)
+      (let* ((entry (compose-preview--grid-entry preview))
+             (width (plist-get entry :width)))
+        (when (and row (> (+ x width) available))
+          (push (nreverse row) rows)
+          (setq row nil x 0))
+        (setq entry (plist-put entry :x x))
+        (push entry row)
+        (setq x (+ x width gap))))
+    (when row (push (nreverse row) rows))
+    (nreverse rows)))
+
+(defun compose-preview--insert-aligned (x)
+  "Insert a pixel spacer that starts the next Grid cell at X."
+  (insert (propertize " " 'display `(space :align-to (,x)))))
+
+(defun compose-preview--insert-grid-cell (entry inserter)
+  "Insert one Grid cell from ENTRY using INSERTER."
+  (let ((start (point))
+        (item (plist-get entry :item)))
+    (compose-preview--insert-aligned (plist-get entry :x))
+    (funcall inserter entry)
+    (put-text-property start (point) 'compose-preview-item item)))
+
+(defun compose-preview--insert-grid-row (entries)
+  "Insert one Grid row of measured ENTRIES."
+  (dolist (entry entries)
+    (compose-preview--insert-grid-cell
+     entry (lambda (cell)
+             (compose-preview--insert-preview-title
+              (plist-get cell :item)))))
+  (insert "\n")
+  (dolist (entry entries)
+    (compose-preview--insert-grid-cell
+     entry
+     (lambda (cell)
+       (cond
+        ((plist-get cell :image)
+         (insert-image (plist-get cell :image)))
+        ((plist-get cell :file)
+         (insert (propertize "Could not render image." 'face 'error)))
+        (t (insert (propertize "No image was produced." 'face 'error)))))))
+  (insert "\n")
+  (when (seq-some (lambda (entry)
+                    (compose-preview-item-error (plist-get entry :item)))
+                  entries)
+    (dolist (entry entries)
+      (when-let* ((error (compose-preview-item-error (plist-get entry :item))))
+        (compose-preview--insert-grid-cell
+         entry (lambda (_cell)
+                 (insert (propertize (compose-preview--error-summary error)
+                                     'face 'error))))))
+    (insert "\n"))
+  (insert "\n"))
+
 (defun compose-preview--insert-preview (preview)
   "Insert PREVIEW image, issue summary, and actions in the results buffer."
   (let ((start (point))
         (files (seq-filter #'file-readable-p
                            (compose-preview-item-files preview)))
         (error (compose-preview-item-error preview)))
-    (insert-text-button (compose-preview-item-name preview)
-                        'face 'bold 'follow-link t
-                        'help-echo "Visit Preview source (o)"
-                        'compose-preview-item preview
-                        'action (lambda (button)
-                                  (compose-preview-goto-source
-                                   (button-get button 'compose-preview-item))))
+    (compose-preview--insert-preview-title preview)
     (insert "\n")
     (dolist (file files)
       (insert-button "open image" 'follow-link t
@@ -1431,8 +1616,11 @@ An empty QUERY clears the current text filter."
 (defun compose-preview--insert-group (name previews)
   "Insert Magit-style collapsible section NAME containing PREVIEWS."
   (let ((header-start (point))
+        (title (or (and (car previews)
+                        (compose-preview--section-title (car previews)))
+                   name))
         (collapsed (gethash name compose-preview--collapsed-groups)))
-    (insert-text-button (format "%s  %d\n" name (length previews))
+    (insert-text-button (format "%s  %d\n" title (length previews))
                         'face 'compose-preview-section-heading
                         'follow-link t
                         'help-echo "Toggle section (TAB or RET)"
@@ -1445,8 +1633,8 @@ An empty QUERY clears the current text filter."
       (overlay-put header 'evaporate t)
       (puthash name header compose-preview--group-header-overlays))
     (let ((body-start (point)))
-      (dolist (preview previews)
-        (compose-preview--insert-preview preview))
+      (dolist (row (compose-preview--grid-rows previews))
+        (compose-preview--insert-grid-row row))
       (put-text-property body-start (point) 'compose-preview-group-body name)
       (put-text-property body-start (point) 'compose-preview-section-group name)
       (compose-preview--set-group-collapsed name collapsed))))
@@ -1463,7 +1651,7 @@ An empty QUERY clears the current text filter."
                   compose-preview--items previews
                   default-directory module-root)
       (unless (member compose-preview--group-filter
-                      (mapcar #'car (compose-preview--group-items previews)))
+                      (compose-preview--annotation-group-names previews))
         (setq compose-preview--group-filter nil))
       (let ((issue-count (seq-count #'compose-preview-item-error previews)))
         (setq header-line-format
@@ -1477,7 +1665,10 @@ An empty QUERY clears the current text filter."
     (compose-preview--display-panel buffer)
     (with-current-buffer buffer
       (when compose-preview--fit-images
-        (compose-preview--window-state-change)))))
+        (compose-preview--window-state-change))
+      (goto-char (point-min))
+      (when-let* ((window (get-buffer-window buffer t)))
+        (set-window-point window (point-min))))))
 
 (defun compose-preview-open-results (&optional module-root previews _source-file)
   "Open the most recently rendered Compose previews.
@@ -1509,6 +1700,43 @@ FORMAT-STRING and ARGS are passed to `format'."
                                    (concat "failed — " message) 'error)
     (compose-preview--log "%s" message)))
 
+(defun compose-preview--padded-index (index max-index)
+  "Return INDEX zero-padded to the width of MAX-INDEX."
+  (let ((width (max 1 (length (number-to-string (max 0 max-index))))))
+    (format (format "%%0%dd" width) index)))
+
+(defun compose-preview--preview-base-name (method-name preview-name)
+  "Return Studio's base Preview name for METHOD-NAME and PREVIEW-NAME."
+  (if (and preview-name (not (string-empty-p preview-name)))
+      (format "%s - %s" method-name preview-name)
+    method-name))
+
+(defun compose-preview--custom-parameter-display-name (renderer-name)
+  "Return RENDERER-NAME when it is a provider display name rather than paramN."
+  (and (stringp renderer-name)
+       (not (string-empty-p renderer-name))
+       (not (string-match-p "\\`param[0-9]+ [0-9]+\\'" renderer-name))
+       renderer-name))
+
+(defun compose-preview--parameter-display-name (parameter-name index count renderer-name)
+  "Return Studio's parameter label for one PreviewParameter instance."
+  (or (compose-preview--custom-parameter-display-name renderer-name)
+      (and parameter-name
+           (format "%s %s" parameter-name
+                   (compose-preview--padded-index
+                    index (max 0 (1- (or count 1))))))
+      renderer-name))
+
+(defun compose-preview--studio-item-name (method-name preview-name parameter-name index count renderer-name)
+  "Return Studio Grid title for one Preview instance."
+  (let ((base (compose-preview--preview-base-name method-name preview-name))
+        (param (and index
+                    (compose-preview--parameter-display-name
+                     parameter-name index count renderer-name))))
+    (if param
+        (format "%s (%s)" base param)
+      base)))
+
 (defun compose-preview--result-items (results output &optional metadata)
   "Convert renderer RESULTS into preview items rooted at OUTPUT.
 Use METADATA keyed by preview id to preserve annotation display settings."
@@ -1516,23 +1744,37 @@ Use METADATA keyed by preview id to preserve annotation display settings."
    (lambda (result)
      (let* ((fqn (compose-preview--json-get result "methodFQN"))
             (path (compose-preview--json-get result "imagePath"))
-            (id (compose-preview--json-get result "previewId"))
-            (details (and metadata (gethash id metadata)))
-            (suffix (string-remove-prefix (concat fqn "_") id))
-            (name (car (last (split-string fqn "\\." t))))
-            (label (if (string-match-p "\\`[0-9]+\\'" suffix)
-                       name
-                     (format "%s - %s" name
-                             (replace-regexp-in-string "_+" " " suffix)))))
+            (preview-id (compose-preview--json-get result "previewId"))
+            (instance-id (compose-preview--json-get result "instanceId"))
+            (parameter-index (compose-preview--json-get result "parameterIndex"))
+            (parameter-count (compose-preview--json-get result "parameterCount"))
+            (details (and metadata (gethash preview-id metadata)))
+            (method-name (car (last (split-string fqn "\\." t))))
+            (parameter-name (or (plist-get details :parameter-name)
+                                (compose-preview--json-get result "parameterName")))
+            (label (compose-preview--studio-item-name
+                    method-name
+                    (plist-get details :preview-name)
+                    (plist-get details :parameter-name)
+                    parameter-index parameter-count
+                    (compose-preview--json-get result "parameterName")))
+            (id (if instance-id
+                    (concat preview-id "#" instance-id)
+                  (if parameter-index
+                      (format "%s#%d" preview-id parameter-index)
+                    preview-id))))
        (make-compose-preview-item
         :id id :name label
         :declaring-class (string-join (butlast (split-string fqn "\\." t)) ".")
-        :method name
+        :method method-name
         :method-fqn fqn
         :preview-name (plist-get details :preview-name)
         :group (plist-get details :group)
         :source-file (plist-get details :source-file)
         :density-dpi (compose-preview--json-get result "densityDpi")
+        :parameter-index parameter-index
+        :parameter-count parameter-count
+        :parameter-name parameter-name
         :files (and path (list (expand-file-name path output)))
         :error (compose-preview--json-get result "error"))))
    results))
