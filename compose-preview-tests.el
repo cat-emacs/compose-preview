@@ -52,6 +52,21 @@
     (should (equal (compose-preview--current-buffer-class-prefix)
                    "com.example.ui.FooKt"))))
 
+(ert-deftest compose-preview-source-file-scanners-do-not-prompt-on-temp-kill ()
+  "Temporary Kotlin scans must not ask to kill a modified file buffer."
+  (let ((file (make-temp-file "compose-preview" nil ".kt")))
+    (unwind-protect
+        (progn
+          (with-temp-file file
+            (insert "package com.example\nclass Card\nfun Preview() {}\n"))
+          (cl-letf (((symbol-function 'read-multiple-choice)
+                     (lambda (&rest _) (error "kill prompt"))))
+            (should (equal (compose-preview--source-file-class-prefix file)
+                           (concat "com.example." (file-name-base file) "Kt")))
+            (should (member "com.example.Card"
+                            (compose-preview--source-declaring-prefixes file)))))
+      (delete-file file))))
+
 (ert-deftest compose-preview-current-preview-method ()
   "Current Kotlin position maps to the containing @Preview function."
   (with-temp-buffer

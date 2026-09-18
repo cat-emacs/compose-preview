@@ -529,8 +529,8 @@ Each entry is (PROJECT-ROOT . TARGET), where TARGET is a plist containing
   (when (and file (file-readable-p file) (string-match-p "\\.kt\\'" file))
     (with-temp-buffer
       (insert-file-contents file)
-      (setq-local buffer-file-name file)
-      (compose-preview--current-buffer-class-prefix))))
+      (let ((buffer-file-name file))
+        (compose-preview--current-buffer-class-prefix)))))
 
 (defun compose-preview--looking-at-preview-annotation-p ()
   "Return non-nil when point is at a Compose @Preview annotation."
@@ -865,8 +865,8 @@ When FORCE-PROMPT is non-nil, prompt for module and variant via android-mode."
   (when (and file (file-readable-p file))
     (with-temp-buffer
       (insert-file-contents file)
-      (setq-local buffer-file-name file)
-      (let* ((package (compose-preview--current-package))
+      (let* ((buffer-file-name file)
+             (package (compose-preview--current-package))
              (qualify (lambda (name)
                         (if (and package (not (string-empty-p package)))
                             (concat package "." name)
