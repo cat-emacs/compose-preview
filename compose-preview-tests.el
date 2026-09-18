@@ -482,6 +482,7 @@
       (compose-preview-next)
       (should (equal (compose-preview-item-id (compose-preview--current-item))
                      "two"))
+      (should (= (point) (compose-preview--item-title-position two)))
       (should-error (compose-preview-next))
       (compose-preview-previous)
       (should (equal (compose-preview-item-id (compose-preview--current-item))

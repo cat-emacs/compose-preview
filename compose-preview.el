@@ -193,6 +193,14 @@ Each entry is (PROJECT-ROOT . TARGET), where TARGET is a plist containing
   "Face for Compose Preview section headings."
   :group 'compose-preview)
 
+(defface compose-preview-section-highlight
+  '((((class color) (background light))
+     :background "grey95" :extend t)
+    (((class color) (background dark))
+     :background "grey20" :extend t))
+  "Face for the current Compose Preview section heading."
+  :group 'compose-preview)
+
 (when (fboundp 'define-fringe-bitmap)
   (define-fringe-bitmap 'compose-preview-fringe>
     [#b01100000
@@ -230,6 +238,9 @@ Each entry is (PROJECT-ROOT . TARGET), where TARGET is a plist containing
 
 (defvar-local compose-preview--section-highlight-overlay nil
   "Overlay highlighting the Preview section at point.")
+
+(defvar-local compose-preview--item-highlight-overlay nil
+  "Overlay highlighting the Preview card title at point.")
 
 (defvar-local compose-preview--items nil
   "All items available to the current Preview panel.")
@@ -1243,7 +1254,9 @@ mode only shrinks images that exceed the available panel width."
                    (delete-overlay overlay)))
                table)))
   (when (overlayp compose-preview--section-highlight-overlay)
-    (delete-overlay compose-preview--section-highlight-overlay)))
+    (delete-overlay compose-preview--section-highlight-overlay))
+  (when (overlayp compose-preview--item-highlight-overlay)
+    (delete-overlay compose-preview--item-highlight-overlay)))
 
 (defun compose-preview--redraw ()
   "Redraw the current Preview panel without rerendering images."
@@ -1256,6 +1269,7 @@ mode only shrinks images that exceed the available panel width."
     (setq compose-preview--group-overlays (make-hash-table :test #'equal)
           compose-preview--group-header-overlays (make-hash-table :test #'equal)
           compose-preview--section-highlight-overlay nil
+          compose-preview--item-highlight-overlay nil
           compose-preview--group-names
           (mapcar #'car (compose-preview--group-items visible)))
     (when compose-preview--status
@@ -1298,14 +1312,28 @@ mode only shrinks images that exceed the available panel width."
   "Highlight the heading of the Preview section containing point."
   (when (overlayp compose-preview--section-highlight-overlay)
     (delete-overlay compose-preview--section-highlight-overlay))
-  (setq compose-preview--section-highlight-overlay nil)
-  (when-let* ((group (compose-preview--group-at-point))
-              (header (gethash group compose-preview--group-header-overlays))
-              ((overlay-buffer header)))
-    (let ((overlay (make-overlay (overlay-start header) (overlay-end header))))
-      (overlay-put overlay 'face 'highlight)
-      (overlay-put overlay 'priority 10)
-      (setq compose-preview--section-highlight-overlay overlay))))
+  (when (overlayp compose-preview--item-highlight-overlay)
+    (delete-overlay compose-preview--item-highlight-overlay))
+  (setq compose-preview--section-highlight-overlay nil
+        compose-preview--item-highlight-overlay nil)
+  (let ((item (compose-preview--current-item)))
+    (unless item
+      (when-let* ((group (compose-preview--group-at-point))
+                  (header (gethash group compose-preview--group-header-overlays))
+                  ((overlay-buffer header)))
+        (let ((overlay (make-overlay (overlay-start header) (overlay-end header))))
+          (overlay-put overlay 'face 'compose-preview-section-highlight)
+          (overlay-put overlay 'priority 10)
+          (setq compose-preview--section-highlight-overlay overlay))))
+    (when-let* ((start (and item (compose-preview--item-title-position item))))
+      (let ((overlay (make-overlay
+                      start
+                      (or (next-single-property-change
+                           start 'compose-preview-item-title nil (point-max))
+                          (point-max)))))
+        (overlay-put overlay 'face 'highlight)
+        (overlay-put overlay 'priority 11)
+        (setq compose-preview--item-highlight-overlay overlay)))))
 
 (defun compose-preview--property-position (property value)
   "Return first position whose PROPERTY is equal to VALUE."
@@ -1410,6 +1438,21 @@ mode only shrinks images that exceed the available panel width."
        (compose-preview--visible-items))
     (compose-preview--visible-items)))
 
+(defun compose-preview--item-title-position (item)
+  "Return first title position for ITEM, if it has a Grid label."
+  (let ((position (point-min))
+        found)
+    (while (and (< position (point-max)) (not found))
+      (let ((current (get-text-property position 'compose-preview-item-title)))
+        (if (and current
+                 (equal (compose-preview-item-id current)
+                        (compose-preview-item-id item)))
+            (setq found position)
+          (setq position (or (next-single-property-change
+                              position 'compose-preview-item-title nil (point-max))
+                             (point-max))))))
+    found))
+
 (defun compose-preview--item-position (item)
   "Return first buffer position of ITEM, if any."
   (let ((position (point-min))
@@ -1427,7 +1470,8 @@ mode only shrinks images that exceed the available panel width."
 
 (defun compose-preview--goto-item (item)
   "Move point to ITEM in the current Preview panel."
-  (when-let* ((position (compose-preview--item-position item)))
+  (when-let* ((position (or (compose-preview--item-title-position item)
+                            (compose-preview--item-position item))))
     (goto-char position)))
 
 (defun compose-preview--heading-at-point-p ()
@@ -1625,16 +1669,18 @@ An empty QUERY clears the current text filter."
                    (compose-preview-item-name preview)
                  (compose-preview--card-title preview))))
     (when (and title (not (string-empty-p title)))
-      (insert-text-button title
-                          'face 'bold 'follow-link t
-                          'help-echo (or (compose-preview-item-name preview)
-                                         "Visit Preview source (o)")
-                          'keymap compose-preview-button-map
-                          'compose-preview-item preview
-                          'action (lambda (button)
-                                    (compose-preview-goto-source
-                                     (button-get button
-                                                 'compose-preview-item)))))))
+      (let ((start (point)))
+        (insert-text-button title
+                            'face 'bold 'follow-link t
+                            'help-echo (or (compose-preview-item-name preview)
+                                           "Visit Preview source (o)")
+                            'keymap compose-preview-button-map
+                            'compose-preview-item preview
+                            'action (lambda (button)
+                                      (compose-preview-goto-source
+                                       (button-get button
+                                                   'compose-preview-item))))
+        (put-text-property start (point) 'compose-preview-item-title preview)))))
 
 (defun compose-preview--grid-entry (preview)
   "Return measured Grid entry for PREVIEW."
