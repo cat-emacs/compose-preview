@@ -62,7 +62,7 @@
   :type 'integer
   :group 'compose-preview)
 
-(defcustom compose-preview-panel-width 0.35
+(defcustom compose-preview-panel-width 0.3
   "Width of the Compose preview side window.
 A float means a fraction of the frame width; an integer means columns."
   :type '(choice (float :tag "Frame fraction")
@@ -269,6 +269,20 @@ Each entry is (PROJECT-ROOT . TARGET), where TARGET is a plist containing
 
 (defvar-local compose-preview--group-filter nil
   "Preview group to display, or nil to display every group.")
+
+(defun compose-preview--grid-gap (scale)
+  "Return Android Studio's responsive Grid card gap for SCALE."
+  (truncate
+   (cond
+    ((<= scale 0.2) 5)
+    ((>= scale 1.0) 15)
+    (t (+ 5 (* (/ (- scale 0.2) 0.8) 10))))))
+
+(defun compose-preview--current-image-scale ()
+  "Return the scale currently applied to Preview images."
+  (if compose-preview--fit-images
+      compose-preview--fit-scale
+    compose-preview--image-zoom))
 
 (defvar-local compose-preview--fit-images nil
   "Non-nil when Preview images use a shared Zoom to Fit scale.")
@@ -1269,7 +1283,10 @@ mode uses one scale shared by every visible Preview, like Studio's surface."
 
 (defun compose-preview--fit-grid-size (items scale available-width)
   "Return Grid layout size for ITEMS at SCALE within AVAILABLE-WIDTH."
-  (let ((gap 24) (line-height (frame-char-height)) (max-width 0) (height 0))
+  (let ((gap (compose-preview--grid-gap scale))
+        (line-height (frame-char-height))
+        (max-width 0)
+        (height 0))
     (dolist (group (compose-preview--group-items items))
       (setq height (+ height line-height))
       (unless (gethash (car group) compose-preview--collapsed-groups)
@@ -1802,7 +1819,8 @@ An empty QUERY clears the current text filter."
 (defun compose-preview--grid-rows (previews)
   "Pack PREVIEWS into Studio-style Grid rows for the current width."
   (let ((available (compose-preview--fit-width))
-        (gap 24)
+        (gap (compose-preview--grid-gap
+              (compose-preview--current-image-scale)))
         (x 0)
         rows row)
     (dolist (preview previews)

@@ -693,6 +693,14 @@
     (should (equal (mapcar #'car (compose-preview--group-items items))
                    '("com.example.FooKt.LoginPreview")))))
 
+(ert-deftest compose-preview-grid-gap-matches-studio-dynamic-padding ()
+  "Grid card spacing follows Studio's scale-responsive padding."
+  (should (= (compose-preview--grid-gap 0.1) 5))
+  (should (= (compose-preview--grid-gap 0.2) 5))
+  (should (= (compose-preview--grid-gap 0.8) 12))
+  (should (= (compose-preview--grid-gap 1.0) 15))
+  (should (= (compose-preview--grid-gap 2.0) 15)))
+
 (ert-deftest compose-preview-grid-rows-wrap-to-available-width ()
   "Grid rows wrap when the next Preview would exceed the panel width."
   (cl-letf (((symbol-function 'compose-preview--fit-width) (lambda () 250))
