@@ -270,6 +270,18 @@ Each entry is (PROJECT-ROOT . TARGET), where TARGET is a plist containing
 (defvar-local compose-preview--group-filter nil
   "Preview group to display, or nil to display every group.")
 
+(defvar-local compose-preview--fit-images nil
+  "Non-nil when Preview images use a shared Zoom to Fit scale.")
+
+(defvar-local compose-preview--fit-scale 1.0
+  "Shared image scale computed by Zoom to Fit.")
+
+(defvar-local compose-preview--last-layout-size nil
+  "Panel pixel size used for the most recent layout.")
+
+(defvar-local compose-preview--image-zoom 1.0
+  "Image scale used when `compose-preview--fit-images' is nil.")
+
 (defun compose-preview--grid-gap (scale)
   "Return Android Studio's responsive Grid card gap for SCALE."
   (truncate
@@ -283,18 +295,6 @@ Each entry is (PROJECT-ROOT . TARGET), where TARGET is a plist containing
   (if compose-preview--fit-images
       compose-preview--fit-scale
     compose-preview--image-zoom))
-
-(defvar-local compose-preview--fit-images nil
-  "Non-nil when Preview images use a shared Zoom to Fit scale.")
-
-(defvar-local compose-preview--fit-scale 1.0
-  "Shared image scale computed by Zoom to Fit.")
-
-(defvar-local compose-preview--last-layout-size nil
-  "Panel pixel size used for the most recent layout.")
-
-(defvar-local compose-preview--image-zoom 1.0
-  "Image scale used when `compose-preview--fit-images' is nil.")
 
 (defvar compose-preview-results-mode-map (make-sparse-keymap)
   "Keymap for `compose-preview-results-mode'.")
