@@ -533,29 +533,28 @@
     (should (= (compose-preview--actual-image-width 'image 480) 180))
     (should (= (compose-preview--actual-image-width 'image nil) 1080))))
 
-(ert-deftest compose-preview-image-spec-fits-without-upscaling ()
-  "Fit mode only shrinks images from their Studio-style actual size."
+(ert-deftest compose-preview-image-spec-uses-shared-fit-scale ()
+  "Fit mode applies one Studio-style scale and may enlarge images."
   (let ((compose-preview--fit-images t)
+        (compose-preview--fit-scale 2.0)
         created-widths)
     (cl-letf (((symbol-function 'create-image)
                (lambda (_file _type _data-p &rest properties)
                  (push (plist-get properties :width) created-widths)
                  'image))
               ((symbol-function 'compose-preview--actual-image-width)
-               (lambda (_image _density) 180))
-              ((symbol-function 'compose-preview--fit-width) (lambda () 320)))
+               (lambda (_image _density) 180)))
       (compose-preview--image-spec "phone.png" 480)
-      (should (equal created-widths '(180 nil))))
-    (setq created-widths nil)
-    (cl-letf (((symbol-function 'create-image)
-               (lambda (_file _type _data-p &rest properties)
-                 (push (plist-get properties :width) created-widths)
-                 'image))
-              ((symbol-function 'compose-preview--actual-image-width)
-               (lambda (_image _density) 600))
-              ((symbol-function 'compose-preview--fit-width) (lambda () 320)))
-      (compose-preview--image-spec "tablet.png" 320)
-      (should (equal created-widths '(320 nil))))))
+      (should (equal created-widths '(360 nil))))))
+
+(ert-deftest compose-preview-fit-scale-respects-layout-width-and-height ()
+  "Zoom to Fit finds one scale bounded by both surface dimensions."
+  (cl-letf (((symbol-function 'compose-preview--available-size)
+             (lambda () '(320 . 240)))
+            ((symbol-function 'compose-preview--fit-layout-size)
+             (lambda (_items scale) (cons (* 200 scale) (* 300 scale)))))
+    (let ((scale (compose-preview--fit-scale-for-items '(preview))))
+      (should (< (abs (- scale 0.8)) 0.001)))))
 
 (ert-deftest compose-preview-group-sections-toggle-visibility ()
   "Group headers hide and reveal their Preview body without rebuilding it."

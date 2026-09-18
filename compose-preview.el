@@ -271,16 +271,16 @@ Each entry is (PROJECT-ROOT . TARGET), where TARGET is a plist containing
   "Preview group to display, or nil to display every group.")
 
 (defvar-local compose-preview--fit-images nil
-  "Non-nil when oversized Preview images should fit the panel width.")
+  "Non-nil when Preview images use a shared Zoom to Fit scale.")
 
-(defvar-local compose-preview--last-layout-width nil
-  "Panel width used for the most recent Grid layout.")
+(defvar-local compose-preview--fit-scale 1.0
+  "Shared image scale computed by Zoom to Fit.")
+
+(defvar-local compose-preview--last-layout-size nil
+  "Panel pixel size used for the most recent layout.")
 
 (defvar-local compose-preview--image-zoom 1.0
   "Image scale used when `compose-preview--fit-images' is nil.")
-
-(defvar-local compose-preview--last-fit-width nil
-  "Last image width used by fit mode in the current panel.")
 
 (defvar compose-preview-results-mode-map (make-sparse-keymap)
   "Keymap for `compose-preview-results-mode'.")
@@ -1072,10 +1072,15 @@ Use GENERATION to isolate concurrent or superseded render attempts."
           :metadata metadata)))
 
 (defun compose-preview--fit-width ()
-  "Return an image width that fits the current Preview window."
+  "Return the available pixel width of the current Preview surface."
+  (car (compose-preview--available-size)))
+
+(defun compose-preview--available-size ()
+  "Return available Preview surface size in logical pixels."
   (if-let* ((window (get-buffer-window (current-buffer) t)))
-      (max 64 (- (window-body-width window t) 32))
-    compose-preview-image-width))
+      (cons (max 64 (- (window-body-width window t) 32))
+            (max 64 (- (window-body-height window t) 32)))
+    (cons compose-preview-image-width compose-preview-image-width)))
 
 (defun compose-preview--string-pixel-width (string)
   "Return the pixel width of STRING in the current Preview panel."
@@ -1106,24 +1111,36 @@ Use GENERATION to isolate concurrent or superseded render attempts."
                   (max 1.0 (compose-preview--frame-scale-factor))))
       width)))
 
+(defun compose-preview--actual-image-size (file density-dpi)
+  "Return FILE size at Studio-style actual size for DENSITY-DPI."
+  (condition-case nil
+      (let* ((image (create-image file 'png nil))
+             (size (image-size image t))
+             (factor (if (and density-dpi (> density-dpi 0))
+                         (/ 160.0 density-dpi
+                            (max 1.0 (compose-preview--frame-scale-factor)))
+                       1.0)))
+        (cons (round (* (car size) factor))
+              (round (* (cdr size) factor))))
+    (error nil)))
+
 (defun compose-preview--image-spec (file &optional density-dpi)
   "Return an image spec for FILE using Android Studio scale semantics.
 At actual size, convert renderer pixels to Android dp using DENSITY-DPI and
 compensate for the host frame scale, matching Studio's design surface.  Fit
-mode only shrinks images that exceed the available panel width."
+mode uses one scale shared by every visible Preview, like Studio's surface."
   (let* ((original (create-image file 'png nil))
          (width (compose-preview--actual-image-width original density-dpi))
-         (fit-width (compose-preview--fit-width))
+         (scale (if compose-preview--fit-images
+                    compose-preview--fit-scale
+                  compose-preview--image-zoom))
          (display-width
           (cond
-           ((and width compose-preview--fit-images)
-            (min width fit-width))
-           (width (round (* width compose-preview--image-zoom)))
-           ((= compose-preview--image-zoom 1.0) nil)
-           (t (round (* compose-preview-image-width
-                        compose-preview--image-zoom))))))
+           (width (round (* width scale)))
+           ((= scale 1.0) nil)
+           (t (round (* compose-preview-image-width scale))))))
     (if display-width
-        (create-image file 'png nil :width display-width)
+        (create-image file 'png nil :width (max 1 display-width))
       original)))
 
 (defun compose-preview--insert-image (file &optional density-dpi)
@@ -1234,11 +1251,82 @@ mode only shrinks images that exceed the available panel width."
   "Return the Preview item at point, if any."
   (get-text-property (point) 'compose-preview-item))
 
+(defun compose-preview--fit-item-size (item scale)
+  "Return ITEM card size at SCALE as a pixel cons cell."
+  (let* ((file (seq-find #'file-readable-p (compose-preview-item-files item)))
+         (actual (and file (compose-preview--actual-image-size
+                            file (compose-preview-item-density-dpi item))))
+         (image-width (if actual (* scale (car actual)) 96))
+         (image-height (if actual (* scale (cdr actual)) 64))
+         (title (compose-preview--card-title item))
+         (title-width (if title (compose-preview--string-pixel-width title) 0))
+         (line-height (frame-char-height))
+         (extra-height (+ (if title line-height 0)
+                          (if (compose-preview-item-error item) line-height 0)
+                          line-height)))
+    (cons (max 96 image-width title-width)
+          (+ image-height extra-height))))
+
+(defun compose-preview--fit-grid-size (items scale available-width)
+  "Return Grid layout size for ITEMS at SCALE within AVAILABLE-WIDTH."
+  (let ((gap 24) (line-height (frame-char-height)) (max-width 0) (height 0))
+    (dolist (group (compose-preview--group-items items))
+      (setq height (+ height line-height))
+      (unless (gethash (car group) compose-preview--collapsed-groups)
+        (let ((x 0) (row-height 0))
+          (dolist (item (cdr group))
+            (let* ((size (compose-preview--fit-item-size item scale))
+                   (width (car size)))
+              (when (and (> x 0) (> (+ x width) available-width))
+                (setq max-width (max max-width (- x gap))
+                      height (+ height row-height)
+                      x 0 row-height 0))
+              (setq x (+ x width gap)
+                    row-height (max row-height (cdr size)))))
+          (setq max-width (max max-width (max 0 (- x gap)))
+                height (+ height row-height line-height)))))
+    (cons max-width height)))
+
+(defun compose-preview--fit-layout-size (items scale)
+  "Return visible Preview layout size for ITEMS at SCALE."
+  (let* ((available (compose-preview--available-size))
+         (line-height (frame-char-height))
+         (hints-height (if compose-preview-show-key-hints (* 2 line-height) 0)))
+    (if (eq compose-preview--view-mode 'focus)
+        (let* ((item (compose-preview--focused-item items))
+               (size (and item (compose-preview--fit-item-size item scale))))
+          (cons (if size (car size) 0)
+                (+ hints-height (if size (cdr size) 0) (* 2 line-height))))
+      (let ((size (compose-preview--fit-grid-size items scale (car available))))
+        (cons (car size) (+ hints-height (cdr size)))))))
+
+(defun compose-preview--fit-scale-for-items (items)
+  "Return Studio-style shared Zoom to Fit scale for visible ITEMS."
+  (if (null items)
+      1.0
+    (let* ((available (compose-preview--available-size))
+           (width (car available))
+           (height (cdr available))
+           (low 0.01)
+           (high 10.0))
+      (dotimes (_ 18)
+        (let* ((scale (/ (+ low high) 2.0))
+               (size (compose-preview--fit-layout-size items scale)))
+          (if (and (<= (car size) width) (<= (cdr size) height))
+              (setq low scale)
+            (setq high scale))))
+      low)))
+
 (defun compose-preview--view-description (visible)
   "Return a concise description of current view over VISIBLE items."
-  (format "%s · %d/%d%s%s"
+  (format "%s · %d/%d · %s%s%s"
           (capitalize (symbol-name compose-preview--view-mode))
           (length visible) (length compose-preview--items)
+          (if compose-preview--fit-images
+              (format "Fit · %d%%" (round (* 100 compose-preview--fit-scale)))
+            (if (= compose-preview--image-zoom 1.0)
+                "Actual"
+              (format "%d%%" (round (* 100 compose-preview--image-zoom)))))
           (if compose-preview--group-filter
               (format " · %s" compose-preview--group-filter) "")
           (if compose-preview--search-query
@@ -1272,6 +1360,11 @@ mode only shrinks images that exceed the available panel width."
           compose-preview--item-highlight-overlay nil
           compose-preview--group-names
           (mapcar #'car (compose-preview--group-items visible)))
+    (setq compose-preview--last-layout-size
+          (compose-preview--available-size))
+    (when compose-preview--fit-images
+      (setq compose-preview--fit-scale
+            (compose-preview--fit-scale-for-items visible)))
     (when compose-preview--status
       (setq header-line-format
             (propertize
@@ -1282,9 +1375,6 @@ mode only shrinks images that exceed the available panel width."
       (insert (propertize
                "TAB fold  n/p browse  v view  / search  G group  f/1/+/- scale  o source\n\n"
                'face 'shadow)))
-    (setq compose-preview--last-fit-width
-          (and compose-preview--fit-images (compose-preview--fit-width))
-          compose-preview--last-layout-width (compose-preview--fit-width))
     (cond
      ((and (null visible) compose-preview--items)
       (insert (propertize "No previews match the current filters.\n" 'face 'shadow)))
@@ -1405,8 +1495,14 @@ mode only shrinks images that exceed the available panel width."
     (unless group
       (user-error "Point is not in a Preview section"))
     (compose-preview--set-group-collapsed group collapsed)
-    (when (and collapsed (overlayp header) (overlay-buffer header))
-      (goto-char (overlay-start header)))))
+    (if compose-preview--fit-images
+        (progn
+          (compose-preview--redraw)
+          (when-let* ((position (compose-preview--property-position
+                                 'compose-preview-group group)))
+            (goto-char position)))
+      (when (and collapsed (overlayp header) (overlay-buffer header))
+        (goto-char (overlay-start header))))))
 
 (defun compose-preview-toggle-all-groups ()
   "Expand all Preview groups, or collapse all when all are expanded."
@@ -1417,7 +1513,9 @@ mode only shrinks images that exceed the available panel width."
                       (not (gethash group compose-preview--collapsed-groups)))
                     groups)))
     (dolist (group groups)
-      (compose-preview--set-group-collapsed group collapse))))
+      (compose-preview--set-group-collapsed group collapse))
+    (when compose-preview--fit-images
+      (compose-preview--redraw))))
 
 (defun compose-preview-toggle-view ()
   "Toggle between Grid and Focus Preview views."
@@ -1596,13 +1694,13 @@ An empty QUERY clears the current text filter."
   (compose-preview--redraw))
 
 (defun compose-preview-fit ()
-  "Scale images to fit the current Preview panel width."
+  "Scale the visible Preview layout to fit the current panel."
   (interactive)
   (setq compose-preview--fit-images t)
   (compose-preview--redraw))
 
 (defun compose-preview-original-size ()
-  "Display Preview images at their original pixel size."
+  "Display Preview images at Android Studio Actual Size."
   (interactive)
   (setq compose-preview--fit-images nil
         compose-preview--image-zoom 1.0)
@@ -1610,6 +1708,8 @@ An empty QUERY clears the current text filter."
 
 (defun compose-preview--zoom (factor)
   "Multiply the current image scale by FACTOR and redraw."
+  (when compose-preview--fit-images
+    (setq compose-preview--image-zoom compose-preview--fit-scale))
   (setq compose-preview--fit-images nil
         compose-preview--image-zoom
         (min 4.0 (max 0.1 (* compose-preview--image-zoom factor))))
@@ -1626,13 +1726,13 @@ An empty QUERY clears the current text filter."
   (compose-preview--zoom 0.8))
 
 (defun compose-preview--window-state-change (&optional _frame)
-  "Reflow Grid rows and refit images after the panel width changes."
+  "Reflow and refit the Preview layout after the panel size changes."
   (when (and compose-preview--items
              (get-buffer-window (current-buffer) t)
              (or compose-preview--fit-images
                  (eq compose-preview--view-mode 'grid)))
-    (let ((width (compose-preview--fit-width)))
-      (unless (equal width compose-preview--last-layout-width)
+    (let ((size (compose-preview--available-size)))
+      (unless (equal size compose-preview--last-layout-size)
         (compose-preview--redraw)))))
 
 (defun compose-preview-goto-source (&optional preview)

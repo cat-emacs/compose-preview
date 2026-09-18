@@ -48,7 +48,7 @@ a panel on the right and returns immediately. Inside the panel:
 - `n` / `p` move like Magit: in Grid they visit section headings then visible
   cards, and `TAB` folds the section at point; in Focus they cycle items;
 - `/` filters by Preview name, function, or group, and `G` selects one group;
-- `f` fits oversized images to the panel without enlarging smaller previews,
+- `f` applies Android Studio-style Zoom to Fit to the complete visible layout,
   `1` restores Android Studio-style Actual Size, and `+` / `-` zoom;
 - click a Preview title, or press `o` on its card, to visit the exact source
   declaration;
@@ -63,8 +63,9 @@ one collapsible section named after the composable. `G` still filters by
 zoom are preserved across automatic and manual refreshes; a refresh itself
 returns to the top of the panel. Actual Size maps the rendered PNG back through
 the Preview device density and the host display scale, matching Android
-Studio's design-surface coordinates. Fit mode responds to side-window width
-changes and only shrinks previews that exceed the available width.
+Studio's design-surface coordinates. Fit mode applies one shared scale to the
+visible layout, accounts for both panel width and height, and recomputes after
+window resizing, filtering, view changes, or section folding.
 Renderer issues are isolated to their Preview cards: successful images remain
 visible, and a card can show both its image and a fidelity warning with a link
 to the render log. `@PreviewParameter` values appear as separate Grid items
