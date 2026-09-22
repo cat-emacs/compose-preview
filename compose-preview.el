@@ -31,8 +31,10 @@
 (declare-function android-current-target "android-mode"
                   (&optional prompt file project-root))
 (declare-function android-project-target "android-mode"
-                  (module variant &optional project-root refresh))
+                  (module &optional variant project-root refresh))
 (declare-function android-project-targets "android-mode"
+                  (&optional project-root refresh))
+(declare-function android-project-variants "android-mode"
                   (&optional project-root refresh))
 (declare-function android-target-for-source-file "android-mode"
                   (file &optional project-root refresh))
@@ -784,7 +786,7 @@ With REFRESH non-nil, refresh Android project metadata first."
 (defun compose-preview--android-flavors-available-p ()
   "Return non-nil when public android-mode target APIs are available."
   (and compose-preview-use-android-mode-flavors
-       (fboundp 'android-project-targets)
+       (fboundp 'android-project-variants)
        (fboundp 'android-project-target)
        (fboundp 'android-current-target)))
 
@@ -798,7 +800,7 @@ With REFRESH non-nil, refresh Android project metadata first."
         (seq-filter
          (lambda (entry)
            (string= (plist-get entry :module-name) module))
-         (android-project-targets project-root)))))))
+         (android-project-variants project-root)))))))
 
 (defun compose-preview--android-target-for-module (project-root module variant)
   "Return android-mode target metadata for PROJECT-ROOT, MODULE and VARIANT."
