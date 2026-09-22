@@ -30,6 +30,10 @@
 
 (declare-function android-current-target "android-mode"
                   (&optional prompt file project-root))
+(declare-function android-project-model-status "android-mode"
+                  (&optional project-root))
+(declare-function android-refresh-project-model "android-mode"
+                  (&optional project-root callback))
 (declare-function android-project-target "android-mode"
                   (module &optional variant project-root refresh))
 (declare-function android-project-targets "android-mode"
@@ -37,6 +41,7 @@
 (declare-function android-project-variants "android-mode"
                   (&optional project-root refresh))
 (defvar android-project-model-updated-hook)
+(defvar android-project-model-state-changed-hook)
 (declare-function android-target-for-source-file "android-mode"
                   (file &optional project-root refresh))
 
@@ -169,6 +174,9 @@ Each entry is (PROJECT-ROOT . TARGET), where TARGET is a plist containing
 
 (defvar compose-preview--metadata-refresh-roots nil
   "Project roots whose stale Android preview metadata was refreshed.")
+
+(defvar compose-preview--model-refresh-timers nil
+  "Alist of pending Preview refresh timers keyed by project root.")
 
 (defun compose-preview--log (format-string &rest args)
   "Log compose-preview message FORMAT-STRING with ARGS."
@@ -438,6 +446,9 @@ Preserve the selected window because this can run from `post-command-hook'."
   (compose-preview--cancel-follow-timer)
   (compose-preview--cancel-process)
   (remove-hook 'post-command-hook #'compose-preview--follow-selected-buffer)
+  (when-let* ((root (compose-preview--source-project-root
+                     compose-preview--source-buffer)))
+    (compose-preview--cancel-model-refresh-timer root))
   (quit-window))
 
 (defun compose-preview-open-log ()
@@ -578,6 +589,83 @@ With REFRESH non-nil, refresh Android project metadata first."
   "Return normalized cache key for PROJECT-ROOT."
   (directory-file-name (expand-file-name project-root)))
 
+(defun compose-preview--source-project-root (source-buffer)
+  "Return normalized project root for SOURCE-BUFFER."
+  (when (buffer-live-p source-buffer)
+    (with-current-buffer source-buffer
+      (compose-preview--find-project-root))))
+
+(defun compose-preview--panel-for-project-p (root)
+  "Return non-nil when the open Preview panel belongs to ROOT."
+  (when-let* ((buffer (get-buffer compose-preview-results-buffer-name)))
+    (with-current-buffer buffer
+      (equal (compose-preview--cache-key root)
+             (and compose-preview--source-buffer
+                  (when-let* ((source-root
+                               (compose-preview--source-project-root
+                                compose-preview--source-buffer)))
+                    (compose-preview--cache-key source-root)))))))
+
+(defun compose-preview--cancel-model-refresh-timer (root)
+  "Cancel a pending model-triggered Preview refresh for ROOT."
+  (let* ((key (compose-preview--cache-key root))
+         (timer (cdr (assoc key compose-preview--model-refresh-timers))))
+    (when (timerp timer) (cancel-timer timer))
+    (setq compose-preview--model-refresh-timers
+          (assoc-delete-all key compose-preview--model-refresh-timers))))
+
+(defun compose-preview--panel-visible-for-project-p (root)
+  "Return non-nil when the visible Preview panel belongs to ROOT."
+  (and (compose-preview--panel-for-project-p root)
+       (get-buffer-window compose-preview-results-buffer-name t)))
+
+(defun compose-preview--android-project-model-state-changed (root status)
+  "Reflect Android model STATUS for ROOT without discarding preview images."
+  (when (compose-preview--panel-visible-for-project-p root)
+    (with-current-buffer compose-preview-results-buffer-name
+      (pcase (plist-get status :state)
+        ('syncing
+         (compose-preview--panel-status
+          compose-preview--source-buffer default-directory
+          "syncing Android project model…" 'warning))
+        ('needs-sync
+         (compose-preview--panel-status
+          compose-preview--source-buffer default-directory
+          "Android project model out of date…" 'warning))
+        ('failed
+         (compose-preview--panel-status
+          compose-preview--source-buffer default-directory
+          (format "Android project sync failed: %s"
+                  (or (plist-get status :diagnostic) "unknown error"))
+          'error))))))
+
+(defun compose-preview--refresh-after-model-update (root source-buffer)
+  "Refresh SOURCE-BUFFER after the Android model for ROOT updates."
+  (setq compose-preview--model-refresh-timers
+        (assoc-delete-all (compose-preview--cache-key root)
+                          compose-preview--model-refresh-timers))
+  (when (and (buffer-live-p source-buffer)
+             (compose-preview--panel-visible-for-project-p root))
+    (with-current-buffer source-buffer
+      (let ((compose-preview--refresh-all-in-file t))
+        (compose-preview-refresh)))))
+
+(defun compose-preview--schedule-model-update-refresh (root)
+  "Schedule one Preview refresh after an Android model update for ROOT."
+  (when (compose-preview--panel-visible-for-project-p root)
+    (let* ((key (compose-preview--cache-key root))
+           (buffer (get-buffer compose-preview-results-buffer-name))
+           (source (and buffer
+                        (buffer-local-value 'compose-preview--source-buffer
+                                            buffer)))
+           (old (cdr (assoc key compose-preview--model-refresh-timers))))
+      (when (timerp old) (cancel-timer old))
+      (setf (alist-get key compose-preview--model-refresh-timers
+                       nil nil #'equal)
+            (run-with-timer compose-preview-auto-refresh-delay nil
+                            #'compose-preview--refresh-after-model-update
+                            root source)))))
+
 (defun compose-preview--android-project-model-updated (root _data)
   "Invalidate preview target state after Android model ROOT is updated."
   (let ((key (compose-preview--cache-key root)))
@@ -585,7 +673,8 @@ With REFRESH non-nil, refresh Android project metadata first."
           (assoc-delete-all key compose-preview--target-cache)
           compose-preview--metadata-refresh-roots
           (delete (file-name-as-directory (expand-file-name root))
-                  compose-preview--metadata-refresh-roots))))
+                  compose-preview--metadata-refresh-roots))
+    (compose-preview--schedule-model-update-refresh root)))
 
 (defun compose-preview--cached-target (project-root)
   "Return cached preview target for PROJECT-ROOT."
@@ -841,6 +930,18 @@ When FORCE-PROMPT is non-nil, prompt with android-mode when possible."
           (compose-preview-read-variant))))
       (compose-preview-read-variant))))
 
+(defun compose-preview--android-project-status (project-root)
+  "Return Android project model status for PROJECT-ROOT, when available."
+  (when (and compose-preview-use-android-mode-flavors
+             (fboundp 'android-project-model-status))
+    (ignore-errors (android-project-model-status project-root))))
+
+(defun compose-preview--android-project-model-pending-p (project-root)
+  "Return non-nil when PROJECT-ROOT has no usable Android model yet."
+  (let ((status (compose-preview--android-project-status project-root)))
+    (and (memq (plist-get status :state) '(not-loaded needs-sync syncing))
+         (not (plist-get status :last-model-available-p)))))
+
 (defun compose-preview--target (&optional force-prompt)
   "Return plist describing the preview target.
 When FORCE-PROMPT is non-nil, prompt for module and variant via android-mode."
@@ -852,7 +953,12 @@ When FORCE-PROMPT is non-nil, prompt for module and variant via android-mode."
                 project-root
                 (compose-preview--target-from-android-mode project-root))))
          (cached (compose-preview--cached-target project-root)))
-    (if metadata-target
+    (if (and (not force-prompt)
+             (not metadata-target)
+             (not cached)
+             (compose-preview--android-project-model-pending-p project-root))
+        (user-error "Android project model is loading; retry shortly")
+      (if metadata-target
         (progn
           (compose-preview--log
            "selected target from android-mode module=%s variant=%s module-root=%s project-root=%s"
@@ -919,7 +1025,7 @@ When FORCE-PROMPT is non-nil, prompt for module and variant via android-mode."
                      (list :project-root project-root
                            :module-root module-root
                            :module-path module-path
-                           :variant variant))))))))))
+                           :variant variant)))))))))))
 
 (defun compose-preview--json-get (object key)
   "Return KEY from JSON alist OBJECT."
@@ -2420,6 +2526,16 @@ VARIANT defaults to the selected android-mode variant.  With a prefix argument,
 prompt for the module and full variant name."
   (interactive)
   (let* ((source-buffer (current-buffer))
+         (project-root (compose-preview--find-project-root)))
+    (when (and project-root
+               (not (compose-preview--cached-target project-root))
+               (compose-preview--android-project-model-pending-p project-root))
+      (when (fboundp 'android-refresh-project-model)
+        (android-refresh-project-model project-root))
+      (compose-preview--panel-status
+       source-buffer project-root "syncing Android project model…" 'warning)
+      (user-error "Android project model is loading; preview will refresh when ready")))
+  (let* ((source-buffer (current-buffer))
          (target (compose-preview--target current-prefix-arg))
          (variant (or variant (plist-get target :variant)))
          (source-file buffer-file-name)
@@ -2501,6 +2617,8 @@ prompt for the module and full variant name."
 
 (add-hook 'android-project-model-updated-hook
           #'compose-preview--android-project-model-updated)
+(add-hook 'android-project-model-state-changed-hook
+          #'compose-preview--android-project-model-state-changed)
 
 (provide 'compose-preview)
 ;;; compose-preview.el ends here

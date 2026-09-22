@@ -177,6 +177,74 @@
               :variant "androidMain"
               :preview-task "assembleAndroidMain"))))))
 
+(ert-deftest compose-preview-refresh-starts-missing-project-model ()
+  "A first Preview request actively starts Android project-model sync."
+  (let (refreshed status)
+    (cl-letf (((symbol-function 'compose-preview--find-project-root)
+               (lambda () "/tmp/project/"))
+              ((symbol-function 'compose-preview--cached-target) #'ignore)
+              ((symbol-function 'compose-preview--android-project-model-pending-p)
+               (lambda (_root) t))
+              ((symbol-function 'android-refresh-project-model)
+               (lambda (root &optional _callback) (setq refreshed root)))
+              ((symbol-function 'compose-preview--panel-status)
+               (lambda (_source _root message &optional _face)
+                 (setq status message))))
+      (should-error (compose-preview-refresh) :type 'user-error))
+    (should (equal refreshed "/tmp/project/"))
+    (should (string-match-p "syncing" status))))
+
+(ert-deftest compose-preview-project-model-pending-requires-no-last-known-model ()
+  "Preview waits only when Android sync has no usable model."
+  (cl-letf (((symbol-function 'android-project-model-status)
+             (lambda (_root)
+               '(:state syncing :last-model-available-p nil))))
+    (should (compose-preview--android-project-model-pending-p "/tmp/project/")))
+  (cl-letf (((symbol-function 'android-project-model-status)
+             (lambda (_root)
+               '(:state syncing :last-model-available-p t))))
+    (should-not
+     (compose-preview--android-project-model-pending-p "/tmp/project/"))))
+
+(ert-deftest compose-preview-project-model-failure-preserves-results ()
+  "A failed Android sync updates status without clearing Preview results."
+  (let ((compose-preview-results-buffer-name
+         (generate-new-buffer-name " *compose-preview-status-test*"))
+        (source (generate-new-buffer " *compose-preview-source-test*")))
+    (unwind-protect
+        (progn
+          (with-current-buffer source
+            (setq default-directory "/tmp/project/"))
+          (with-current-buffer (get-buffer-create
+                                compose-preview-results-buffer-name)
+            (compose-preview-results-mode)
+            (setq-local compose-preview--source-buffer source)
+            (let ((inhibit-read-only t)) (insert "old preview image")))
+          (cl-letf (((symbol-function 'compose-preview--panel-visible-for-project-p)
+                     (lambda (_root) t))
+                    ((symbol-function 'compose-preview--display-panel)
+                     #'ignore))
+            (compose-preview--android-project-model-state-changed
+             "/tmp/project/" '(:state failed :diagnostic "Gradle failed")))
+          (with-current-buffer compose-preview-results-buffer-name
+            (should (equal (buffer-string) "old preview image"))
+            (should (string-match-p "Gradle failed" compose-preview--status))
+            (should (eq compose-preview--status-face 'error))))
+      (when (buffer-live-p source) (kill-buffer source))
+      (when-let* ((buffer (get-buffer compose-preview-results-buffer-name)))
+        (kill-buffer buffer)))))
+
+(ert-deftest compose-preview-model-update-schedules-open-project-refresh ()
+  "A model update invalidates metadata and schedules the open Preview project."
+  (let ((compose-preview--target-cache
+         '(("/tmp/project" . (:variant "debug"))))
+        scheduled)
+    (cl-letf (((symbol-function 'compose-preview--schedule-model-update-refresh)
+               (lambda (root) (setq scheduled root))))
+      (compose-preview--android-project-model-updated "/tmp/project/" nil))
+    (should-not compose-preview--target-cache)
+    (should (equal scheduled "/tmp/project/"))))
+
 (ert-deftest compose-preview-android-model-update-invalidates-target-state ()
   "A refreshed Android model invalidates project target metadata caches."
   (let ((compose-preview--target-cache
@@ -962,16 +1030,22 @@
   "Manually closing Preview stops automatic file following."
   (let ((compose-preview--follow-active t)
         (compose-preview--follow-buffer 'source)
-        cancelled quit)
+        cancelled timer-cancelled removed quit)
     (cl-letf (((symbol-function 'compose-preview--cancel-follow-timer) #'ignore)
               ((symbol-function 'compose-preview--cancel-process)
                (lambda () (setq cancelled t)))
-              ((symbol-function 'remove-hook) #'ignore)
+              ((symbol-function 'compose-preview--source-project-root)
+               (lambda (_source) "/tmp/project/"))
+              ((symbol-function 'compose-preview--cancel-model-refresh-timer)
+               (lambda (root) (setq timer-cancelled root)))
+              ((symbol-function 'remove-hook) (lambda (&rest _) (setq removed t)))
               ((symbol-function 'quit-window) (lambda (&rest _) (setq quit t))))
       (compose-preview-panel-quit)
       (should-not compose-preview--follow-active)
       (should-not compose-preview--follow-buffer)
       (should cancelled)
+      (should removed)
+      (should (equal timer-cancelled "/tmp/project/"))
       (should quit))))
 
 (ert-deftest compose-preview-failure-normalizes-package-prefix ()

@@ -16,7 +16,11 @@ work is in progress. The panel shows build, render, ready, and failure status.
 It groups results by Android Studio's `@Preview(group = "...")` setting and
 renders each group as a collapsible section; ungrouped previews appear under
 `Default`. Saving can also trigger a debounced refresh when
-`compose-preview-auto-refresh-mode` is enabled in the source buffer.
+`compose-preview-auto-refresh-mode` is enabled in the source buffer. When
+`android-mode` is available, the panel also reflects project-model syncing,
+staleness, and failure. A last-known target and rendered images remain usable
+while Gradle refreshes; a successful model update invalidates target metadata
+and schedules one debounced Preview refresh.
 
 ## How It Works
 
