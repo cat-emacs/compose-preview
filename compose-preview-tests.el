@@ -156,8 +156,8 @@
   "Target lookup follows Android Studio-style module metadata for KMP files."
   (cl-letf (((symbol-function 'compose-preview--find-project-root)
              (lambda () "/tmp/project/"))
-            ((symbol-function 'android--target-for-source-file)
-             (lambda (_file _project-root)
+            ((symbol-function 'android-target-for-source-file)
+             (lambda (_file _project-root &optional _refresh)
                (list :module-path ":composeApp"
                      :module-name "composeApp"
                      :module-root "/tmp/project/composeApp"
@@ -182,11 +182,9 @@
   (let ((refreshed nil))
     (cl-letf (((symbol-function 'compose-preview--find-project-root)
                (lambda () "/tmp/project/"))
-              ((symbol-function 'android--get-flavors)
-               (lambda (&optional refresh)
-                 (setq refreshed refresh)))
-              ((symbol-function 'android--target-for-source-file)
-               (lambda (_file _project-root)
+              ((symbol-function 'android-target-for-source-file)
+               (lambda (_file _project-root &optional refresh)
+                 (setq refreshed (or refreshed refresh))
                  (list :module-path ":composeApp"
                        :module-name "composeApp"
                        :module-root "/tmp/project/composeApp"
@@ -208,8 +206,8 @@
   "Android-mode source metadata should replace stale in-memory targets."
   (cl-letf (((symbol-function 'compose-preview--find-project-root)
              (lambda () "/tmp/project/"))
-            ((symbol-function 'android--target-for-source-file)
-             (lambda (_file _project-root)
+            ((symbol-function 'android-target-for-source-file)
+             (lambda (_file _project-root &optional _refresh)
                (list :module-path ":composeApp"
                      :module-name "composeApp"
                      :module-root "/tmp/project/composeApp"
@@ -240,16 +238,15 @@
              (lambda () "/tmp/project/"))
             ((symbol-function 'compose-preview--android-flavors-available-p)
              (lambda () t))
-            ((symbol-function 'android--get-flavors)
-             (lambda (&optional _refresh)
-               (list
-                (list :module-path ":composeApp"
-                      :module-name "composeApp"
-                      :module-root "/tmp/project/composeApp"
-                      :variant "androidMain"
-                      :application-id "com.example"
-                      :source-roots '("src/commonMain/kotlin")
-                      :preview-task "assembleAndroidMain")))))
+            ((symbol-function 'android-project-target)
+             (lambda (_module _variant &optional _project-root _refresh)
+               (list :module-path ":composeApp"
+                     :module-name "composeApp"
+                     :module-root "/tmp/project/composeApp"
+                     :variant "androidMain"
+                     :application-id "com.example"
+                     :source-roots '("src/commonMain/kotlin")
+                     :preview-task "assembleAndroidMain"))))
     (let ((compose-preview--target-cache
            (list (cons "/tmp/project"
                        (list :project-root "/tmp/project/"
@@ -274,20 +271,15 @@
              (lambda () "/tmp/project/current/file/module/"))
             ((symbol-function 'compose-preview--android-flavors-available-p)
              (lambda () t))
-            ((symbol-function 'android--select-module)
-             (lambda () "demo-android"))
-            ((symbol-function 'compose-preview--read-variant-for-module)
-             (lambda (_module _force-prompt) "debug"))
-            ((symbol-function 'android--get-flavors)
-             (lambda (&optional _refresh)
-               (list
-                (list :module-path ":demo-android"
-                      :module-name "demo-android"
-                      :module-root "/tmp/project/app/demo-android"
-                      :variant "debug"
-                      :application-id "com.example.demo"
-                      :source-roots '("src/main/java")
-                      :preview-task "testDebugUnitTest")))))
+            ((symbol-function 'android-current-target)
+             (lambda (&optional _prompt _file _project-root)
+               (list :module-path ":demo-android"
+                     :module-name "demo-android"
+                     :module-root "/tmp/project/app/demo-android"
+                     :variant "debug"
+                     :application-id "com.example.demo"
+                     :source-roots '("src/main/java")
+                     :preview-task "testDebugUnitTest"))))
     (let ((compose-preview--target-cache nil)
           (buffer-file-name "/tmp/project/composeApp/src/commonMain/kotlin/Foo.kt"))
       (should

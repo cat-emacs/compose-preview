@@ -28,9 +28,14 @@
        default-directory))
   "Directory containing compose-preview package files.")
 
-(declare-function android--flavor-variants "android-mode" (module))
-(declare-function android--select-module "android-mode" ())
-(declare-function android--target-for-source-file "android-mode" (file project-root))
+(declare-function android-current-target "android-mode"
+                  (&optional prompt file project-root))
+(declare-function android-project-target "android-mode"
+                  (module variant &optional project-root refresh))
+(declare-function android-project-targets "android-mode"
+                  (&optional project-root refresh))
+(declare-function android-target-for-source-file "android-mode"
+                  (file &optional project-root refresh))
 
 (defgroup compose-preview nil
   "Preview Jetpack Compose @Preview functions with layoutlib."
@@ -519,36 +524,47 @@ Preserve the selected window because this can run from `post-command-hook'."
     (replace-regexp-in-string ":" "/" module-name)
     project-root)))
 
-(defun compose-preview--target-from-android-mode (project-root)
-  "Return current source target from android-mode metadata under PROJECT-ROOT."
+(defun compose-preview--target-from-android-entry (project-root entry)
+  "Return a preview target under PROJECT-ROOT from Android target ENTRY."
+  (when entry
+    (list :project-root project-root
+          :module-root (file-name-as-directory (plist-get entry :module-root))
+          :module-path (plist-get entry :module-path)
+          :variant (plist-get entry :variant)
+          :preview-task (plist-get entry :preview-task))))
+
+(defun compose-preview--target-from-android-mode (project-root &optional refresh)
+  "Return current source target from android-mode under PROJECT-ROOT.
+With REFRESH non-nil, refresh Android project metadata first."
   (when (and compose-preview-use-android-mode-flavors
              buffer-file-name
-             (fboundp 'android--target-for-source-file))
-    (when-let* ((target (ignore-errors
-                         (android--target-for-source-file
-                          buffer-file-name project-root))))
-      (list :project-root project-root
-            :module-root (file-name-as-directory
-                          (plist-get target :module-root))
-            :module-path (plist-get target :module-path)
-            :variant (plist-get target :variant)
-            :preview-task (plist-get target :preview-task)))))
+             (fboundp 'android-target-for-source-file))
+    (compose-preview--target-from-android-entry
+     project-root
+     (ignore-errors
+       (android-target-for-source-file
+        buffer-file-name project-root refresh)))))
+
+(defun compose-preview--prompt-android-target (project-root)
+  "Prompt for an Android target under PROJECT-ROOT through android-mode."
+  (when (compose-preview--android-flavors-available-p)
+    (compose-preview--target-from-android-entry
+     project-root
+     (ignore-errors
+       (android-current-target t buffer-file-name project-root)))))
 
 (defun compose-preview--refresh-stale-kmp-target (project-root target)
   "Refresh stale Android KMP TARGET metadata under PROJECT-ROOT once."
   (if (and target
            (string= (plist-get target :variant) "androidMain")
            (not (string= (plist-get target :preview-task) "desktopTest"))
-           (fboundp 'android--get-flavors)
+           (fboundp 'android-target-for-source-file)
            (not (member project-root compose-preview--metadata-refresh-roots)))
       (progn
         (push project-root compose-preview--metadata-refresh-roots)
         (compose-preview--log
          "refreshing stale Android KMP preview metadata for %s" project-root)
-        (ignore-errors
-          (let ((default-directory project-root))
-            (android--get-flavors t)))
-        (or (compose-preview--target-from-android-mode project-root) target))
+        (or (compose-preview--target-from-android-mode project-root t) target))
     target))
 
 (defun compose-preview--sanitize (value)
@@ -766,51 +782,39 @@ Preserve the selected window because this can run from `post-command-hook'."
     found))
 
 (defun compose-preview--android-flavors-available-p ()
-  "Return non-nil when android-mode flavor helpers are available."
+  "Return non-nil when public android-mode target APIs are available."
   (and compose-preview-use-android-mode-flavors
-       (fboundp 'android--get-flavors)
-       (fboundp 'android--select-module)
-       (fboundp 'android--select-variant)))
+       (fboundp 'android-project-targets)
+       (fboundp 'android-project-target)
+       (fboundp 'android-current-target)))
 
-(defun compose-preview--android-variants (module)
-  "Return android-mode variants for MODULE, or nil."
-  (when (and (compose-preview--android-flavors-available-p)
-             (fboundp 'android--flavor-variants))
+(defun compose-preview--android-variants (project-root module)
+  "Return android-mode variants under PROJECT-ROOT for MODULE, or nil."
+  (when (compose-preview--android-flavors-available-p)
     (ignore-errors
-      (android--flavor-variants module))))
+      (delete-dups
+       (mapcar
+        (lambda (entry) (plist-get entry :variant))
+        (seq-filter
+         (lambda (entry)
+           (string= (plist-get entry :module-name) module))
+         (android-project-targets project-root)))))))
 
 (defun compose-preview--android-target-for-module (project-root module variant)
   "Return android-mode target metadata for PROJECT-ROOT, MODULE and VARIANT."
-  (when (and (compose-preview--android-flavors-available-p)
-             (fboundp 'android--get-flavors))
-    (let* ((entries (ignore-errors
-                      (let ((default-directory project-root))
-                        (android--get-flavors))))
-           (module-entries
-            (seq-filter
-             (lambda (candidate)
-               (and (keywordp (car-safe candidate))
-                    (string= (plist-get candidate :module-name) module)))
-             entries)))
-      (when-let* ((entry (or (seq-find
-                             (lambda (candidate)
-                               (string= (plist-get candidate :variant) variant))
-                             module-entries)
-                            (car module-entries))))
-        (list :project-root project-root
-              :module-root (file-name-as-directory
-                            (plist-get entry :module-root))
-              :module-path (plist-get entry :module-path)
-              :variant (plist-get entry :variant)
-              :preview-task (plist-get entry :preview-task))))))
+  (when (compose-preview--android-flavors-available-p)
+    (compose-preview--target-from-android-entry
+     project-root
+     (ignore-errors
+       (android-project-target module variant project-root)))))
 
-(defun compose-preview--read-variant-for-module (module force-prompt)
-  "Return a variant for MODULE.
+(defun compose-preview--read-variant-for-module (project-root module force-prompt)
+  "Return a variant under PROJECT-ROOT for MODULE.
 When FORCE-PROMPT is non-nil, prompt with android-mode when possible."
   (if noninteractive
       compose-preview-default-variant
     (if (compose-preview--android-flavors-available-p)
-      (let ((variants (compose-preview--android-variants module)))
+      (let ((variants (compose-preview--android-variants project-root module)))
         (cond
          ((and (not force-prompt)
                (member compose-preview-default-variant variants))
@@ -865,37 +869,45 @@ When FORCE-PROMPT is non-nil, prompt for module and variant via android-mode."
                                     (plist-get cached :variant)
                                     project-root)
               cached))
-        (let* ((module-root (or (compose-preview--find-module-root)
-                                (user-error "Could not find module root: no build.gradle(.kts)")))
-               (module-path (compose-preview--module-path project-root module-root))
-               (module-name (compose-preview--module-name module-path))
-               variant)
-          (when (and force-prompt (compose-preview--android-flavors-available-p))
-            (setq module-name (android--select-module)
-                  module-path (concat ":" module-name)))
-          (setq variant (compose-preview--read-variant-for-module
-                         module-name force-prompt))
-          (or (when-let* ((android-target
-                          (compose-preview--android-target-for-module
-                           project-root module-name variant)))
-                (compose-preview--log
-                 "selected target from android-mode module=%s variant=%s module-root=%s project-root=%s"
-                 (plist-get android-target :module-path)
-                 (plist-get android-target :variant)
-                 (plist-get android-target :module-root)
-                 project-root)
-                (compose-preview--cache-target android-target))
-              (progn
-                (when force-prompt
-                  (setq module-root (compose-preview--module-root-from-name
-                                     project-root module-name)))
-                (compose-preview--log "selected target module=%s module-root=%s project-root=%s"
-                                      module-path module-root project-root)
-                (compose-preview--cache-target
-                 (list :project-root project-root
-                       :module-root module-root
-                       :module-path module-path
-                       :variant variant)))))))))
+        (or (and force-prompt
+                 (when-let* ((android-target
+                              (compose-preview--prompt-android-target
+                               project-root)))
+                   (compose-preview--log
+                    "selected prompted Android target module=%s variant=%s module-root=%s project-root=%s"
+                    (plist-get android-target :module-path)
+                    (plist-get android-target :variant)
+                    (plist-get android-target :module-root)
+                    project-root)
+                   (compose-preview--cache-target android-target)))
+            (let* ((module-root
+                    (or (compose-preview--find-module-root)
+                        (user-error
+                         "Could not find module root: no build.gradle(.kts)")))
+                   (module-path
+                    (compose-preview--module-path project-root module-root))
+                   (module-name (compose-preview--module-name module-path))
+                   (variant (compose-preview--read-variant-for-module
+                             project-root module-name force-prompt)))
+              (or (when-let* ((android-target
+                               (compose-preview--android-target-for-module
+                                project-root module-name variant)))
+                    (compose-preview--log
+                     "selected target from android-mode module=%s variant=%s module-root=%s project-root=%s"
+                     (plist-get android-target :module-path)
+                     (plist-get android-target :variant)
+                     (plist-get android-target :module-root)
+                     project-root)
+                    (compose-preview--cache-target android-target))
+                  (progn
+                    (compose-preview--log
+                     "selected target module=%s module-root=%s project-root=%s"
+                     module-path module-root project-root)
+                    (compose-preview--cache-target
+                     (list :project-root project-root
+                           :module-root module-root
+                           :module-path module-path
+                           :variant variant))))))))))
 
 (defun compose-preview--json-get (object key)
   "Return KEY from JSON alist OBJECT."
