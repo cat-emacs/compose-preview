@@ -177,6 +177,21 @@
               :variant "androidMain"
               :preview-task "assembleAndroidMain"))))))
 
+(ert-deftest compose-preview-android-model-update-invalidates-target-state ()
+  "A refreshed Android model invalidates project target metadata caches."
+  (let ((compose-preview--target-cache
+         '(("/tmp/project" . (:variant "androidMain"))
+           ("/tmp/other" . (:variant "debug"))))
+        (compose-preview--metadata-refresh-roots
+         '("/tmp/project/" "/tmp/other/")))
+    (compose-preview--android-project-model-updated "/tmp/project/" nil)
+    (should-not (assoc "/tmp/project" compose-preview--target-cache))
+    (should (assoc "/tmp/other" compose-preview--target-cache))
+    (should-not (member "/tmp/project/"
+                        compose-preview--metadata-refresh-roots))
+    (should (member "/tmp/other/"
+                    compose-preview--metadata-refresh-roots))))
+
 (ert-deftest compose-preview-target-refreshes-non-rendering-kmp-metadata ()
   "Stale Android KMP metadata is refreshed before selecting a preview task."
   (let ((refreshed nil))

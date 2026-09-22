@@ -36,6 +36,7 @@
                   (&optional project-root refresh))
 (declare-function android-project-variants "android-mode"
                   (&optional project-root refresh))
+(defvar android-project-model-updated-hook)
 (declare-function android-target-for-source-file "android-mode"
                   (file &optional project-root refresh))
 
@@ -576,6 +577,15 @@ With REFRESH non-nil, refresh Android project metadata first."
 (defun compose-preview--cache-key (project-root)
   "Return normalized cache key for PROJECT-ROOT."
   (directory-file-name (expand-file-name project-root)))
+
+(defun compose-preview--android-project-model-updated (root _data)
+  "Invalidate preview target state after Android model ROOT is updated."
+  (let ((key (compose-preview--cache-key root)))
+    (setq compose-preview--target-cache
+          (assoc-delete-all key compose-preview--target-cache)
+          compose-preview--metadata-refresh-roots
+          (delete (file-name-as-directory (expand-file-name root))
+                  compose-preview--metadata-refresh-roots))))
 
 (defun compose-preview--cached-target (project-root)
   "Return cached preview target for PROJECT-ROOT."
@@ -2488,6 +2498,9 @@ prompt for the module and full variant name."
    ("a" "Auto refresh" compose-preview-auto-refresh-mode)
    ("l" "Open log" compose-preview-open-log)
    ("v" "Set variant" compose-preview-set-variant)])
+
+(add-hook 'android-project-model-updated-hook
+          #'compose-preview--android-project-model-updated)
 
 (provide 'compose-preview)
 ;;; compose-preview.el ends here
