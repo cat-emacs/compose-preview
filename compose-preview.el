@@ -146,6 +146,21 @@ Eviction releases image and view metadata, not generated files on disk."
 (defvar compose-preview--process nil
   "Current asynchronous Compose preview process.")
 
+(defvar compose-preview--module-models (make-hash-table :test #'equal)
+  "Target identity to validated module model snapshots.")
+
+(defvar compose-preview--project-input-signatures (make-hash-table :test #'equal)
+  "Last observed source/resource/build-input signatures by project root.")
+
+(defvar compose-preview--input-watch-timer nil
+  "Idle timer monitoring Preview project inputs.")
+
+(defvar compose-preview--artifact-roots nil
+  "Package-owned work directories eligible for generation cleanup.")
+
+(defvar compose-preview--owned-artifacts nil
+  "Exact generation paths created by this Emacs session, eligible for cleanup.")
+
 (defvar compose-preview--sessions (make-hash-table :test #'equal)
   "Source-file keys to cached Preview sessions.")
 
@@ -210,7 +225,9 @@ Each entry is (PROJECT-ROOT . TARGET), where TARGET is a plist containing
   "Log compose-preview message FORMAT-STRING with ARGS."
   (let ((line (apply #'format (concat "compose-preview: " format-string) args)))
     (message "%s" line)
-    (when-let* ((buffer (get-buffer compose-preview-log-buffer-name)))
+    (when-let* ((buffer (or (plist-get compose-preview--work-context :log-buffer)
+                            (get-buffer compose-preview-log-buffer-name)))
+                ((buffer-live-p buffer)))
       (with-current-buffer buffer
         (let ((inhibit-read-only t))
           (goto-char (point-max))
@@ -414,10 +431,95 @@ Each entry is (PROJECT-ROOT . TARGET), where TARGET is a plist containing
   (or (gethash key compose-preview--sessions)
       (puthash key
                (list :key key :stale t :target nil :stamp nil :method nil
-                     :revision nil :items nil :images nil :empty nil
+                     :revision nil :artifacts nil :items nil :images nil :empty nil
                      :module-root nil :status nil :face nil :view nil
-                     :point nil :used 0)
+                     :point nil :anchor nil :log nil :used 0)
                compose-preview--sessions)))
+
+(defconst compose-preview--input-file-regexp
+  "\\.\\(?:kt\\|kts\\|java\\|groovy\\|xml\\|properties\\|toml\\|gradle\\|jar\\|aar\\|png\\|webp\\|jpg\\|jpeg\\|svg\\|ttf\\|otf\\|json\\)\\'"
+  "Relevant Preview source, resource, and build input suffixes.")
+
+(defun compose-preview--input-file-p (file root)
+  "Return non-nil when FILE under ROOT can affect compiled previews."
+  (let ((relative (file-relative-name file root)))
+    (and (or (string-match-p compose-preview--input-file-regexp file)
+             (string-match-p "/\\(?:res\\|assets\\|composeResources\\)/" relative))
+         (not (string-match-p
+               "\\(?:\\`\\|/\\)\\(?:build\\|\\.gradle\\|\\.git\\|node_modules\\)\\(?:/\\|\\'\\)"
+               relative)))))
+
+(defun compose-preview--file-metadata (file)
+  "Return FILE's size and change times, without reading its contents."
+  (when-let* ((attributes (file-attributes file)))
+    (list (file-attribute-size attributes)
+          (file-attribute-modification-time attributes)
+          (file-attribute-status-change-time attributes))))
+
+(defun compose-preview--input-signature (root)
+  "Return metadata for relevant inputs below ROOT.
+Do not follow symlink directories or traverse build/runtime output trees."
+  (let (files)
+    (cl-labels
+        ((visit (directory)
+           (dolist (file (directory-files directory t directory-files-no-dot-files-regexp))
+             (cond
+              ((file-symlink-p file)
+               (when (compose-preview--input-file-p file root)
+                 (push (cons file (list (file-symlink-p file)
+                                       (compose-preview--file-metadata file))) files)))
+              ((file-directory-p file)
+               (unless (member (file-name-nondirectory file)
+                               '("build" ".git" ".gradle" ".idea" "node_modules"))
+                 (visit file)))
+              ((compose-preview--input-file-p file root)
+               (push (cons file (compose-preview--file-metadata file)) files))))))
+      (when (file-directory-p root) (visit root)))
+    (sort files (lambda (a b) (string< (car a) (car b))))))
+
+(defun compose-preview--project-unsaved-p (root)
+  "Return non-nil if relevant open source/resource buffers under ROOT are dirty."
+  (and root
+       (seq-some
+   (lambda (buffer)
+     (with-current-buffer buffer
+       (and buffer-file-name (buffer-modified-p)
+            (file-in-directory-p buffer-file-name root)
+            (compose-preview--input-file-p buffer-file-name root))))
+   (buffer-list))))
+
+(defun compose-preview--watch-inputs ()
+  "Invalidate Preview sessions and models after external input changes."
+  (maphash
+   (lambda (root old)
+     (condition-case err
+         (let ((signature (compose-preview--input-signature root)))
+           (unless (equal signature old)
+             (puthash root signature compose-preview--project-input-signatures)
+             (compose-preview--invalidate-project-sessions root)))
+       (file-error (compose-preview--log "input monitoring: %s" (error-message-string err)))))
+   compose-preview--project-input-signatures)
+  (when-let* ((session (gethash compose-preview--active-file compose-preview--sessions))
+              (panel (get-buffer compose-preview-results-buffer-name))
+              ((get-buffer-window panel t)))
+    (with-current-buffer panel
+      (when (and compose-preview--items (null compose-preview--work-context))
+        (compose-preview--panel-status
+         compose-preview--source-buffer default-directory
+         (compose-preview--session-status session compose-preview--source-buffer)
+         (if (plist-get session :stale) 'warning (plist-get session :face)))))))
+
+(defun compose-preview--track-inputs (root)
+  "Track ROOT's external changes with a shared idle metadata monitor."
+  (let ((signature (compose-preview--input-signature root))
+        (old (gethash root compose-preview--project-input-signatures)))
+    (when (and old (not (equal old signature)))
+      (compose-preview--invalidate-project-sessions root))
+    (puthash root signature compose-preview--project-input-signatures)
+    (unless (timerp compose-preview--input-watch-timer)
+      (setq compose-preview--input-watch-timer
+            (run-with-idle-timer 2 t #'compose-preview--watch-inputs)))
+    signature))
 
 (defun compose-preview--source-stamp (buffer)
   "Return BUFFER's modification tick and on-disk file metadata."
@@ -441,7 +543,10 @@ Each entry is (PROJECT-ROOT . TARGET), where TARGET is a plist containing
                 (mapcar (lambda (variable)
                           (cons variable (symbol-value variable)))
                         compose-preview--session-view-variables)
-                (plist-get session :point) (point)))))))
+                (plist-get session :point) (point)
+                (plist-get session :anchor)
+                (when-let* ((item (get-text-property (point) 'compose-preview-item)))
+                  (compose-preview-item-id item))))))))
 
 (defun compose-preview--evict-sessions ()
   "Release least recently used inactive sessions beyond the cache limit."
@@ -456,8 +561,26 @@ Each entry is (PROJECT-ROOT . TARGET), where TARGET is a plist containing
     (while (and candidates
                 (> (hash-table-count compose-preview--sessions)
                    (max 1 compose-preview-session-cache-size)))
-      (remhash (caar candidates) compose-preview--sessions)
-      (setq candidates (cdr candidates)))))
+      (let ((key (caar candidates)))
+        (when-let* ((log (plist-get (gethash key compose-preview--sessions) :log)))
+          (when (buffer-live-p log) (kill-buffer log)))
+        (remhash key compose-preview--sessions))
+      (setq candidates (cdr candidates)))
+    (let (keys)
+      (maphash (lambda (_key session)
+                 (when (plist-get session :target)
+                   (push (compose-preview--module-model-key (plist-get session :target)) keys)))
+               compose-preview--sessions)
+      (when compose-preview--work-context
+        (push (compose-preview--module-model-key
+               (plist-get compose-preview--work-context :target)) keys))
+      (maphash (lambda (key _model)
+                 (unless (member key keys) (remhash key compose-preview--module-models)))
+               compose-preview--module-models)
+      (maphash (lambda (root _signature)
+                 (unless (seq-some (lambda (key) (equal (car key) root)) keys)
+                   (remhash root compose-preview--project-input-signatures)))
+               compose-preview--project-input-signatures))))
 
 (defun compose-preview--show-session (session buffer)
   "Display SESSION's cached results and view for source BUFFER."
@@ -487,12 +610,43 @@ Each entry is (PROJECT-ROOT . TARGET), where TARGET is a plist containing
       (compose-preview--panel-status
        buffer (or (plist-get session :module-root)
                   (buffer-local-value 'default-directory buffer))
-       (or (plist-get session :status) "waiting for Preview…")
-       (plist-get session :face))
+       (compose-preview--session-status session buffer)
+       (if (plist-get session :stale) 'warning (plist-get session :face)))
       (with-current-buffer panel
-        (goto-char (min (or (plist-get session :point) (point-min)) (point-max)))
+        (goto-char
+         (or (compose-preview--anchor-position (plist-get session :anchor))
+             (min (or (plist-get session :point) (point-min)) (point-max))))
         (when-let* ((window (get-buffer-window panel t)))
           (set-window-point window (point)))))))
+
+(defun compose-preview--anchor-position (item)
+  "Find a stable Preview card position matching saved ITEM's identity.
+ITEM may be a Preview ID string or a legacy Preview item."
+  (when item
+    (let ((id (if (compose-preview-item-p item) (compose-preview-item-id item) item))
+          (position (point-min)) found)
+      (while (and (< position (point-max)) (not found))
+        (let ((candidate (get-text-property position 'compose-preview-item)))
+          (when (and (compose-preview-item-p candidate)
+                     (equal (compose-preview-item-id candidate)
+                            id))
+            (setq found position)))
+        (setq position (or (next-single-property-change
+                            position 'compose-preview-item nil (point-max))
+                           (point-max))))
+      found)))
+
+(defun compose-preview--session-status (session buffer)
+  "Return an honest cache/build status for SESSION and source BUFFER."
+  (let ((root (plist-get (plist-get session :target) :project-root)))
+    (cond
+     ((and root (compose-preview--project-unsaved-p root))
+      "unsaved changes — preview uses saved sources")
+     ((and (plist-get session :stale) (plist-get session :items))
+      "out of date — last rendered images")
+     ((and (buffer-live-p buffer) (buffer-modified-p buffer))
+      "unsaved changes — preview uses saved sources")
+     (t (or (plist-get session :status) "waiting for Preview…")))))
 
 (defun compose-preview--activate-file (buffer)
   "Activate BUFFER's Preview session, returning non-nil for valid cached data."
@@ -504,11 +658,24 @@ Each entry is (PROJECT-ROOT . TARGET), where TARGET is a plist containing
     (compose-preview--save-session-view)
     (setq compose-preview--active-file key)
     (setf (plist-get session :used) (cl-incf compose-preview--session-clock))
+    (when (or (not (equal target (plist-get session :target)))
+              (not (equal (compose-preview--source-stamp buffer)
+                          (plist-get session :stamp)))
+              (not (seq-every-p #'file-exists-p (plist-get session :images)))
+              (when-let* ((saved (plist-get session :artifacts)))
+                (not (equal (cdr saved)
+                            (compose-preview--model-artifact-signature (car saved)))))
+              (when-let* ((root (plist-get target :project-root)))
+                (let ((old (gethash root compose-preview--project-input-signatures))
+                      (signature (compose-preview--track-inputs root)))
+                  (and old (not (equal old signature))))))
+      (setf (plist-get session :stale) t))
     (compose-preview--show-session session buffer)
     (compose-preview--evict-sessions)
     (and target
          (not (buffer-modified-p buffer))
          (not (plist-get session :stale))
+         (not (compose-preview--project-unsaved-p (plist-get target :project-root)))
          (equal target (plist-get session :target))
          (equal (compose-preview--source-stamp buffer)
                 (plist-get session :stamp))
@@ -517,6 +684,10 @@ Each entry is (PROJECT-ROOT . TARGET), where TARGET is a plist containing
 
 (defun compose-preview--invalidate-project-sessions (root)
   "Invalidate cached and in-flight Preview sessions belonging to ROOT."
+  (maphash
+   (lambda (key _model)
+     (when (equal (car key) root) (remhash key compose-preview--module-models)))
+   compose-preview--module-models)
   (maphash
    (lambda (_key session)
      (when (equal (plist-get (plist-get session :target) :project-root) root)
@@ -527,7 +698,9 @@ Each entry is (PROJECT-ROOT . TARGET), where TARGET is a plist containing
 
 (defun compose-preview--source-saved ()
   "Invalidate file sessions after source or resource changes in their project."
-  (when-let* ((root (compose-preview--find-project-root)))
+  (when-let* ((root (compose-preview--find-project-root))
+              (file buffer-file-name)
+              ((compose-preview--input-file-p file root)))
     (compose-preview--invalidate-project-sessions root)))
 
 (defun compose-preview--drain-request ()
@@ -556,6 +729,7 @@ Each entry is (PROJECT-ROOT . TARGET), where TARGET is a plist containing
                (plist-get compose-preview--work-context :generation))
     (setq compose-preview--work-context nil)
     (compose-preview--evict-sessions)
+    (compose-preview--cleanup-artifacts)
     (compose-preview--drain-request)))
 
 (defun compose-preview--cancel-follow-timer ()
@@ -610,7 +784,13 @@ Preserve the selected window because this can run from `post-command-hook'."
     (let ((buffer (window-buffer (selected-window))))
       (unless (or (eq buffer compose-preview--follow-buffer)
                   (eq buffer (get-buffer compose-preview-results-buffer-name))
-                  (eq buffer (get-buffer compose-preview-log-buffer-name)))
+                  (eq buffer (get-buffer compose-preview-log-buffer-name))
+                  (let (log-p)
+                    (maphash (lambda (_key session)
+                               (when (eq buffer (plist-get session :log))
+                                 (setq log-p t)))
+                             compose-preview--sessions)
+                    log-p))
         (setq compose-preview--follow-buffer buffer)
         (compose-preview--cancel-follow-timer)
         (compose-preview--save-session-view)
@@ -647,7 +827,11 @@ Preserve the selected window because this can run from `post-command-hook'."
 (defun compose-preview-open-log ()
   "Show the Compose preview build and renderer log."
   (interactive)
-  (display-buffer (get-buffer-create compose-preview-log-buffer-name)))
+  (let* ((source (if (derived-mode-p 'compose-preview-results-mode)
+                     compose-preview--source-buffer (current-buffer)))
+         (session (gethash (compose-preview--file-key source) compose-preview--sessions)))
+    (display-buffer (or (and session (plist-get session :log))
+                        (get-buffer-create compose-preview-log-buffer-name)))))
 
 (defun compose-preview-panel-refresh ()
   "Refresh previews from the source buffer associated with this panel."
@@ -1267,10 +1451,113 @@ When FORCE-PROMPT is non-nil, prompt for module and variant via android-mode."
                         (format "model-%s.json" variant))
                       (compose-preview--work-directory target))))
 
+(defun compose-preview--module-model-key (target)
+  "Return build/module/variant/toolchain identity for TARGET."
+  (list (plist-get target :project-root) (plist-get target :module-root)
+        (plist-get target :module-path) (plist-get target :variant)
+        compose-preview-renderer-version compose-preview-layoutlib-version
+        compose-preview-detector-version
+        (compose-preview--file-metadata
+         (expand-file-name "preview.init.gradle" compose-preview--package-directory))
+        (compose-preview--file-metadata
+         (expand-file-name "adapters/agp-9.3-kmp.init.gradle"
+                           compose-preview--package-directory))))
+
+(defun compose-preview--model-artifact-signature (model)
+  "Return signatures of classpath/resource artifacts referenced by MODEL."
+  (let ((paths (delete-dups
+                (append (compose-preview--json-get model "classPath")
+                        (compose-preview--json-get model "rendererClassPath")
+                        (list (compose-preview--json-get model "resourceApkPath")))))
+        signatures)
+    (dolist (path (delq nil paths))
+      (push (cons path
+                  (if (file-directory-p path)
+                      (mapcar (lambda (file)
+                                (cons file (compose-preview--file-metadata file)))
+                              (sort (directory-files-recursively path ".") #'string<))
+                    (compose-preview--file-metadata path)))
+            signatures))
+    (nreverse signatures)))
+
+(defun compose-preview--remember-module-model (context)
+  "Cache CONTEXT's model only if its build-input snapshot is still valid."
+  (let* ((target (plist-get context :target))
+         (root (plist-get target :project-root))
+         (file (plist-get context :model-file))
+         (signature (compose-preview--input-signature root)))
+    (when (and (plist-member context :input-signature)
+               (equal signature (plist-get context :input-signature))
+               (not (compose-preview--project-unsaved-p root)))
+      (let ((model (compose-preview--read-json file)))
+        (puthash (compose-preview--module-model-key target)
+                 (list :file file :model model :inputs signature
+                       :artifacts (compose-preview--model-artifact-signature model))
+                 compose-preview--module-models)))))
+
+(defun compose-preview--reusable-module-model (target)
+  "Return a validated module model for TARGET, or nil."
+  (let* ((key (compose-preview--module-model-key target))
+         (cached (gethash key compose-preview--module-models))
+         (root (plist-get target :project-root)))
+    (when (and cached
+               (file-exists-p (plist-get cached :file))
+               (not (compose-preview--project-unsaved-p root))
+               (equal (plist-get cached :inputs) (compose-preview--input-signature root))
+               (seq-every-p (lambda (artifact) (file-exists-p (car artifact)))
+                            (plist-get cached :artifacts))
+               (equal (plist-get cached :artifacts)
+                      (compose-preview--model-artifact-signature (plist-get cached :model))))
+      cached)))
+
+(defun compose-preview--cleanup-artifacts ()
+  "Delete unreferenced package-owned generation artifacts.
+Never delete stable models, symlinks, layoutlib, launcher caches, or user files."
+  (let (protected retained)
+    (maphash (lambda (_key session)
+               (setq protected (append (plist-get session :images) protected)))
+             compose-preview--sessions)
+    (maphash (lambda (_key model) (push (plist-get model :file) protected))
+             compose-preview--module-models)
+    (when compose-preview--work-context
+      (push (plist-get compose-preview--work-context :model-file) protected)
+      (let ((render (plist-get compose-preview--work-context :render)))
+        (setq protected (append (list (plist-get render :output)
+                                      (plist-get render :settings)
+                                      (plist-get render :results)) protected))))
+    (when-let* ((panel (get-buffer compose-preview-results-buffer-name)))
+      (setq protected
+            (append (buffer-local-value 'compose-preview--legacy-images panel) protected)))
+    (setq protected (append (apply #'append
+                                   (mapcar #'compose-preview-item-files
+                                           compose-preview--last-result-items)) protected))
+    (dolist (file compose-preview--owned-artifacts)
+      (let ((root (file-name-directory (directory-file-name file))))
+        (if (and (member root compose-preview--artifact-roots)
+                 (file-directory-p root) (not (file-symlink-p root)))
+            (progn
+          (when (and (not (file-symlink-p file))
+                     (string-match-p
+                      "\\`\\(?:model-.+-[0-9]+\\.json\\|settings-[0-9]+\\.json\\|results-[0-9]+\\.json\\|rendered-[0-9]+\\)\\'"
+                      (file-name-nondirectory file))
+                     (not (seq-some
+                           (lambda (path)
+                             (and path
+                                  (or (equal (directory-file-name path) file)
+                                      (string-prefix-p (file-name-as-directory file) path))))
+                           protected)))
+            (condition-case err
+                (if (file-directory-p file) (delete-directory file t) (delete-file file))
+              (file-error (compose-preview--log "artifact cleanup: %s" (error-message-string err)))))
+              (when (file-exists-p file) (push file retained)))
+          (push file retained))))
+    (setq compose-preview--owned-artifacts (nreverse retained))))
+
 (defun compose-preview--snapshot-model (context)
   "Copy CONTEXT's stable Gradle model to its generation-specific file."
   (let ((source (plist-get context :gradle-model-file))
         (destination (plist-get context :model-file)))
+    (cl-pushnew destination compose-preview--owned-artifacts :test #'equal)
     (copy-file source destination t)))
 
 (defun compose-preview--source-file-package (file)
@@ -2567,6 +2854,11 @@ Use METADATA keyed by preview id to preserve annotation display settings."
      (t
       (let* ((target (plist-get context :target))
              (source (plist-get context :source-buffer))
+             (input-changed
+              (and (plist-member context :input-signature)
+                   (not (equal (plist-get context :input-signature)
+                               (compose-preview--input-signature
+                                (plist-get target :project-root))))))
              (items (compose-preview--result-items
                      result-list (plist-get render :output)
                      (plist-get render :metadata)))
@@ -2577,7 +2869,10 @@ Use METADATA keyed by preview id to preserve annotation display settings."
                          result-list)))
         (when-let* ((key (compose-preview--file-key source)))
           (let ((session (compose-preview--session key)))
-            (setf (plist-get session :items) items
+            (setf (plist-get session :artifacts)
+                  (when-let* ((model (plist-get context :model)))
+                    (cons model (compose-preview--model-artifact-signature model)))
+                  (plist-get session :items) items
                   (plist-get session :images)
                   (apply #'append (mapcar #'compose-preview-item-files items))
                   (plist-get session :empty) nil
@@ -2586,7 +2881,12 @@ Use METADATA keyed by preview id to preserve annotation display settings."
                   (plist-get session :stamp) (plist-get context :stamp)
                   (plist-get session :method) (plist-get context :preview-method)
                   (plist-get session :stale)
-                  (or (not (equal (plist-get context :stamp)
+                  (or input-changed
+                      (and (plist-member context :artifact-signature)
+                           (not (equal (plist-get context :artifact-signature)
+                                       (compose-preview--model-artifact-signature
+                                        (plist-get context :model)))))
+                      (not (equal (plist-get context :stamp)
                                   (compose-preview--source-stamp source)))
                       (not (equal (plist-get context :revision)
                                   (plist-get session :revision))))
@@ -2604,7 +2904,13 @@ Use METADATA keyed by preview id to preserve annotation display settings."
           (compose-preview--render-results
            (plist-get target :module-root)
            (apply #'append (mapcar #'compose-preview-item-files items))
-           items source))
+           items source)
+          (when-let* ((session (gethash (compose-preview--file-key source)
+                                       compose-preview--sessions)))
+            (compose-preview--panel-status
+             source (plist-get target :module-root)
+             (compose-preview--session-status session source)
+             (if (plist-get session :stale) 'warning (plist-get session :face)))))
         (compose-preview--log
          "rendered %d preview images; %d preview%s reported issues"
          rendered-count failed-count (if (= failed-count 1) "" "s"))
@@ -2721,8 +3027,15 @@ Use METADATA keyed by preview id to preserve annotation display settings."
                         (plist-get session :target) target
                         (plist-get session :stamp) (plist-get context :stamp)
                         (plist-get session :stale)
-                        (not (equal (plist-get context :revision)
-                                    (plist-get session :revision)))))
+                        (or (not (equal (plist-get context :revision)
+                                        (plist-get session :revision)))
+                            (not (equal (plist-get context :stamp)
+                                        (compose-preview--source-stamp
+                                         (plist-get context :source-buffer))))
+                            (and (plist-member context :input-signature)
+                                 (not (equal (plist-get context :input-signature)
+                                             (compose-preview--input-signature
+                                              (plist-get target :project-root))))))))
                 (when (equal key compose-preview--active-file)
                   (compose-preview--hide-panel)))
               (compose-preview--log "no previews found for %s"
@@ -2738,8 +3051,16 @@ Use METADATA keyed by preview id to preserve annotation display settings."
                          model previews target (plist-get context :generation))))
             (setq context (plist-put context :model model)
                   context (plist-put context :previews previews)
+                  context (plist-put context :artifact-signature
+                                     (compose-preview--model-artifact-signature model))
                   context (plist-put context :render render)
                   context (plist-put context :launcher launcher))
+            (dolist (path (list (plist-get render :settings)
+                                (plist-get render :results)
+                                (directory-file-name (plist-get render :output))))
+              (cl-pushnew path compose-preview--owned-artifacts :test #'equal))
+            (when compose-preview--work-context
+              (setq compose-preview--work-context context))
             (if (plist-get launcher :current)
                 (compose-preview--launch-renderer context)
               (compose-preview--compile-launcher context)))
@@ -2777,6 +3098,8 @@ Use METADATA keyed by preview id to preserve annotation display settings."
             (condition-case err
                 (progn
                   (compose-preview--snapshot-model context)
+                  (when (plist-member context :input-signature)
+                    (compose-preview--remember-module-model context))
                   (compose-preview--start-render context))
               (error
                (compose-preview--fail context "%s"
@@ -2854,7 +3177,12 @@ prompt for the module and full variant name."
          (init-script (compose-preview--get-init-script))
          (adapter-directory (expand-file-name "adapters/"
                                                compose-preview--package-directory))
-         (log-buffer (get-buffer-create compose-preview-log-buffer-name))
+         (log-buffer (generate-new-buffer
+                      (format "*Compose Preview Log: %s*" (file-name-nondirectory source-file))))
+         (input-signature (compose-preview--track-inputs project-root))
+         (cached-model (and compose-preview--follow-refresh
+                            (not compose-preview-force-clean-build)
+                            (compose-preview--reusable-module-model target)))
          (process-environment
           (append
            (list (concat "COMPOSE_PREVIEW_MODULE_PATH=" module-path)
@@ -2870,8 +3198,13 @@ prompt for the module and full variant name."
          (session (compose-preview--session
                    (compose-preview--file-key source-buffer)))
          context process)
+    (when-let* ((old-log (plist-get session :log)))
+      (when (buffer-live-p old-log) (kill-buffer old-log)))
     (setf (plist-get session :target) target
+          (plist-get session :log) log-buffer
           (plist-get session :stale) t)
+    (cl-pushnew (compose-preview--work-directory target)
+                compose-preview--artifact-roots :test #'equal)
     (unless compose-preview--follow-refresh
       (compose-preview--start-following source-buffer))
     (setq target (compose-preview--cache-target target))
@@ -2880,28 +3213,43 @@ prompt for the module and full variant name."
     (with-current-buffer log-buffer
       (let ((inhibit-read-only t))
         (erase-buffer)
-        (insert (format "$ %s %s\n\n" gradle (string-join gradle-args " ")))))
+        (insert (if cached-model
+                    "Reusing validated module model; Gradle skipped.\n\n"
+                  (format "$ %s %s\n\n" gradle (string-join gradle-args " "))))))
     (setq context (list :generation generation :target target
                         :source-buffer source-buffer :source-file source-file
                         :stamp (compose-preview--source-stamp source-buffer)
+                        :input-signature input-signature
                         :revision (plist-get session :revision)
                         :preview-method preview-method
                         :follow-refresh compose-preview--follow-refresh
                         :gradle-model-file gradle-model-file
                         :model-file model-file :log-buffer log-buffer)
-          process (make-process
+          compose-preview--work-context context)
+    (if cached-model
+        (condition-case err
+            (progn
+              (cl-pushnew model-file compose-preview--owned-artifacts :test #'equal)
+              (copy-file (plist-get cached-model :file) model-file t)
+              (compose-preview--log "reusing validated module model for %s" module-path)
+              (compose-preview--start-render context))
+          (error (compose-preview--fail context "%s" (error-message-string err))))
+      (condition-case err
+          (setq process (make-process
                    :name "compose-preview-gradle"
                    :buffer log-buffer :stderr log-buffer :noquery t
                    :command (cons gradle gradle-args)
                    :sentinel #'ignore)
           compose-preview--process process
           compose-preview--work-context context)
-    (process-put process 'compose-preview-context context)
-    (set-process-sentinel process #'compose-preview--gradle-sentinel)
-    (compose-preview--panel-status source-buffer (plist-get target :module-root)
-                                   (format "building %s…" variant))
-    (compose-preview--log "preparing module=%s variant=%s" module-path variant)
-    process))
+        (error (compose-preview--fail context "%s" (error-message-string err))))
+      (when process
+        (process-put process 'compose-preview-context context)
+        (set-process-sentinel process #'compose-preview--gradle-sentinel)
+        (compose-preview--panel-status source-buffer (plist-get target :module-root)
+                                       (format "building %s…" variant))
+        (compose-preview--log "preparing module=%s variant=%s" module-path variant))
+      process)))
 
 
 ;;;###autoload

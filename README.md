@@ -22,6 +22,24 @@ staleness, and failure. A last-known target and rendered images remain usable
 while Gradle refreshes; a successful model update invalidates target metadata
 and schedules one debounced Preview refresh.
 
+### Android Studio source alignment (2026-10-10)
+
+Audited checkout: `tools/adt/idea` `bba282350237`, `tools/base` `f8b1f24565f2`.
+
+- Studio `2efbd2291cb` releases source-file references and clears surface flows
+  on disposal. File sessions here use file keys, bounded caches, and release
+  their log buffers when evicted.
+- Studio `53f0b33e47c` releases queued actions on cancellation/timeout/eviction;
+  this implementation retains only one latest waiting request.
+- Studio `4b5595b44fd` delays shared classloader disposal until render references
+  are released. Here renderer JVMs remain isolated, and artifact cleanup protects
+  in-flight and cached references; no shared JVM/classloader cache was added.
+- Studio `d6d5210164c` propagates variants through active source-provider
+  configurations. This requires a reliable dependency/configuration model and
+  is not approximated by variant-name guessing here.
+- New MediaQuery DeviceSpec/interactive states and Compose Preview sidecar Web
+  UI work are not yet part of the pinned standalone renderer integration.
+
 ## How It Works
 
 Rendering happens in three steps.
@@ -90,15 +108,31 @@ file's running task may complete and cache its results, but cannot replace the
 active file's panel. Only the latest waiting file request is retained.
 
 The cache holds up to `compose-preview-session-cache-size` file sessions
-(default 8), protecting the active and in-flight sessions. Source-file changes,
-saves anywhere in the same Gradle project, target changes, and Android project
-model updates invalidate cached results; inactive saves do not steal focus.
-This is file-lifecycle reuse, not Studio Fast Preview or incremental compilation.
-External dependency/resource changes that bypass Emacs saves and project-model
-notifications still require a manual refresh. Selecting a non-Kotlin buffer
+(default 8), protecting the active and in-flight sessions. Relevant source,
+resource, and build-input saves in the same Gradle project invalidate cached
+results; documentation saves do not. An idle metadata monitor also detects
+external changes under the project root. Target/model changes, missing PNGs,
+and externally modified compiled artifacts prevent stale cache reuse. Unsaved
+buffers are reported explicitly: Gradle renders saved sources, not editor text.
+Invalidation is conservatively project-wide until a reliable variant dependency
+graph is available; inactive saves do not steal focus.
+
+File switching within the same module/variant can reuse the last compiled
+module model without Gradle, but only when its input and classpath/resource
+signatures still match and relevant buffers are saved. Manual refresh still
+runs Gradle. This is validated model reuse, not Studio Fast Preview or
+incremental compilation. Changes outside the project root (such as external
+included builds or replaced toolchains) may still require manual refresh.
+
+Each file retains its latest build/render log (`l`). Browsing position is
+restored by Preview ID when possible, rather than only a text offset. Cleanup
+reclaims unreferenced generation files created by the current Emacs session;
+it preserves cached/in-flight images, stable Gradle models, shared layoutlib
+and launcher caches, symlinks, and unowned files. Selecting a non-Kotlin buffer
 hides the panel without cancelling background rendering. Pressing `q` ends the
 follow session and cancels outstanding work; the next manual refresh starts it
-again. Set `compose-preview-follow-current-file` to nil to disable file following. `compose-preview-panel-width` controls the side-window
+again. Set `compose-preview-follow-current-file` to nil to disable file following.
+`compose-preview-panel-width` controls the side-window
 width. Keybinding hints are shown at the top of the panel by default; set
 `compose-preview-show-key-hints` to nil to hide them.
 

@@ -1116,6 +1116,158 @@
           (should-not compose-preview--queued-request))
       (kill-buffer source))))
 
+(ert-deftest compose-preview-input-signature-ignores-docs-and-build-output ()
+  "Only source/resource/build inputs invalidate cached Preview results."
+  (let ((root (file-name-as-directory (make-temp-file "preview-inputs" t))))
+    (unwind-protect
+        (progn
+          (make-directory (expand-file-name "src/main" root) t)
+          (make-directory (expand-file-name "build" root) t)
+          (with-temp-file (expand-file-name "src/main/A.kt" root) (insert "fun A() {}"))
+          (let ((before (compose-preview--input-signature root)))
+            (with-temp-file (expand-file-name "README.md" root) (insert "docs"))
+            (with-temp-file (expand-file-name "build/A.kt" root) (insert "generated"))
+            (should (equal before (compose-preview--input-signature root)))
+            (with-temp-file (expand-file-name "src/main/A.kt" root) (insert "fun Changed() {}"))
+            (should-not (equal before (compose-preview--input-signature root)))))
+      (delete-directory root t))))
+
+(ert-deftest compose-preview-module-model-reuse-validates-inputs-and-artifacts ()
+  "Module model reuse rejects changed sources and compiled classpath files."
+  (let* ((root (file-name-as-directory (make-temp-file "preview-model-cache" t)))
+         (target (list :project-root root :module-root root :module-path ":app" :variant "debug"))
+         (file (expand-file-name "model.json" root))
+         (classes (expand-file-name "build/classes/A.class" root))
+         (model (list (cons "classPath" (list classes))))
+         (compose-preview--module-models (make-hash-table :test #'equal)))
+    (unwind-protect
+        (progn
+          (make-directory (file-name-directory classes) t)
+          (with-temp-file classes (insert "bytecode"))
+          (with-temp-file file (insert "{}"))
+          (puthash (compose-preview--module-model-key target)
+                   (list :file file :model model
+                         :inputs (compose-preview--input-signature root)
+                         :artifacts (compose-preview--model-artifact-signature model))
+                   compose-preview--module-models)
+          (should (compose-preview--reusable-module-model target))
+          (with-temp-file classes (insert "changed-bytecode"))
+          (should-not (compose-preview--reusable-module-model target)))
+      (delete-directory root t))))
+
+(ert-deftest compose-preview-artifact-cleanup-only-deletes-owned-unreferenced-paths ()
+  "Cleanup protects cached images and never deletes unowned generation names."
+  (let* ((root (file-name-as-directory (make-temp-file "preview-cleanup" t)))
+         (live (expand-file-name "rendered-1" root))
+         (dead (expand-file-name "rendered-2" root))
+         (unowned (expand-file-name "rendered-3" root))
+         (compose-preview--artifact-roots (list root))
+         (compose-preview--owned-artifacts (list live dead))
+         (compose-preview--work-context nil)
+         (compose-preview--module-models (make-hash-table :test #'equal))
+         (compose-preview--sessions (make-hash-table :test #'equal))
+         (compose-preview--last-result-items nil)
+         (compose-preview-results-buffer-name " *nonexistent-preview-cleanup*"))
+    (unwind-protect
+        (progn
+          (dolist (directory (list live dead unowned)) (make-directory directory))
+          (let ((image (expand-file-name "A.png" live))
+                (session (compose-preview--session "/tmp/A.kt")))
+            (with-temp-file image (insert "PNG"))
+            (setf (plist-get session :images) (list image)))
+          (compose-preview--cleanup-artifacts)
+          (should (file-directory-p live))
+          (should-not (file-exists-p dead))
+          (should (file-directory-p unowned)))
+      (delete-directory root t))))
+
+(ert-deftest compose-preview-session-status-reports-unsaved-and-stale ()
+  "Cached images must not masquerade as fresh results after source changes."
+  (let ((source (generate-new-buffer " *preview-status-unsaved*")))
+    (unwind-protect
+        (with-current-buffer source
+          (insert "unsaved")
+          (should (string-match-p "unsaved"
+                                  (compose-preview--session-status '(:status "ready") source)))
+          (set-buffer-modified-p nil)
+          (should (string-match-p "out of date"
+                                  (compose-preview--session-status '(:stale t :items (image)) source))))
+      (kill-buffer source))))
+
+(ert-deftest compose-preview-anchor-follows-item-id-after-layout-change ()
+  "Restored navigation uses card identity rather than a stale character offset."
+  (with-temp-buffer
+    (let ((old (make-compose-preview-item :id "card"))
+          (new (make-compose-preview-item :id "card")))
+      (insert "new layout prefix\n")
+      (let ((position (point)))
+        (insert (propertize "Card" 'compose-preview-item new))
+        (should (= position (compose-preview--anchor-position old)))))))
+
+(ert-deftest compose-preview-idle-monitor-invalidates-external-source-change ()
+  "External source edits invalidate both file and module model caches."
+  (let* ((root (file-name-as-directory (make-temp-file "preview-watch" t)))
+         (file (expand-file-name "A.kt" root))
+         (compose-preview--sessions (make-hash-table :test #'equal))
+         (compose-preview--module-models (make-hash-table :test #'equal))
+         (compose-preview--project-input-signatures (make-hash-table :test #'equal))
+         (compose-preview--active-file nil)
+         (target (list :project-root root :module-root root)))
+    (unwind-protect
+        (progn
+          (with-temp-file file (insert "fun A() {}"))
+          (let ((session (compose-preview--session file)))
+            (setf (plist-get session :target) target
+                  (plist-get session :stale) nil)
+            (puthash (compose-preview--module-model-key target) '(:file "old")
+                     compose-preview--module-models)
+            (puthash root (compose-preview--input-signature root)
+                     compose-preview--project-input-signatures)
+            (with-temp-file file (insert "fun ChangedExternally() {}"))
+            (compose-preview--watch-inputs)
+            (should (plist-get session :stale))
+            (should (= (hash-table-count compose-preview--module-models) 0))))
+      (delete-directory root t))))
+
+(ert-deftest compose-preview-log-command-uses-source-session ()
+  "The panel log command opens its own file log rather than the latest build."
+  (let ((source (generate-new-buffer " *preview-log-source*"))
+        (log (generate-new-buffer " *preview-own-log*"))
+        (compose-preview--sessions (make-hash-table :test #'equal))
+        displayed)
+    (unwind-protect
+        (with-current-buffer source
+          (setq buffer-file-name "/tmp/A.kt")
+          (let ((session (compose-preview--session buffer-file-name)))
+            (setf (plist-get session :log) log))
+          (cl-letf (((symbol-function 'display-buffer)
+                     (lambda (buffer &rest _) (setq displayed buffer))))
+            (compose-preview-open-log))
+          (should (eq displayed log)))
+      (kill-buffer source)
+      (kill-buffer log))))
+
+(ert-deftest compose-preview-missing-cached-png-forces-refresh ()
+  "A missing PNG prevents reactivation from treating a session as fresh."
+  (let ((source (generate-new-buffer " *preview-missing-png*"))
+        (compose-preview--sessions (make-hash-table :test #'equal))
+        (compose-preview--module-models (make-hash-table :test #'equal))
+        (target '(:project-root "/tmp/" :module-root "/tmp/")))
+    (unwind-protect
+        (with-current-buffer source
+          (setq buffer-file-name "/tmp/A.kt")
+          (let ((session (compose-preview--session buffer-file-name)))
+            (setf (plist-get session :target) target
+                  (plist-get session :stamp) (compose-preview--source-stamp source)
+                  (plist-get session :stale) nil
+                  (plist-get session :images) '("/missing-preview-file.png"))
+            (cl-letf (((symbol-function 'compose-preview--target) (lambda (&rest _) target))
+                      ((symbol-function 'compose-preview--track-inputs) #'ignore)
+                      ((symbol-function 'compose-preview--save-session-view) #'ignore)
+                      ((symbol-function 'compose-preview--show-session) #'ignore))
+              (should-not (compose-preview--activate-file source)))))
+      (kill-buffer source))))
+
 (ert-deftest compose-preview-stale-render-sentinel-is-ignored ()
   "A superseded renderer process cannot replace current panel results."
   (let ((compose-preview--generation 2)
