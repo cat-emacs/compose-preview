@@ -38,7 +38,7 @@ lint:
 build:
 	$(BATCH) $(ARCHIVES) $(LOAD_PATH) \
 	  --eval "(setq byte-compile-error-on-warn t)" \
-	  --eval "(byte-compile-file \"compose-preview.el\")"
+	  -f batch-byte-compile compose-preview.el
 
 test:
 	test -f "$(ANDROID_MODE_DIR)/android-mode.el"

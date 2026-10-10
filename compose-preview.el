@@ -1732,9 +1732,10 @@ Use GENERATION to isolate concurrent or superseded render attempts."
 
 (defun compose-preview--image-width (image)
   "Return pixel width of IMAGE, or nil when it cannot be measured."
-  (condition-case nil
-      (car (image-size image t))
-    (error nil)))
+  (when (fboundp 'image-size)
+    (condition-case nil
+        (car (image-size image t))
+      (error nil))))
 
 (defun compose-preview--frame-scale-factor ()
   "Return the current frame's physical-to-logical pixel scale."
@@ -1755,16 +1756,17 @@ Use GENERATION to isolate concurrent or superseded render attempts."
 
 (defun compose-preview--actual-image-size (file density-dpi)
   "Return FILE size at Studio-style actual size for DENSITY-DPI."
-  (condition-case nil
-      (let* ((image (create-image file 'png nil))
-             (size (image-size image t))
-             (factor (if (and density-dpi (> density-dpi 0))
-                         (/ 160.0 density-dpi
-                            (max 1.0 (compose-preview--frame-scale-factor)))
-                       1.0)))
-        (cons (round (* (car size) factor))
-              (round (* (cdr size) factor))))
-    (error nil)))
+  (when (fboundp 'image-size)
+    (condition-case nil
+        (let* ((image (create-image file 'png nil))
+               (size (image-size image t))
+               (factor (if (and density-dpi (> density-dpi 0))
+                           (/ 160.0 density-dpi
+                              (max 1.0 (compose-preview--frame-scale-factor)))
+                         1.0)))
+          (cons (round (* (car size) factor))
+                (round (* (cdr size) factor))))
+      (error nil))))
 
 (defun compose-preview--image-spec (file &optional density-dpi)
   "Return an image spec for FILE using Android Studio scale semantics.

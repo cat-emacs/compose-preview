@@ -924,16 +924,31 @@
                (lambda () "/tmp/project/b/")))
       (should (equal (plist-get (compose-preview--target) :module-path) ":b")))))
 
+(ert-deftest compose-preview-image-measurement-supports-headless-emacs ()
+  "Emacs builds without image-size use the existing layout fallback."
+  (let ((original (and (fboundp 'image-size) (symbol-function 'image-size))))
+    (unwind-protect
+        (progn
+          (fmakunbound 'image-size)
+          (should-not (compose-preview--image-width 'image))
+          (should-not (compose-preview--actual-image-size "/tmp/unused.png" 160)))
+      (when original (fset 'image-size original)))))
+
 (ert-deftest compose-preview-file-session-restores-valid-cache ()
   "Reactivating a fresh file restores its surface without building."
-  (let ((source (generate-new-buffer " *preview-cache-source*"))
-        (compose-preview--sessions (make-hash-table :test #'equal))
-        (compose-preview--active-file nil)
-        (target '(:module-root "/tmp/" :project-root "/tmp/"))
-        shown)
+  (let* ((root (file-name-as-directory (make-temp-file "preview-cache-project" t)))
+         (source (generate-new-buffer " *preview-cache-source*"))
+         (compose-preview--sessions (make-hash-table :test #'equal))
+         (compose-preview--module-models (make-hash-table :test #'equal))
+         (compose-preview--project-input-signatures (make-hash-table :test #'equal))
+         (compose-preview--input-watch-timer nil)
+         (compose-preview--active-file nil)
+         (compose-preview--work-context nil)
+         (target (list :module-root root :project-root root))
+         shown)
     (unwind-protect
         (with-current-buffer source
-          (setq buffer-file-name "/tmp/Cached.kt")
+          (setq buffer-file-name (expand-file-name "Cached.kt" root))
           (let ((session (compose-preview--session buffer-file-name)))
             (setf (plist-get session :target) target
                   (plist-get session :stamp) (compose-preview--source-stamp source)
@@ -946,7 +961,10 @@
               (should (eq shown session))
               (insert "changed")
               (should-not (compose-preview--activate-file source)))))
-      (kill-buffer source))))
+      (when (timerp compose-preview--input-watch-timer)
+        (cancel-timer compose-preview--input-watch-timer))
+      (kill-buffer source)
+      (delete-directory root t))))
 
 (ert-deftest compose-preview-background-render-caches-without-replacing-panel ()
   "An inactive file completion is cached and never paints the active file."
