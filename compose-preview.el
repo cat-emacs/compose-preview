@@ -97,6 +97,12 @@ A float means a fraction of the frame width; an integer means columns."
   :type 'number
   :group 'compose-preview)
 
+(defcustom compose-preview-session-cache-size 8
+  "Maximum number of file Preview sessions retained in memory.
+Eviction releases image and view metadata, not generated files on disk."
+  :type 'natnum
+  :group 'compose-preview)
+
 (defcustom compose-preview-follow-current-file t
   "Whether an active Preview panel should follow the selected Kotlin file."
   :type 'boolean
@@ -139,6 +145,28 @@ A float means a fraction of the frame width; an integer means columns."
 
 (defvar compose-preview--process nil
   "Current asynchronous Compose preview process.")
+
+(defvar compose-preview--sessions (make-hash-table :test #'equal)
+  "Source-file keys to cached Preview sessions.")
+
+(defvar compose-preview--active-file nil
+  "Source-file key currently represented by the Preview panel.")
+
+(defvar compose-preview--work-context nil
+  "Context owning the serialized Gradle/compiler/renderer chain.")
+
+(defvar compose-preview--queued-request nil
+  "Latest request waiting for the serialized rendering chain.")
+
+(defvar compose-preview--session-clock 0
+  "Monotonic counter used for file-session LRU eviction.")
+
+(defconst compose-preview--session-view-variables
+  '(compose-preview--collapsed-groups compose-preview--view-mode
+    compose-preview--focus-id compose-preview--search-query
+    compose-preview--group-filter compose-preview--fit-images
+    compose-preview--image-zoom)
+  "Buffer-local view settings preserved independently for each file.")
 
 (defvar compose-preview--generation 0
   "Generation used to ignore stale asynchronous process sentinels.")
@@ -375,6 +403,161 @@ Each entry is (PROJECT-ROOT . TARGET), where TARGET is a plist containing
   (add-hook 'window-state-change-functions
             #'compose-preview--window-state-change nil t))
 
+(defun compose-preview--file-key (buffer)
+  "Return a stable file key for source BUFFER."
+  (when (buffer-live-p buffer)
+    (when-let* ((file (buffer-local-value 'buffer-file-name buffer)))
+      (expand-file-name file))))
+
+(defun compose-preview--session (key)
+  "Get or create the file Preview session for KEY."
+  (or (gethash key compose-preview--sessions)
+      (puthash key
+               (list :key key :stale t :target nil :stamp nil :method nil
+                     :revision nil :items nil :images nil :empty nil
+                     :module-root nil :status nil :face nil :view nil
+                     :point nil :used 0)
+               compose-preview--sessions)))
+
+(defun compose-preview--source-stamp (buffer)
+  "Return BUFFER's modification tick and on-disk file metadata."
+  (when (buffer-live-p buffer)
+    (with-current-buffer buffer
+      (list (buffer-chars-modified-tick)
+            (when buffer-file-name
+              (let ((attributes (file-attributes buffer-file-name)))
+                (and attributes
+                     (list (file-attribute-size attributes)
+                           (file-attribute-modification-time attributes)
+                           (file-attribute-status-change-time attributes)))))))))
+
+(defun compose-preview--save-session-view ()
+  "Save the visible panel's view settings to its file session."
+  (when-let* ((panel (get-buffer compose-preview-results-buffer-name)))
+    (with-current-buffer panel
+      (when-let* ((key (compose-preview--file-key compose-preview--source-buffer)))
+        (let ((session (compose-preview--session key)))
+          (setf (plist-get session :view)
+                (mapcar (lambda (variable)
+                          (cons variable (symbol-value variable)))
+                        compose-preview--session-view-variables)
+                (plist-get session :point) (point)))))))
+
+(defun compose-preview--evict-sessions ()
+  "Release least recently used inactive sessions beyond the cache limit."
+  (let (candidates)
+    (maphash
+     (lambda (key session)
+       (unless (or (equal key compose-preview--active-file)
+                   (equal key (plist-get compose-preview--work-context :source-file)))
+         (push (cons key (or (plist-get session :used) 0)) candidates)))
+     compose-preview--sessions)
+    (setq candidates (sort candidates (lambda (a b) (< (cdr a) (cdr b)))))
+    (while (and candidates
+                (> (hash-table-count compose-preview--sessions)
+                   (max 1 compose-preview-session-cache-size)))
+      (remhash (caar candidates) compose-preview--sessions)
+      (setq candidates (cdr candidates)))))
+
+(defun compose-preview--show-session (session buffer)
+  "Display SESSION's cached results and view for source BUFFER."
+  (let ((panel (get-buffer-create compose-preview-results-buffer-name)))
+    (with-current-buffer panel
+      (unless (derived-mode-p 'compose-preview-results-mode)
+        (compose-preview-results-mode))
+      (dolist (variable compose-preview--session-view-variables)
+        (set (make-local-variable variable)
+             (if (eq variable 'compose-preview--collapsed-groups)
+                 (make-hash-table :test #'equal)
+               (default-value variable))))
+      (dolist (setting (plist-get session :view))
+        (set (make-local-variable (car setting)) (cdr setting)))
+      (setq compose-preview--source-buffer buffer))
+    (if (plist-get session :empty)
+        (compose-preview--hide-panel)
+      (if (plist-get session :items)
+          (compose-preview--render-results
+           (plist-get session :module-root) (plist-get session :images)
+           (plist-get session :items) buffer)
+        (with-current-buffer panel
+          (let ((inhibit-read-only t))
+            (compose-preview--delete-section-overlays)
+            (erase-buffer))
+          (setq compose-preview--items nil compose-preview--legacy-images nil)))
+      (compose-preview--panel-status
+       buffer (or (plist-get session :module-root)
+                  (buffer-local-value 'default-directory buffer))
+       (or (plist-get session :status) "waiting for Preview…")
+       (plist-get session :face))
+      (with-current-buffer panel
+        (goto-char (min (or (plist-get session :point) (point-min)) (point-max)))
+        (when-let* ((window (get-buffer-window panel t)))
+          (set-window-point window (point)))))))
+
+(defun compose-preview--activate-file (buffer)
+  "Activate BUFFER's Preview session, returning non-nil for valid cached data."
+  (setq compose-preview--queued-request nil)
+  (let* ((key (compose-preview--file-key buffer))
+         (session (compose-preview--session key))
+         (target (with-current-buffer buffer
+                   (ignore-errors (compose-preview--target)))))
+    (compose-preview--save-session-view)
+    (setq compose-preview--active-file key)
+    (setf (plist-get session :used) (cl-incf compose-preview--session-clock))
+    (compose-preview--show-session session buffer)
+    (compose-preview--evict-sessions)
+    (and target
+         (not (buffer-modified-p buffer))
+         (not (plist-get session :stale))
+         (equal target (plist-get session :target))
+         (equal (compose-preview--source-stamp buffer)
+                (plist-get session :stamp))
+         ;; A single-method manual result is not a complete file surface.
+         (not (plist-get session :method)))))
+
+(defun compose-preview--invalidate-project-sessions (root)
+  "Invalidate cached and in-flight Preview sessions belonging to ROOT."
+  (maphash
+   (lambda (_key session)
+     (when (equal (plist-get (plist-get session :target) :project-root) root)
+       (setf (plist-get session :stale) t
+             (plist-get session :revision)
+             (1+ (or (plist-get session :revision) 0)))))
+   compose-preview--sessions))
+
+(defun compose-preview--source-saved ()
+  "Invalidate file sessions after source or resource changes in their project."
+  (when-let* ((root (compose-preview--find-project-root)))
+    (compose-preview--invalidate-project-sessions root)))
+
+(defun compose-preview--drain-request ()
+  "Start the latest pending request when no render chain is running."
+  (unless compose-preview--work-context
+    (when-let* ((request (prog1 compose-preview--queued-request
+                          (setq compose-preview--queued-request nil)))
+                (buffer (plist-get request :buffer))
+                ((buffer-live-p buffer))
+                ((equal (compose-preview--file-key buffer)
+                        compose-preview--active-file)))
+      (with-current-buffer buffer
+        (let ((compose-preview--refresh-all-in-file (plist-get request :all))
+              (compose-preview--follow-refresh (plist-get request :follow))
+              (current-prefix-arg (plist-get request :prefix)))
+          (condition-case err
+              (compose-preview--start-refresh (plist-get request :variant))
+            (error
+             (setq compose-preview--work-context nil)
+             (compose-preview--panel-status
+              buffer default-directory (error-message-string err) 'error))))))))
+
+(defun compose-preview--complete-work (context)
+  "Release CONTEXT's serialized render chain and start pending work."
+  (when (equal (plist-get context :generation)
+               (plist-get compose-preview--work-context :generation))
+    (setq compose-preview--work-context nil)
+    (compose-preview--evict-sessions)
+    (compose-preview--drain-request)))
+
 (defun compose-preview--cancel-follow-timer ()
   "Cancel a pending Preview refresh caused by switching files."
   (when (timerp compose-preview--follow-timer)
@@ -397,6 +580,8 @@ Preserve the selected window because this can run from `post-command-hook'."
 (defun compose-preview--cancel-process ()
   "Cancel active Preview work and invalidate its sentinels."
   (cl-incf compose-preview--generation)
+  (setq compose-preview--work-context nil
+        compose-preview--queued-request nil)
   (when (process-live-p compose-preview--process)
     (delete-process compose-preview--process))
   (setq compose-preview--process nil))
@@ -410,7 +595,12 @@ Preserve the selected window because this can run from `post-command-hook'."
     (with-current-buffer buffer
       (let ((compose-preview--follow-refresh t)
             (compose-preview--refresh-all-in-file t))
-        (compose-preview-refresh)))))
+        (condition-case err
+            (unless (compose-preview--activate-file buffer)
+              (compose-preview-refresh))
+          (error
+           (compose-preview--panel-status
+            buffer default-directory (error-message-string err) 'error)))))))
 
 (defun compose-preview--follow-selected-buffer ()
   "Update an active Preview session for the selected buffer."
@@ -423,12 +613,13 @@ Preserve the selected window because this can run from `post-command-hook'."
                   (eq buffer (get-buffer compose-preview-log-buffer-name)))
         (setq compose-preview--follow-buffer buffer)
         (compose-preview--cancel-follow-timer)
-        (compose-preview--cancel-process)
+        (compose-preview--save-session-view)
+        (setq compose-preview--active-file nil
+              compose-preview--queued-request nil)
         (if (compose-preview--kotlin-source-buffer-p buffer)
             (setq compose-preview--follow-timer
                   (run-with-timer compose-preview-file-switch-delay nil
                                   #'compose-preview--follow-refresh-buffer buffer))
-          (compose-preview--cancel-process)
           (compose-preview--hide-panel))))))
 
 (defun compose-preview--start-following (source-buffer)
@@ -441,7 +632,9 @@ Preserve the selected window because this can run from `post-command-hook'."
 (defun compose-preview-panel-quit ()
   "Close the Preview panel and stop following selected files."
   (interactive)
+  (compose-preview--save-session-view)
   (setq compose-preview--follow-active nil
+        compose-preview--active-file nil
         compose-preview--follow-buffer nil)
   (compose-preview--cancel-follow-timer)
   (compose-preview--cancel-process)
@@ -476,7 +669,10 @@ Preserve the selected window because this can run from `post-command-hook'."
   (when (buffer-live-p buffer)
     (with-current-buffer buffer
       (setq compose-preview--refresh-timer nil)
-      (when compose-preview-auto-refresh-mode
+      (when (and compose-preview-auto-refresh-mode
+                 (or (null compose-preview--active-file)
+                     (equal (compose-preview--file-key buffer)
+                            compose-preview--active-file)))
         (let ((compose-preview--refresh-all-in-file t))
           (compose-preview-refresh))))))
 
@@ -645,6 +841,8 @@ With REFRESH non-nil, refresh Android project metadata first."
         (assoc-delete-all (compose-preview--cache-key root)
                           compose-preview--model-refresh-timers))
   (when (and (buffer-live-p source-buffer)
+             (equal (compose-preview--file-key source-buffer)
+                    compose-preview--active-file)
              (compose-preview--panel-visible-for-project-p root))
     (with-current-buffer source-buffer
       (let ((compose-preview--refresh-all-in-file t))
@@ -668,6 +866,7 @@ With REFRESH non-nil, refresh Android project metadata first."
 
 (defun compose-preview--android-project-model-updated (root _data)
   "Invalidate preview target state after Android model ROOT is updated."
+  (compose-preview--invalidate-project-sessions root)
   (let ((key (compose-preview--cache-key root)))
     (setq compose-preview--target-cache
           (assoc-delete-all key compose-preview--target-cache)
@@ -952,7 +1151,15 @@ When FORCE-PROMPT is non-nil, prompt for module and variant via android-mode."
                (compose-preview--refresh-stale-kmp-target
                 project-root
                 (compose-preview--target-from-android-mode project-root))))
-         (cached (compose-preview--cached-target project-root)))
+         (cached-target (compose-preview--cached-target project-root))
+         (source-module-root (compose-preview--find-module-root))
+         (cached
+          (and cached-target
+               (or (null source-module-root)
+                   (equal (compose-preview--cache-key source-module-root)
+                          (compose-preview--cache-key
+                           (plist-get cached-target :module-root))))
+               cached-target)))
     (if (and (not force-prompt)
              (not metadata-target)
              (not cached)
@@ -1313,7 +1520,15 @@ mode uses one scale shared by every visible Preview, like Studio's surface."
 
 (defun compose-preview--panel-status (source-buffer module-root status &optional face)
   "Show STATUS for SOURCE-BUFFER and MODULE-ROOT in the preview panel."
-  (let ((buffer (get-buffer-create compose-preview-results-buffer-name)))
+  (let* ((key (compose-preview--file-key source-buffer))
+         (session (and key (compose-preview--session key)))
+         (visible (or (null compose-preview--work-context)
+                      (and key (equal key compose-preview--active-file)))))
+    (when session
+      (setf (plist-get session :status) status
+            (plist-get session :face) face))
+    (when visible
+      (let ((buffer (get-buffer-create compose-preview-results-buffer-name)))
     (with-current-buffer buffer
       (unless (derived-mode-p 'compose-preview-results-mode)
         (compose-preview-results-mode))
@@ -1326,7 +1541,7 @@ mode uses one scale shared by every visible Preview, like Studio's surface."
       (when (= (buffer-size) 0)
         (let ((inhibit-read-only t))
           (insert "Waiting for the first render...\n"))))
-    (compose-preview--display-panel buffer)))
+    (compose-preview--display-panel buffer)))))
 
 (defun compose-preview--group-name (preview)
   "Return @Preview(group) name for PREVIEW, or nil when ungrouped."
@@ -2197,13 +2412,21 @@ MODULE-ROOT and PREVIEWS are accepted for compatibility with older callers."
   (let ((root (or module-root
                   (compose-preview--find-module-root)
                   default-directory))
-        (items (or previews compose-preview--last-result-items)))
-    (if items
+        (items (or previews compose-preview--last-result-items))
+        (session (gethash (compose-preview--file-key (current-buffer))
+                          compose-preview--sessions)))
+    (if (and session (plist-get session :items) (not previews))
+        (progn
+          (compose-preview--save-session-view)
+          (setq compose-preview--active-file (compose-preview--file-key (current-buffer)))
+          (compose-preview--start-following (current-buffer))
+          (compose-preview--show-session session (current-buffer)))
+      (if items
         (compose-preview--render-results
          root
          (apply #'append (mapcar #'compose-preview-item-files items))
          items compose-preview--last-source-buffer)
-      (user-error "No Compose preview results are available"))))
+      (user-error "No Compose preview results are available")))))
 
 (defun compose-preview--active-generation-p (generation)
   "Return non-nil when GENERATION is the current refresh."
@@ -2216,9 +2439,13 @@ FORMAT-STRING and ARGS are passed to `format'."
          (target (plist-get context :target))
          (message (apply #'format format-string args))
          (message (string-remove-prefix "compose-preview: " message)))
+    (when-let* ((key (compose-preview--file-key source)))
+      (let ((session (compose-preview--session key)))
+        (setf (plist-get session :stale) t)))
     (compose-preview--panel-status source (plist-get target :module-root)
                                    (concat "failed — " message) 'error)
-    (compose-preview--log "%s" message)))
+    (compose-preview--log "%s" message)
+    (compose-preview--complete-work context)))
 
 (defun compose-preview--padded-index (index max-index)
   "Return INDEX zero-padded to the width of MAX-INDEX."
@@ -2348,16 +2575,40 @@ Use METADATA keyed by preview id to preserve annotation display settings."
               (seq-count (lambda (result)
                            (compose-preview--json-get result "imagePath"))
                          result-list)))
+        (when-let* ((key (compose-preview--file-key source)))
+          (let ((session (compose-preview--session key)))
+            (setf (plist-get session :items) items
+                  (plist-get session :images)
+                  (apply #'append (mapcar #'compose-preview-item-files items))
+                  (plist-get session :empty) nil
+                  (plist-get session :module-root) (plist-get target :module-root)
+                  (plist-get session :target) target
+                  (plist-get session :stamp) (plist-get context :stamp)
+                  (plist-get session :method) (plist-get context :preview-method)
+                  (plist-get session :stale)
+                  (or (not (equal (plist-get context :stamp)
+                                  (compose-preview--source-stamp source)))
+                      (not (equal (plist-get context :revision)
+                                  (plist-get session :revision))))
+                  (plist-get session :status)
+                  (if (> failed-count 0)
+                      (format "ready — %d issues" failed-count) "ready")
+                  (plist-get session :face) (if (> failed-count 0) 'warning 'success))))
         (setq compose-preview--last-results-directory (plist-get render :output)
               compose-preview--last-result-items items
               compose-preview--last-source-buffer source)
-        (compose-preview--render-results
-         (plist-get target :module-root)
-         (apply #'append (mapcar #'compose-preview-item-files items))
-         items source)
+        (when (or (null compose-preview--work-context)
+                  (and (compose-preview--file-key source)
+                       (equal (compose-preview--file-key source)
+                              compose-preview--active-file)))
+          (compose-preview--render-results
+           (plist-get target :module-root)
+           (apply #'append (mapcar #'compose-preview-item-files items))
+           items source))
         (compose-preview--log
          "rendered %d preview images; %d preview%s reported issues"
-         rendered-count failed-count (if (= failed-count 1) "" "s")))))))
+         rendered-count failed-count (if (= failed-count 1) "" "s"))
+        (compose-preview--complete-work context))))))
 
 (defun compose-preview--render-sentinel (process _event)
   "Handle completion of asynchronous renderer PROCESS."
@@ -2414,7 +2665,9 @@ Use METADATA keyed by preview id to preserve annotation display settings."
       (when (compose-preview--active-generation-p generation)
         (setq compose-preview--process nil)
         (if (zerop (process-exit-status process))
-            (compose-preview--launch-renderer context)
+            (condition-case err
+                (compose-preview--launch-renderer context)
+              (error (compose-preview--fail context "%s" (error-message-string err))))
           (compose-preview--fail context "launcher compiler exited with status %d"
                                  (process-exit-status process)))))))
 
@@ -2458,9 +2711,23 @@ Use METADATA keyed by preview id to preserve annotation display settings."
     (if (null previews)
         (if (plist-get context :follow-refresh)
             (progn
-              (compose-preview--hide-panel)
+              (when (null compose-preview--work-context)
+                (compose-preview--hide-panel))
+              (when-let* ((key (compose-preview--file-key
+                               (plist-get context :source-buffer))))
+                (let ((session (compose-preview--session key)))
+                  (setf (plist-get session :empty) t
+                        (plist-get session :items) nil
+                        (plist-get session :target) target
+                        (plist-get session :stamp) (plist-get context :stamp)
+                        (plist-get session :stale)
+                        (not (equal (plist-get context :revision)
+                                    (plist-get session :revision)))))
+                (when (equal key compose-preview--active-file)
+                  (compose-preview--hide-panel)))
               (compose-preview--log "no previews found for %s"
-                                    (file-name-nondirectory source-file)))
+                                    (file-name-nondirectory source-file))
+              (compose-preview--complete-work context))
           (compose-preview--fail context "no previews found for %s"
                                  (or (and source-file
                                           (file-name-nondirectory source-file))
@@ -2521,6 +2788,41 @@ Use METADATA keyed by preview id to preserve annotation display settings."
 
 ;;;###autoload
 (defun compose-preview-refresh (&optional variant)
+  "Request an asynchronous Preview refresh for the current file.
+VARIANT overrides the selected variant.  File switches keep existing work
+running; only the newest waiting file request is retained."
+  (interactive)
+  (unless buffer-file-name
+    (user-error "Preview requires a source file buffer"))
+  (unless compose-preview--follow-refresh
+    (compose-preview--start-following (current-buffer)))
+  (unless (equal (compose-preview--file-key (current-buffer))
+                 compose-preview--active-file)
+    (compose-preview--save-session-view)
+    (setq compose-preview--active-file
+          (compose-preview--file-key (current-buffer)))
+    (compose-preview--show-session
+     (compose-preview--session compose-preview--active-file) (current-buffer)))
+  (if compose-preview--work-context
+      (unless (and compose-preview--follow-refresh
+                   (equal compose-preview--active-file
+                          (plist-get compose-preview--work-context :source-file))
+                   (not (plist-get compose-preview--work-context :preview-method))
+                   (equal (plist-get (compose-preview--session
+                                      compose-preview--active-file) :revision)
+                          (plist-get compose-preview--work-context :revision))
+                   (equal (compose-preview--source-stamp (current-buffer))
+                          (plist-get compose-preview--work-context :stamp)))
+        (setq compose-preview--queued-request
+              (list :buffer (current-buffer) :variant variant
+                    :prefix current-prefix-arg
+                    :all compose-preview--refresh-all-in-file
+                    :follow compose-preview--follow-refresh))
+        (compose-preview--panel-status
+         (current-buffer) default-directory "waiting for current render…"))
+    (compose-preview--start-refresh variant)))
+
+(defun compose-preview--start-refresh (&optional variant)
   "Asynchronously build and render previews for the current Android module.
 VARIANT defaults to the selected android-mode variant.  With a prefix argument,
 prompt for the module and full variant name."
@@ -2565,7 +2867,11 @@ prompt for the module and full variant name."
            process-environment))
          (default-directory project-root)
          (gradle-args (compose-preview--gradle-arguments task-path init-script))
+         (session (compose-preview--session
+                   (compose-preview--file-key source-buffer)))
          context process)
+    (setf (plist-get session :target) target
+          (plist-get session :stale) t)
     (unless compose-preview--follow-refresh
       (compose-preview--start-following source-buffer))
     (setq target (compose-preview--cache-target target))
@@ -2577,6 +2883,8 @@ prompt for the module and full variant name."
         (insert (format "$ %s %s\n\n" gradle (string-join gradle-args " ")))))
     (setq context (list :generation generation :target target
                         :source-buffer source-buffer :source-file source-file
+                        :stamp (compose-preview--source-stamp source-buffer)
+                        :revision (plist-get session :revision)
                         :preview-method preview-method
                         :follow-refresh compose-preview--follow-refresh
                         :gradle-model-file gradle-model-file
@@ -2586,7 +2894,8 @@ prompt for the module and full variant name."
                    :buffer log-buffer :stderr log-buffer :noquery t
                    :command (cons gradle gradle-args)
                    :sentinel #'ignore)
-          compose-preview--process process)
+          compose-preview--process process
+          compose-preview--work-context context)
     (process-put process 'compose-preview-context context)
     (set-process-sentinel process #'compose-preview--gradle-sentinel)
     (compose-preview--panel-status source-buffer (plist-get target :module-root)
@@ -2615,6 +2924,7 @@ prompt for the module and full variant name."
    ("l" "Open log" compose-preview-open-log)
    ("v" "Set variant" compose-preview-set-variant)])
 
+(add-hook 'after-save-hook #'compose-preview--source-saved)
 (add-hook 'android-project-model-updated-hook
           #'compose-preview--android-project-model-updated)
 (add-hook 'android-project-model-state-changed-hook

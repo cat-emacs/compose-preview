@@ -35,8 +35,9 @@ Rendering happens in three steps.
    function, writes a rendering settings file, and compiles the fixed launcher
    once per renderer version under `compose-preview-cache-directory`.
 3. The launcher renders in a separate JVM and writes a results file with one
-   PNG per preview. Gradle and the renderer run asynchronously; a newer refresh
-   cancels and supersedes an older one.
+   PNG per preview. Gradle and the renderer run asynchronously on one serialized
+   chain. Switching files does not cancel running work: it finishes into the
+   original file's cache, then the latest pending file request starts.
 
 ## Emacs UI
 
@@ -82,10 +83,22 @@ Run `M-x compose-preview-auto-refresh-mode` in a source buffer to refresh all
 previews in that file after each save. Saves are debounced by
 `compose-preview-auto-refresh-delay`; automatic refresh is buffer-local and is
 off by default. While a Preview panel is active, selecting another Kotlin file
-refreshes it after `compose-preview-file-switch-delay`; selecting a non-Kotlin
-buffer hides the panel. Pressing `q` ends this follow session, and the next
-manual refresh starts it again. Set `compose-preview-follow-current-file` to nil
-to disable file following. `compose-preview-panel-width` controls the side-window
+activates its file session after `compose-preview-file-switch-delay`. Switching
+back to a fresh, complete file surface restores its images, Grid/Focus, filters,
+folds, zoom, and browsing position without Gradle or rendering. An inactive
+file's running task may complete and cache its results, but cannot replace the
+active file's panel. Only the latest waiting file request is retained.
+
+The cache holds up to `compose-preview-session-cache-size` file sessions
+(default 8), protecting the active and in-flight sessions. Source-file changes,
+saves anywhere in the same Gradle project, target changes, and Android project
+model updates invalidate cached results; inactive saves do not steal focus.
+This is file-lifecycle reuse, not Studio Fast Preview or incremental compilation.
+External dependency/resource changes that bypass Emacs saves and project-model
+notifications still require a manual refresh. Selecting a non-Kotlin buffer
+hides the panel without cancelling background rendering. Pressing `q` ends the
+follow session and cancels outstanding work; the next manual refresh starts it
+again. Set `compose-preview-follow-current-file` to nil to disable file following. `compose-preview-panel-width` controls the side-window
 width. Keybinding hints are shown at the top of the panel by default; set
 `compose-preview-show-key-hints` to nil to hide them.
 

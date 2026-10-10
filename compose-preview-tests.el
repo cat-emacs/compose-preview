@@ -179,7 +179,10 @@
 
 (ert-deftest compose-preview-refresh-starts-missing-project-model ()
   "A first Preview request actively starts Android project-model sync."
-  (let (refreshed status)
+  (let ((buffer-file-name "/tmp/project/First.kt")
+        (compose-preview--active-file "/tmp/project/First.kt")
+        (compose-preview--work-context nil)
+        refreshed status)
     (cl-letf (((symbol-function 'compose-preview--find-project-root)
                (lambda () "/tmp/project/"))
               ((symbol-function 'compose-preview--cached-target) #'ignore)
@@ -908,6 +911,211 @@
       (when-let* ((buffer (get-buffer compose-preview-results-buffer-name)))
         (kill-buffer buffer)))))
 
+(ert-deftest compose-preview-fallback-target-cache-does-not-cross-modules ()
+  "Without android-mode, a project cache cannot redirect another module."
+  (let ((compose-preview-use-android-mode-flavors nil)
+        (compose-preview--target-cache
+         '(("/tmp/project" . (:project-root "/tmp/project/"
+                              :module-root "/tmp/project/a/"
+                              :module-path ":a" :variant "debug")))))
+    (cl-letf (((symbol-function 'compose-preview--find-project-root)
+               (lambda () "/tmp/project/"))
+              ((symbol-function 'compose-preview--find-module-root)
+               (lambda () "/tmp/project/b/")))
+      (should (equal (plist-get (compose-preview--target) :module-path) ":b")))))
+
+(ert-deftest compose-preview-file-session-restores-valid-cache ()
+  "Reactivating a fresh file restores its surface without building."
+  (let ((source (generate-new-buffer " *preview-cache-source*"))
+        (compose-preview--sessions (make-hash-table :test #'equal))
+        (compose-preview--active-file nil)
+        (target '(:module-root "/tmp/" :project-root "/tmp/"))
+        shown)
+    (unwind-protect
+        (with-current-buffer source
+          (setq buffer-file-name "/tmp/Cached.kt")
+          (let ((session (compose-preview--session buffer-file-name)))
+            (setf (plist-get session :target) target
+                  (plist-get session :stamp) (compose-preview--source-stamp source)
+                  (plist-get session :stale) nil)
+            (cl-letf (((symbol-function 'compose-preview--target) (lambda (&rest _) target))
+                      ((symbol-function 'compose-preview--save-session-view) #'ignore)
+                      ((symbol-function 'compose-preview--show-session)
+                       (lambda (cached _buffer) (setq shown cached))))
+              (should (compose-preview--activate-file source))
+              (should (eq shown session))
+              (insert "changed")
+              (should-not (compose-preview--activate-file source)))))
+      (kill-buffer source))))
+
+(ert-deftest compose-preview-background-render-caches-without-replacing-panel ()
+  "An inactive file completion is cached and never paints the active file."
+  (let ((source (generate-new-buffer " *preview-background-source*"))
+        (compose-preview--sessions (make-hash-table :test #'equal))
+        (compose-preview--active-file "/tmp/B.kt")
+        (compose-preview--work-context '(:generation 1))
+        (item (make-compose-preview-item :id "a"))
+        painted)
+    (unwind-protect
+        (progn
+          (with-current-buffer source (setq buffer-file-name "/tmp/A.kt"))
+          (cl-letf (((symbol-function 'compose-preview--read-json)
+                     (lambda (_) '(("screenshotResults" . nil))))
+                    ((symbol-function 'compose-preview--result-items)
+                     (lambda (&rest _) (list item)))
+                    ((symbol-function 'compose-preview--render-results)
+                     (lambda (&rest _) (setq painted t)))
+                    ((symbol-function 'compose-preview--complete-work) #'ignore)
+                    ((symbol-function 'compose-preview--log) #'ignore))
+            (compose-preview--finish-render
+             (list :generation 1 :source-buffer source
+                   :stamp (compose-preview--source-stamp source)
+                   :target '(:module-root "/tmp/" :project-root "/tmp/")
+                   :render '(:results "unused" :output "/tmp/"))))
+          (should-not painted)
+          (should (equal (plist-get (gethash "/tmp/A.kt" compose-preview--sessions)
+                                    :items)
+                         (list item))))
+      (kill-buffer source))))
+
+(ert-deftest compose-preview-busy-chain-queues-latest-file ()
+  "Switch requests do not cancel work and only the latest file is queued."
+  (let ((source (generate-new-buffer " *preview-queue-source*"))
+        (compose-preview--active-file "/tmp/B.kt")
+        (compose-preview--work-context '(:source-file "/tmp/A.kt" :generation 1))
+        (compose-preview--queued-request nil)
+        (compose-preview--follow-refresh t))
+    (unwind-protect
+        (with-current-buffer source
+          (setq buffer-file-name "/tmp/B.kt")
+          (cl-letf (((symbol-function 'compose-preview--panel-status) #'ignore)
+                    ((symbol-function 'compose-preview--start-refresh)
+                     (lambda (&rest _) (ert-fail "concurrent chain"))))
+            (compose-preview-refresh)
+            (should (eq (plist-get compose-preview--queued-request :buffer) source))
+            (should (equal (plist-get compose-preview--work-context :source-file)
+                           "/tmp/A.kt"))))
+      (kill-buffer source))))
+
+(ert-deftest compose-preview-file-session-preserves-independent-view ()
+  "A and B retain separate filters, zoom, folds, and focus settings."
+  (let ((a (generate-new-buffer " *preview-view-a*"))
+        (b (generate-new-buffer " *preview-view-b*"))
+        (compose-preview-results-buffer-name " *preview-view-panel*")
+        (compose-preview--sessions (make-hash-table :test #'equal)))
+    (unwind-protect
+        (cl-letf (((symbol-function 'compose-preview--display-panel) #'ignore))
+          (with-current-buffer a (setq buffer-file-name "/tmp/A.kt"))
+          (with-current-buffer b (setq buffer-file-name "/tmp/B.kt"))
+          (compose-preview--show-session (compose-preview--session "/tmp/A.kt") a)
+          (with-current-buffer compose-preview-results-buffer-name
+            (setq compose-preview--search-query "Card"
+                  compose-preview--view-mode 'focus
+                  compose-preview--image-zoom 2.0)
+            (puthash "section-a" t compose-preview--collapsed-groups))
+          (compose-preview--save-session-view)
+          (compose-preview--show-session (compose-preview--session "/tmp/B.kt") b)
+          (with-current-buffer compose-preview-results-buffer-name
+            (should-not compose-preview--search-query)
+            (should (eq compose-preview--view-mode 'grid))
+            (should (= (hash-table-count compose-preview--collapsed-groups) 0)))
+          (compose-preview--save-session-view)
+          (compose-preview--show-session (compose-preview--session "/tmp/A.kt") a)
+          (with-current-buffer compose-preview-results-buffer-name
+            (should (equal compose-preview--search-query "Card"))
+            (should (eq compose-preview--view-mode 'focus))
+            (should (= compose-preview--image-zoom 2.0))
+            (should (gethash "section-a" compose-preview--collapsed-groups))))
+      (kill-buffer a)
+      (kill-buffer b)
+      (when-let* ((panel (get-buffer compose-preview-results-buffer-name)))
+        (kill-buffer panel)))))
+
+(ert-deftest compose-preview-session-invalidation-protects-in-flight-results ()
+  "Project edits invalidate file sessions including running snapshots."
+  (let ((compose-preview--sessions (make-hash-table :test #'equal)))
+    (let ((session (compose-preview--session "/tmp/A.kt")))
+      (setf (plist-get session :target) '(:project-root "/tmp/project/")
+            (plist-get session :stale) nil)
+      (compose-preview--invalidate-project-sessions "/tmp/project/")
+      (should (plist-get session :stale))
+      (should (= (plist-get session :revision) 1)))))
+
+(ert-deftest compose-preview-in-flight-invalidated-result-stays-stale ()
+  "A model change during rendering cannot publish a fresh cached session."
+  (let ((source (generate-new-buffer " *preview-stale-source*"))
+        (compose-preview--sessions (make-hash-table :test #'equal))
+        (compose-preview--active-file "/tmp/B.kt")
+        (compose-preview--work-context '(:generation 1)))
+    (unwind-protect
+        (progn
+          (with-current-buffer source (setq buffer-file-name "/tmp/A.kt"))
+          (let ((session (compose-preview--session "/tmp/A.kt")))
+            (setf (plist-get session :target) '(:project-root "/tmp/project/"))
+            (compose-preview--invalidate-project-sessions "/tmp/project/")
+            (cl-letf (((symbol-function 'compose-preview--read-json)
+                       (lambda (_) '(("screenshotResults" . nil))))
+                      ((symbol-function 'compose-preview--result-items)
+                       (lambda (&rest _) nil))
+                      ((symbol-function 'compose-preview--complete-work) #'ignore)
+                      ((symbol-function 'compose-preview--log) #'ignore))
+              (compose-preview--finish-render
+               (list :generation 1 :revision nil :source-buffer source
+                     :stamp (compose-preview--source-stamp source)
+                     :target '(:project-root "/tmp/project/" :module-root "/tmp/")
+                     :render '(:results "unused" :output "/tmp/"))))
+            (should (plist-get session :stale))))
+      (kill-buffer source))))
+
+(ert-deftest compose-preview-hidden-session-status-does-not-open-panel ()
+  "Background progress on a deactivated file cannot reopen its panel."
+  (let ((source (generate-new-buffer " *preview-inactive-source*"))
+        (compose-preview--sessions (make-hash-table :test #'equal))
+        (compose-preview--active-file nil)
+        (compose-preview--work-context '(:generation 1)))
+    (unwind-protect
+        (progn
+          (with-current-buffer source (setq buffer-file-name "/tmp/A.kt"))
+          (cl-letf (((symbol-function 'compose-preview--display-panel)
+                     (lambda (&rest _) (ert-fail "reopened inactive panel"))))
+            (compose-preview--panel-status source "/tmp/" "rendering"))
+          (should (equal (plist-get (compose-preview--session "/tmp/A.kt") :status)
+                         "rendering")))
+      (kill-buffer source))))
+
+(ert-deftest compose-preview-session-cache-is-lru-bounded ()
+  "Cache eviction keeps the active and rendering file sessions."
+  (let ((compose-preview--sessions (make-hash-table :test #'equal))
+        (compose-preview-session-cache-size 2)
+        (compose-preview--active-file "/tmp/C.kt")
+        (compose-preview--work-context '(:source-file "/tmp/B.kt")))
+    (dolist (file '("/tmp/A.kt" "/tmp/B.kt" "/tmp/C.kt"))
+      (compose-preview--session file))
+    (compose-preview--evict-sessions)
+    (should-not (gethash "/tmp/A.kt" compose-preview--sessions))
+    (should (= (hash-table-count compose-preview--sessions) 2))))
+
+(ert-deftest compose-preview-completion-starts-latest-waiting-file ()
+  "A completed render releases the chain before starting the queued file."
+  (let ((source (generate-new-buffer " *preview-drain-source*"))
+        (compose-preview--work-context '(:generation 7))
+        (compose-preview--active-file "/tmp/B.kt")
+        (compose-preview--queued-request nil)
+        started)
+    (unwind-protect
+        (progn
+          (with-current-buffer source (setq buffer-file-name "/tmp/B.kt"))
+          (setq compose-preview--queued-request (list :buffer source :all t :follow t))
+          (cl-letf (((symbol-function 'compose-preview--evict-sessions) #'ignore)
+                    ((symbol-function 'compose-preview--start-refresh)
+                     (lambda (&rest _)
+                       (should-not compose-preview--work-context)
+                       (setq started (current-buffer)))))
+            (compose-preview--complete-work '(:generation 7)))
+          (should (eq started source))
+          (should-not compose-preview--queued-request))
+      (kill-buffer source))))
+
 (ert-deftest compose-preview-stale-render-sentinel-is-ignored ()
   "A superseded renderer process cannot replace current panel results."
   (let ((compose-preview--generation 2)
@@ -966,7 +1174,7 @@
                        (setq scheduled (list function buffer))
                        'timer)))
             (compose-preview--follow-selected-buffer))
-          (should cancelled)
+          (should-not cancelled)
           (should (equal scheduled
                          (list #'compose-preview--follow-refresh-buffer source))))
       (kill-buffer source))))
@@ -1022,7 +1230,7 @@
                   ((symbol-function 'compose-preview--hide-panel)
                    (lambda () (setq hidden t))))
           (compose-preview--follow-selected-buffer)
-          (should cancelled)
+          (should-not cancelled)
           (should hidden))
       (kill-buffer other))))
 
