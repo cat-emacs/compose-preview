@@ -1,7 +1,7 @@
 ;;; compose-preview.el --- Android Studio Compose previews -*- lexical-binding: t; -*-
 
 ;; Version: 0.1.0
-;; Package-Requires: ((emacs "28.1") (transient "0.3.0"))
+;; Package-Requires: ((emacs "29.1") (transient "0.3.0"))
 ;; URL: https://github.com/cat-emacs/compose-preview
 ;; Keywords: tools android kotlin compose
 
@@ -21,7 +21,7 @@
 (require 'treesit nil t)
 (require 'android-mode nil t)
 
-;; Source folding is optional on Emacs versions without tree-sitter.
+;; Source folding is optional on builds without tree-sitter support.
 (declare-function treesit-parser-list "treesit.c")
 (declare-function treesit-buffer-root-node "treesit.c" (&optional language tag))
 (declare-function treesit-node-child-count "treesit.c" (node &optional named))

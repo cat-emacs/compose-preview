@@ -2,6 +2,9 @@
 
 Android Studio-style Jetpack Compose `@Preview` browsing from Emacs.
 
+Requires Emacs 29.1 or newer and Transient 0.3.0 or newer. Source folding also
+requires tree-sitter support and an installed Kotlin grammar; rendering does not.
+
 Previews are rendered by `compose-preview-renderer`, the standalone layoutlib
 renderer that Android Studio publishes and uses for its own Compose screenshot
 support. Nothing is injected into the project: no generated sources, no extra
