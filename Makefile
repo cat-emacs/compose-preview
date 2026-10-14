@@ -31,7 +31,7 @@ install-deps:
 	  "$(ANDROID_PROJECT_DIR)"
 	$(BATCH) $(ARCHIVES) \
 	  --eval "(require 'package-vc)" \
-	  --eval "(unless (package-installed-p 'android-project) (package-vc-install-from-checkout \"$(ANDROID_PROJECT_DIR)\"))"
+	  --eval "(unless (package-installed-p 'android-project) (package-vc-install-from-checkout \"$(ANDROID_PROJECT_DIR)\" \"android-project\"))"
 
 lint:
 	$(BATCH) $(ARCHIVES) $(LOAD_PATH) \
