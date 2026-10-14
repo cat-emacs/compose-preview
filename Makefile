@@ -1,10 +1,12 @@
 EMACS ?= emacs
 BATCH = $(EMACS) --batch --quick
 TEST_DEPS_DIR ?= .test-deps
+PACKAGE_USER_DIR ?= $(abspath $(TEST_DEPS_DIR)/elpa)
 ANDROID_PROJECT_DIR ?= $(abspath $(TEST_DEPS_DIR)/android-project)
 LOAD_PATH = -L . -L "$(ANDROID_PROJECT_DIR)"
 
-ARCHIVES = --eval "(require 'package)" \
+ARCHIVES = --eval "(setq package-user-dir \"$(PACKAGE_USER_DIR)\")" \
+           --eval "(require 'package)" \
            --eval "(add-to-list 'package-archives '(\"gnu\" . \"https://elpa.gnu.org/packages/\") t)" \
            --eval "(add-to-list 'package-archives '(\"melpa\" . \"https://melpa.org/packages/\") t)" \
            --eval "(package-initialize)"
@@ -27,6 +29,9 @@ install-deps:
 	test -d "$(ANDROID_PROJECT_DIR)/.git" || \
 	  git clone --depth 1 https://github.com/cat-emacs/android-project \
 	  "$(ANDROID_PROJECT_DIR)"
+	$(BATCH) $(ARCHIVES) \
+	  --eval "(require 'package-vc)" \
+	  --eval "(unless (package-installed-p 'android-project) (package-vc-install-from-checkout \"$(ANDROID_PROJECT_DIR)\"))"
 
 lint:
 	$(BATCH) $(ARCHIVES) $(LOAD_PATH) \
