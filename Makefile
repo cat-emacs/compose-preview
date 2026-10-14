@@ -5,6 +5,7 @@ ANDROID_MODE_DIR ?= $(abspath $(TEST_DEPS_DIR)/android-mode)
 LOAD_PATH = -L . -L "$(ANDROID_MODE_DIR)"
 
 ARCHIVES = --eval "(require 'package)" \
+           --eval "(add-to-list 'package-archives '(\"gnu\" . \"https://elpa.gnu.org/packages/\") t)" \
            --eval "(add-to-list 'package-archives '(\"melpa\" . \"https://melpa.org/packages/\") t)" \
            --eval "(package-initialize)"
 
