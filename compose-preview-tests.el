@@ -7,7 +7,7 @@
 ;;; Code:
 
 (require 'ert)
-(require 'android-mode)
+(require 'android-project)
 (require 'compose-preview)
 
 (ert-deftest compose-preview-module-paths ()
@@ -152,7 +152,7 @@
                        model source "Second")))
       (delete-file source))))
 
-(ert-deftest compose-preview-target-prefers-android-mode-source-metadata ()
+(ert-deftest compose-preview-target-prefers-android-project-source-metadata ()
   "Target lookup follows Android Studio-style module metadata for KMP files."
   (cl-letf (((symbol-function 'compose-preview--find-project-root)
              (lambda () "/tmp/project/"))
@@ -288,7 +288,7 @@
                        "desktopTest"))
         (should refreshed)))))
 
-(ert-deftest compose-preview-target-refreshes-stale-cache-from-android-mode ()
+(ert-deftest compose-preview-target-refreshes-stale-cache-from-android-project ()
   "Android-mode source metadata should replace stale in-memory targets."
   (cl-letf (((symbol-function 'compose-preview--find-project-root)
              (lambda () "/tmp/project/"))
@@ -318,8 +318,8 @@
               :variant "androidMain"
               :preview-task "assembleAndroidMain"))))))
 
-(ert-deftest compose-preview-cached-target-upgrades-to-android-mode-variant ()
-  "Cached module targets should use android-mode's real variant metadata."
+(ert-deftest compose-preview-cached-target-upgrades-to-android-project-variant ()
+  "Cached module targets should use android-project's real variant metadata."
   (cl-letf (((symbol-function 'compose-preview--find-project-root)
              (lambda () "/tmp/project/"))
             ((symbol-function 'compose-preview--android-flavors-available-p)
@@ -349,8 +349,8 @@
               :variant "androidMain"
               :preview-task "assembleAndroidMain"))))))
 
-(ert-deftest compose-preview-force-prompt-uses-android-mode-module-root ()
-  "Prompted android-mode modules keep their Gradle metadata module root."
+(ert-deftest compose-preview-force-prompt-uses-android-project-module-root ()
+  "Prompted android-project modules keep their Gradle metadata module root."
   (cl-letf (((symbol-function 'compose-preview--find-project-root)
              (lambda () "/tmp/project/"))
             ((symbol-function 'compose-preview--find-module-root)
@@ -1052,8 +1052,8 @@
         (kill-buffer buffer)))))
 
 (ert-deftest compose-preview-fallback-target-cache-does-not-cross-modules ()
-  "Without android-mode, a project cache cannot redirect another module."
-  (let ((compose-preview-use-android-mode-flavors nil)
+  "Without android-project, a project cache cannot redirect another module."
+  (let ((compose-preview-use-android-project-flavors nil)
         (compose-preview--target-cache
          '(("/tmp/project" . (:project-root "/tmp/project/"
                               :module-root "/tmp/project/a/"

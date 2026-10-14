@@ -1,7 +1,7 @@
 ;;; compose-preview.el --- Android Studio Compose previews -*- lexical-binding: t; -*-
 
 ;; Version: 0.1.0
-;; Package-Requires: ((emacs "29.1") (transient "0.3.0"))
+;; Package-Requires: ((emacs "29.1") (transient "0.3.0") (android-project "0.1.0"))
 ;; URL: https://github.com/cat-emacs/compose-preview
 ;; Keywords: tools android kotlin compose
 
@@ -19,7 +19,10 @@
 (require 'subr-x)
 (require 'transient)
 (require 'treesit nil t)
-(require 'android-mode nil t)
+(require 'android-project)
+
+(defvaralias 'compose-preview-use-android-mode-flavors
+  'compose-preview-use-android-project-flavors)
 
 ;; Source folding is optional on builds without tree-sitter support.
 (declare-function treesit-parser-list "treesit.c")
@@ -40,21 +43,21 @@
        default-directory))
   "Directory containing compose-preview package files.")
 
-(declare-function android-current-target "android-mode"
+(declare-function android-current-target "android-project"
                   (&optional prompt file project-root))
-(declare-function android-project-model-status "android-mode"
+(declare-function android-project-model-status "android-project"
                   (&optional project-root))
-(declare-function android-refresh-project-model "android-mode"
+(declare-function android-refresh-project-model "android-project"
                   (&optional project-root callback))
-(declare-function android-project-target "android-mode"
+(declare-function android-project-target "android-project"
                   (module &optional variant project-root refresh))
-(declare-function android-project-targets "android-mode"
+(declare-function android-project-targets "android-project"
                   (&optional project-root refresh))
-(declare-function android-project-variants "android-mode"
+(declare-function android-project-variants "android-project"
                   (&optional project-root refresh))
 (defvar android-project-model-updated-hook)
 (defvar android-project-model-state-changed-hook)
-(declare-function android-target-for-source-file "android-mode"
+(declare-function android-target-for-source-file "android-project"
                   (file &optional project-root refresh))
 
 (defgroup compose-preview nil
@@ -120,8 +123,8 @@ Eviction releases image and view metadata, not generated files on disk."
   :type 'boolean
   :group 'compose-preview)
 
-(defcustom compose-preview-use-android-mode-flavors t
-  "Whether to reuse android-mode's module and variant discovery."
+(defcustom compose-preview-use-android-project-flavors t
+  "Whether to reuse android-project's module and variant discovery."
   :type 'boolean
   :group 'compose-preview)
 
@@ -935,11 +938,11 @@ Preserve the selected window because this can run from `post-command-hook'."
                                ":")))))
 
 (defun compose-preview--module-name (module-path)
-  "Return android-mode module name for MODULE-PATH."
+  "Return android-project module name for MODULE-PATH."
   (string-remove-prefix ":" module-path))
 
 (defun compose-preview--module-root-from-name (project-root module-name)
-  "Return module root under PROJECT-ROOT for android-mode MODULE-NAME."
+  "Return module root under PROJECT-ROOT for android-project MODULE-NAME."
   (file-name-as-directory
    (expand-file-name
     (replace-regexp-in-string ":" "/" module-name)
@@ -954,10 +957,10 @@ Preserve the selected window because this can run from `post-command-hook'."
           :variant (plist-get entry :variant)
           :preview-task (plist-get entry :preview-task))))
 
-(defun compose-preview--target-from-android-mode (project-root &optional refresh)
-  "Return current source target from android-mode under PROJECT-ROOT.
+(defun compose-preview--target-from-android-project (project-root &optional refresh)
+  "Return current source target from android-project under PROJECT-ROOT.
 With REFRESH non-nil, refresh Android project metadata first."
-  (when (and compose-preview-use-android-mode-flavors
+  (when (and compose-preview-use-android-project-flavors
              buffer-file-name
              (fboundp 'android-target-for-source-file))
     (compose-preview--target-from-android-entry
@@ -967,7 +970,7 @@ With REFRESH non-nil, refresh Android project metadata first."
         buffer-file-name project-root refresh)))))
 
 (defun compose-preview--prompt-android-target (project-root)
-  "Prompt for an Android target under PROJECT-ROOT through android-mode."
+  "Prompt for an Android target under PROJECT-ROOT through android-project."
   (when (compose-preview--android-flavors-available-p)
     (compose-preview--target-from-android-entry
      project-root
@@ -985,7 +988,7 @@ With REFRESH non-nil, refresh Android project metadata first."
         (push project-root compose-preview--metadata-refresh-roots)
         (compose-preview--log
          "refreshing stale Android KMP preview metadata for %s" project-root)
-        (or (compose-preview--target-from-android-mode project-root t) target))
+        (or (compose-preview--target-from-android-project project-root t) target))
     target))
 
 (defun compose-preview--sanitize (value)
@@ -1395,14 +1398,14 @@ MultiPreview functions are recognized through fresh compiled discovery."
     found))
 
 (defun compose-preview--android-flavors-available-p ()
-  "Return non-nil when public android-mode target APIs are available."
-  (and compose-preview-use-android-mode-flavors
+  "Return non-nil when public android-project target APIs are available."
+  (and compose-preview-use-android-project-flavors
        (fboundp 'android-project-variants)
        (fboundp 'android-project-target)
        (fboundp 'android-current-target)))
 
 (defun compose-preview--android-variants (project-root module)
-  "Return android-mode variants under PROJECT-ROOT for MODULE, or nil."
+  "Return android-project variants under PROJECT-ROOT for MODULE, or nil."
   (when (compose-preview--android-flavors-available-p)
     (ignore-errors
       (delete-dups
@@ -1414,7 +1417,7 @@ MultiPreview functions are recognized through fresh compiled discovery."
          (android-project-variants project-root)))))))
 
 (defun compose-preview--android-target-for-module (project-root module variant)
-  "Return android-mode target metadata for PROJECT-ROOT, MODULE and VARIANT."
+  "Return android-project target metadata for PROJECT-ROOT, MODULE and VARIANT."
   (when (compose-preview--android-flavors-available-p)
     (compose-preview--target-from-android-entry
      project-root
@@ -1423,7 +1426,7 @@ MultiPreview functions are recognized through fresh compiled discovery."
 
 (defun compose-preview--read-variant-for-module (project-root module force-prompt)
   "Return a variant under PROJECT-ROOT for MODULE.
-When FORCE-PROMPT is non-nil, prompt with android-mode when possible."
+When FORCE-PROMPT is non-nil, prompt with android-project when possible."
   (if noninteractive
       compose-preview-default-variant
     (if (compose-preview--android-flavors-available-p)
@@ -1444,7 +1447,7 @@ When FORCE-PROMPT is non-nil, prompt with android-mode when possible."
 
 (defun compose-preview--android-project-status (project-root)
   "Return Android project model status for PROJECT-ROOT, when available."
-  (when (and compose-preview-use-android-mode-flavors
+  (when (and compose-preview-use-android-project-flavors
              (fboundp 'android-project-model-status))
     (ignore-errors (android-project-model-status project-root))))
 
@@ -1456,14 +1459,14 @@ When FORCE-PROMPT is non-nil, prompt with android-mode when possible."
 
 (defun compose-preview--target (&optional force-prompt)
   "Return plist describing the preview target.
-When FORCE-PROMPT is non-nil, prompt for module and variant via android-mode."
+When FORCE-PROMPT is non-nil, prompt for module and variant via android-project."
   (let* ((project-root (or (compose-preview--find-project-root)
                            (user-error "Could not find project root: no gradlew")))
          (metadata-target
           (and (not force-prompt)
                (compose-preview--refresh-stale-kmp-target
                 project-root
-                (compose-preview--target-from-android-mode project-root))))
+                (compose-preview--target-from-android-project project-root))))
          (cached-target (compose-preview--cached-target project-root))
          (source-module-root (compose-preview--find-module-root))
          (cached
@@ -1481,7 +1484,7 @@ When FORCE-PROMPT is non-nil, prompt for module and variant via android-mode."
       (if metadata-target
         (progn
           (compose-preview--log
-           "selected target from android-mode module=%s variant=%s module-root=%s project-root=%s"
+           "selected target from android-project module=%s variant=%s module-root=%s project-root=%s"
            (plist-get metadata-target :module-path)
            (plist-get metadata-target :variant)
            (plist-get metadata-target :module-root)
@@ -1496,7 +1499,7 @@ When FORCE-PROMPT is non-nil, prompt for module and variant via android-mode."
             (if android-target
                 (progn
                   (compose-preview--log
-                   "using android-mode target module=%s variant=%s module-root=%s root=%s"
+                   "using android-project target module=%s variant=%s module-root=%s root=%s"
                    (plist-get android-target :module-path)
                    (plist-get android-target :variant)
                    (plist-get android-target :module-root)
@@ -1531,7 +1534,7 @@ When FORCE-PROMPT is non-nil, prompt for module and variant via android-mode."
                                (compose-preview--android-target-for-module
                                 project-root module-name variant)))
                     (compose-preview--log
-                     "selected target from android-mode module=%s variant=%s module-root=%s project-root=%s"
+                     "selected target from android-project module=%s variant=%s module-root=%s project-root=%s"
                      (plist-get android-target :module-path)
                      (plist-get android-target :variant)
                      (plist-get android-target :module-root)
@@ -3484,8 +3487,8 @@ running; only the newest waiting file request is retained."
 
 (defun compose-preview--start-refresh (&optional variant)
   "Asynchronously build and render previews for the current Android module.
-VARIANT defaults to the selected android-mode variant.  With a prefix argument,
-prompt for the module and full variant name."
+VARIANT defaults to the selected Android project variant.
+With a prefix argument, prompt for the module and full variant name."
   (interactive)
   (let* ((source-buffer (current-buffer))
          (project-root (compose-preview--find-project-root)))

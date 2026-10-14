@@ -1,8 +1,8 @@
 EMACS ?= emacs
 BATCH = $(EMACS) --batch --quick
 TEST_DEPS_DIR ?= .test-deps
-ANDROID_MODE_DIR ?= $(abspath $(TEST_DEPS_DIR)/android-mode)
-LOAD_PATH = -L . -L "$(ANDROID_MODE_DIR)"
+ANDROID_PROJECT_DIR ?= $(abspath $(TEST_DEPS_DIR)/android-project)
+LOAD_PATH = -L . -L "$(ANDROID_PROJECT_DIR)"
 
 ARCHIVES = --eval "(require 'package)" \
            --eval "(add-to-list 'package-archives '(\"gnu\" . \"https://elpa.gnu.org/packages/\") t)" \
@@ -24,9 +24,9 @@ install-deps:
 	$(BATCH) $(ARCHIVES) \
 	  --eval "(package-refresh-contents)" \
 	  --eval "(package-install 'package-lint)"
-	test -d "$(ANDROID_MODE_DIR)/.git" || \
-	  git clone --depth 1 https://github.com/cat-emacs/android-mode \
-	  "$(ANDROID_MODE_DIR)"
+	test -d "$(ANDROID_PROJECT_DIR)/.git" || \
+	  git clone --depth 1 https://github.com/cat-emacs/android-project \
+	  "$(ANDROID_PROJECT_DIR)"
 
 lint:
 	$(BATCH) $(ARCHIVES) $(LOAD_PATH) \
@@ -42,9 +42,9 @@ build:
 	  -f batch-byte-compile compose-preview.el
 
 test:
-	test -f "$(ANDROID_MODE_DIR)/android-mode.el"
+	test -f "$(ANDROID_PROJECT_DIR)/android-project.el"
 	$(BATCH) $(ARCHIVES) $(LOAD_PATH) \
-	  -l "$(ANDROID_MODE_DIR)/android-mode.el" \
+	  -l "$(ANDROID_PROJECT_DIR)/android-project.el" \
 	  -l compose-preview.el \
 	  -l compose-preview-tests.el \
 	  --eval "(ert-run-tests-batch-and-exit)"

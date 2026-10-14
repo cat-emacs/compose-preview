@@ -20,7 +20,7 @@ It groups results by Android Studio's `@Preview(group = "...")` setting and
 renders each group as a collapsible section; ungrouped previews appear under
 `Default`. Saving can also trigger a debounced refresh when
 `compose-preview-auto-refresh-mode` is enabled in the source buffer. When
-`android-mode` is available, the panel also reflects project-model syncing,
+`android-project` is available, the panel also reflects project-model syncing,
 staleness, and failure. A last-known target and rendered images remain usable
 while Gradle refreshes; a successful model update invalidates target metadata
 and schedules one debounced Preview refresh.
@@ -299,6 +299,22 @@ These checks are focused runtime validation rather than repository test
 fixtures: this personal configuration repository does not add new test files.
 The existing ERT suite asserts the adapter boundary, AGP version gate, required
 artifact keys, and user-facing configuration diagnostics.
+
+## Installation
+
+```elisp
+(use-package android-project
+  :vc (:url "https://github.com/cat-emacs/android-project"))
+(use-package compose-preview
+  :vc (:url "https://github.com/cat-emacs/compose-preview")
+  :commands compose-preview)
+```
+
+Android target metadata comes from android-project; android-mode and adb are
+not required. The renderer, Preview-specific Gradle task, and desktop/KMP
+fallback paths remain owned by compose-preview. The old
+`compose-preview-use-android-mode-flavors` option aliases
+`compose-preview-use-android-project-flavors`.
 
 ## Configuration
 
