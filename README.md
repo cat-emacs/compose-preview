@@ -24,7 +24,16 @@ and schedules one debounced Preview refresh.
 
 ### Android Studio source alignment (2026-10-10)
 
-Audited checkout: `tools/adt/idea` `bba282350237`, `tools/base` `f8b1f24565f2`.
+Initial audit: `tools/adt/idea` `bba282350237`, `tools/base` `f8b1f24565f2`.
+Latest audited checkout: `tools/adt/idea` `d8518b02c677`, `tools/base` `892571744eeb`.
+
+- `eb0328f5d0b`/`69c22dd0ed6` preserve Focus-mode configuration and user zoom
+  across refreshes. Temporary per-annotation overrides here follow that rule.
+- `afdbcbd403c` folds Preview source bodies through PSI; the optional Emacs
+  implementation uses Kotlin tree-sitter plus compiled MultiPreview discovery.
+- `adc4145e60a`/`a9d6fc92471` share ComposeViewInfo and emit companion bounds in
+  standalone-render. The optional reader follows that protocol but remains
+  unavailable with the currently published alpha16 renderer.
 
 - Studio `2efbd2291cb` releases source-file references and clears surface flows
   on disposal. File sessions here use file keys, bounded caches, and release
@@ -79,6 +88,10 @@ a panel on the right and returns immediately. Inside the panel:
   declaration;
 - `g` refreshes from its associated source buffer;
 - `l` opens the Gradle and renderer log;
+- `d` temporarily selects a Studio `id:` or `spec:` device for the selected card;
+- `s` sets temporary width/height in dp (disables system decorations);
+- `r` resets that card to the source-defined configuration;
+- `i` opens the component tree when the renderer emits companion bounds;
 - `q` closes the side window.
 
 Grid sections follow Android Studio organization groups: every instance of
@@ -135,6 +148,46 @@ again. Set `compose-preview-follow-current-file` to nil to disable file followin
 `compose-preview-panel-width` controls the side-window
 width. Keybinding hints are shown at the top of the panel by default; set
 `compose-preview-show-key-hints` to nil to hide them.
+
+### Temporary Preview configuration
+
+Select a card (or use Focus mode) and press `d`/`s` to change its render
+configuration without editing `@Preview` or Gradle files. Changes are keyed by
+annotation Preview ID; parameterized instances of the same annotation share
+that override. Changing the source-defined device/dimensions clears an older
+override. `r` restores the original annotation settings.
+
+Configuration changes require a fresh compiled module model and saved relevant
+buffers. They run only the renderer, never Gradle; if the model is stale, save
+and refresh first. Controls reject changes while rendering is in progress.
+Focus, manual zoom, filters, folds, and the selected card are retained. This is
+not live canvas dragging or an interactive running composition.
+
+### Preview source folding
+
+`M-x compose-preview-fold-source` (`F` in the source command menu) folds only
+multiline block bodies of Preview functions using the Kotlin tree-sitter parser.
+Imports and aliases for official `Preview`/`Composable` are recognized directly;
+custom MultiPreview annotations are recognized through fresh compiled model
+discovery. Ordinary functions and functions nested inside other function bodies
+are not folded. Edits clear the overlays; `compose-preview-unfold-source` (`U`)
+removes them explicitly. No parser means an explicit unsupported message,
+not a regex-only folding fallback. Wildcard imports require compiled discovery.
+
+### Optional component bounds
+
+The reader accepts Studio's official `<image-stem>.bounds.json` wire format:
+component name, source filename/line/package hash, physical-pixel bounds, and
+children. `i` opens a component tree with source links. Unknown source locations
+remain non-navigable; other source files require explicit selection and
+filename/package validation. Missing, malformed, oversized, or out-of-output
+companions do not affect PNG rendering. A deepest-node physical-pixel hit-test
+helper is provided for future image interactions; image-click selection is not
+yet wired up.
+
+The pinned renderer `0.0.1-alpha16` does **not** emit these files. Component
+inspection therefore reports unsupported until a compatible renderer produces
+real companion data. No renderer upgrade or fake bounds generation is implied.
 
 ### Preview discovery
 

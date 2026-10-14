@@ -18,7 +18,19 @@
 (require 'seq)
 (require 'subr-x)
 (require 'transient)
+(require 'treesit nil t)
 (require 'android-mode nil t)
+
+;; Source folding is optional on Emacs versions without tree-sitter.
+(declare-function treesit-parser-list "treesit.c")
+(declare-function treesit-buffer-root-node "treesit.c" (&optional language tag))
+(declare-function treesit-node-child-count "treesit.c" (node &optional named))
+(declare-function treesit-node-child "treesit.c" (node n &optional named))
+(declare-function treesit-node-type "treesit.c" (node))
+(declare-function treesit-node-start "treesit.c" (node))
+(declare-function treesit-node-end "treesit.c" (node))
+(declare-function treesit-node-text "treesit" (node &optional no-property))
+(declare-function treesit-node-child-by-field-name "treesit.c" (node field-name))
 
 (defconst compose-preview--package-directory
   (file-name-directory
@@ -170,6 +182,12 @@ Eviction releases image and view metadata, not generated files on disk."
 (defvar compose-preview--work-context nil
   "Context owning the serialized Gradle/compiler/renderer chain.")
 
+(defvar compose-preview--render-file nil
+  "Source file owning the render settings currently being prepared.")
+
+(defvar compose-preview--render-only nil
+  "Non-nil when refreshing only from a validated compiled module model.")
+
 (defvar compose-preview--queued-request nil
   "Latest request waiting for the serialized rendering chain.")
 
@@ -247,6 +265,9 @@ Each entry is (PROJECT-ROOT . TARGET), where TARGET is a plist containing
   parameter-count
   parameter-name
   files
+  preview-id
+  configuration
+  bounds
   error)
 
 (defface compose-preview-section-heading
@@ -392,6 +413,10 @@ Each entry is (PROJECT-ROOT . TARGET), where TARGET is a plist containing
            (,(kbd "w") . compose-preview-copy-image)
            (,(kbd "g") . compose-preview-panel-refresh)
            (,(kbd "l") . compose-preview-open-log)
+           (,(kbd "d") . compose-preview-set-device)
+           (,(kbd "s") . compose-preview-set-size)
+           (,(kbd "r") . compose-preview-reset-configuration)
+           (,(kbd "i") . compose-preview-inspect-components)
            (,(kbd "v") . compose-preview-toggle-view)
            (,(kbd "/") . compose-preview-search)
            (,(kbd "G") . compose-preview-filter-group)
@@ -433,6 +458,7 @@ Each entry is (PROJECT-ROOT . TARGET), where TARGET is a plist containing
                (list :key key :stale t :target nil :stamp nil :method nil
                      :revision nil :artifacts nil :items nil :images nil :empty nil
                      :module-root nil :status nil :face nil :view nil
+                     :overrides (make-hash-table :test #'equal)
                      :point nil :anchor nil :log nil :used 0)
                compose-preview--sessions)))
 
@@ -715,6 +741,7 @@ ITEM may be a Preview ID string or a legacy Preview item."
       (with-current-buffer buffer
         (let ((compose-preview--refresh-all-in-file (plist-get request :all))
               (compose-preview--follow-refresh (plist-get request :follow))
+              (compose-preview--render-only (plist-get request :render-only))
               (current-prefix-arg (plist-get request :prefix)))
           (condition-case err
               (compose-preview--start-refresh (plist-get request :variant))
@@ -1125,6 +1152,108 @@ With REFRESH non-nil, refresh Android project metadata first."
       (insert-file-contents file)
       (let ((buffer-file-name file))
         (compose-preview--current-buffer-class-prefix)))))
+
+(defvar-local compose-preview--source-folds nil
+  "Overlays hiding Preview function bodies in the source buffer.")
+
+(defun compose-preview--clear-source-folds (&rest _)
+  "Remove source Preview fold overlays after edits or mode deactivation."
+  (mapc #'delete-overlay compose-preview--source-folds)
+  (setq compose-preview--source-folds nil))
+
+(defun compose-preview--compiled-preview-methods ()
+  "Return exact Preview JVM method names from fresh compiled module discovery."
+  (when-let* ((target (ignore-errors (compose-preview--target)))
+              (cached (compose-preview--reusable-module-model target)))
+    (mapcar (lambda (preview) (compose-preview--json-get preview "methodFQN"))
+            (compose-preview--select-model-previews
+             (plist-get cached :model) buffer-file-name nil))))
+
+(defun compose-preview--node-children (node)
+  "Return NODE's named tree-sitter children in source order."
+  (let (children)
+    (dotimes (index (treesit-node-child-count node t))
+      (push (treesit-node-child node index t) children))
+    (nreverse children)))
+
+(defun compose-preview-fold-source ()
+  "Fold multiline Preview function bodies using Kotlin tree-sitter structure.
+Known direct Preview annotations are recognized before compilation.  Custom
+MultiPreview functions are recognized through fresh compiled discovery."
+  (interactive)
+  (unless (and (fboundp 'treesit-parser-list)
+               (fboundp 'treesit-buffer-root-node)
+               (treesit-parser-list))
+    (user-error "Kotlin tree-sitter parser is required for safe Preview folding"))
+  (let ((root (treesit-buffer-root-node 'kotlin))
+        (methods (compose-preview--compiled-preview-methods))
+        (preview-aliases '("androidx.compose.ui.tooling.preview.Preview"))
+        (composable-aliases '("androidx.compose.runtime.Composable")))
+    (save-excursion
+      (goto-char (point-min))
+      (while (re-search-forward
+              "^[[:space:]]*import[[:space:]]+\\(?:androidx.compose.ui.tooling.preview.Preview\\|androidx.compose.runtime.Composable\\)\\(?:[[:space:]]+as[[:space:]]+\\([A-Za-z_][A-Za-z0-9_]*\\)\\)?" nil t)
+        (if (string-match-p "Composable" (match-string-no-properties 0))
+            (push (or (match-string-no-properties 1) "Composable") composable-aliases)
+          (push (or (match-string-no-properties 1) "Preview") preview-aliases))))
+    (compose-preview--clear-source-folds)
+    (add-to-invisibility-spec 'compose-preview-source-fold)
+    (cl-labels
+        ((visit (node)
+           (if (equal (treesit-node-type node) "function_declaration")
+               (let* ((start (treesit-node-start node))
+                      (text (treesit-node-text node t))
+                      (name-node (or (treesit-node-child-by-field-name node "name")
+                                     (seq-find (lambda (child)
+                                                 (member (treesit-node-type child)
+                                                         '("simple_identifier" "identifier")))
+                                               (compose-preview--node-children node))))
+                      (name (and name-node (treesit-node-text name-node t)))
+                      (body (seq-find (lambda (child)
+                                        (equal (treesit-node-type child) "function_body"))
+                                      (compose-preview--node-children node)))
+                      (body-start (and body (treesit-node-start body)))
+                      (body-end (and body (treesit-node-end body)))
+                      (annotations
+                       (when-let* ((modifiers (seq-find
+                                              (lambda (child) (equal (treesit-node-type child) "modifiers"))
+                                              (compose-preview--node-children node))))
+                         (string-join
+                          (mapcar (lambda (annotation) (treesit-node-text annotation t))
+                                  (seq-filter (lambda (child) (equal (treesit-node-type child) "annotation"))
+                                              (compose-preview--node-children modifiers))) "\n")))
+                      (direct (and annotations
+                                   (string-match-p "@androidx\\.compose\\.ui\\.tooling\\.preview\\.Preview\\_>" annotations)
+                                   (string-match-p "@androidx\\.compose\\.runtime\\.Composable\\_>" annotations)))
+                      (aliased
+                       (and annotations
+                            (seq-some (lambda (alias)
+                                        (string-match-p (concat "@" (regexp-quote alias) "\\_>") annotations))
+                                      preview-aliases)
+                            (seq-some (lambda (alias)
+                                        (string-match-p (concat "@" (regexp-quote alias) "\\_>") annotations))
+                                      composable-aliases)))
+                      (compiled (and name (member (compose-preview--kotlin-method-fqn start name) methods))))
+                 (when (and (or direct aliased compiled) body
+                            (eq (char-after body-start) ?{)
+                            (string-match-p "\n" text)
+                            (> (line-number-at-pos body-end) (line-number-at-pos body-start)))
+                   (let ((overlay (make-overlay (1+ body-start) (1- body-end))))
+                     (overlay-put overlay 'invisible 'compose-preview-source-fold)
+                     (overlay-put overlay 'isearch-open-invisible #'delete-overlay)
+                     (overlay-put overlay 'after-string (propertize "…" 'face 'shadow))
+                     (push overlay compose-preview--source-folds))))
+             (dolist (child (compose-preview--node-children node)) (visit child)))))
+      (visit root))
+    (add-hook 'after-change-functions #'compose-preview--clear-source-folds nil t)
+    (message "Folded %d Preview function bodies" (length compose-preview--source-folds))))
+
+(defun compose-preview-unfold-source ()
+  "Unfold all Preview function bodies in the current source buffer."
+  (interactive)
+  (compose-preview--clear-source-folds)
+  (remove-hook 'after-change-functions #'compose-preview--clear-source-folds t)
+  (remove-from-invisibility-spec 'compose-preview-source-fold))
 
 (defun compose-preview--looking-at-preview-annotation-p ()
   "Return non-nil when point is at a Compose @Preview annotation."
@@ -1660,6 +1789,27 @@ METHOD may be an unqualified name or a full JVM method name."
     (concat (compose-preview--json-get preview "methodFQN") "_"
             (compose-preview--sanitize (or name (number-to-string index))))))
 
+(defun compose-preview--configuration-baseline (annotation)
+  "Return source-defined device and dimensions from ANNOTATION."
+  (mapcar (lambda (key) (cons key (compose-preview--json-get annotation key)))
+          '("device" "widthDp" "heightDp" "showSystemUi")))
+
+(defun compose-preview--effective-annotation (id annotation)
+  "Apply session override for ID to a copy of ANNOTATION.
+Discard overrides if the source-defined device or dimensions have changed."
+  (let* ((session (gethash (or compose-preview--render-file compose-preview--active-file)
+                           compose-preview--sessions))
+         (overrides (and session (plist-get session :overrides)))
+         (override (and overrides (gethash id overrides)))
+         (baseline (compose-preview--configuration-baseline annotation))
+         (effective (copy-tree annotation)))
+    (when (and override (not (equal baseline (plist-get override :baseline))))
+      (remhash id overrides)
+      (setq override nil))
+    (dolist (pair (plist-get override :values))
+      (setf (alist-get (car pair) effective nil nil #'equal) (cdr pair)))
+    effective))
+
 (defun compose-preview--render-settings (model previews target &optional generation)
   "Write renderer settings for MODEL PREVIEWS and TARGET.
 Use GENERATION to isolate concurrent or superseded render attempts."
@@ -1677,15 +1827,17 @@ Use GENERATION to isolate concurrent or superseded render attempts."
       (cl-loop for annotation in (compose-preview--json-get preview "annotations")
                for index from 0
                do (let* ((id (compose-preview--preview-id preview annotation index))
+                         (effective (compose-preview--effective-annotation id annotation))
                          (entry
                           `(("previewType" . "COMPOSE")
                             ("methodFQN" . ,(compose-preview--json-get preview "methodFQN"))
                             ("previewId" . ,id)
                             ("methodParams" . ,(vconcat (compose-preview--json-get preview "methodParams")))
-                            ("previewParams" . ,(or annotation
+                            ("previewParams" . ,(or effective
                                                      (make-hash-table :test #'equal))))))
                     (puthash id
-                             (list :preview-name (compose-preview--json-get annotation "name")
+                             (list :configuration (compose-preview--configuration-baseline annotation)
+                                   :preview-name (compose-preview--json-get annotation "name")
                                    :group (compose-preview--json-get annotation "group")
                                    :source-file (compose-preview--json-get preview "sourceFile")
                                    :parameter-name
@@ -1898,6 +2050,66 @@ mode uses one scale shared by every visible Preview, like Studio's surface."
                            (compose-preview-item-id item)))
                   items)
         (car items))))
+
+(defun compose-preview--configuration-item ()
+  "Return the card at point or the focused Preview."
+  (or (compose-preview--current-item)
+      (and (eq compose-preview--view-mode 'focus) (compose-preview--focused-item))
+      (user-error "Select a Preview card first")))
+
+(defun compose-preview--apply-configuration (values)
+  "Apply temporary configuration VALUES to the selected annotation instance."
+  (let* ((item (compose-preview--configuration-item))
+         (source compose-preview--source-buffer)
+         (id (compose-preview-item-preview-id item))
+         (session (gethash (compose-preview--file-key source) compose-preview--sessions))
+         (target (and session (plist-get session :target))))
+    (unless (and id session (buffer-live-p source))
+      (user-error "No source session for this Preview"))
+    (when compose-preview--work-context
+      (user-error "Wait for rendering to finish before changing configuration"))
+    (unless (compose-preview--reusable-module-model target)
+      (user-error "Compiled model is out of date; save sources and refresh first"))
+    (let* ((overrides (plist-get session :overrides))
+           (old (gethash id overrides))
+           (merged (copy-tree (plist-get old :values))))
+      (if values
+          (progn
+            (dolist (pair values)
+              (setf (alist-get (car pair) merged nil nil #'equal) (cdr pair)))
+            (puthash id (list :baseline (compose-preview-item-configuration item)
+                              :values merged) overrides))
+        (remhash id overrides)))
+    (setf (plist-get session :stale) t)
+    (compose-preview--save-session-view)
+    (with-current-buffer source
+      (let ((compose-preview--render-only t)
+            (compose-preview--refresh-all-in-file t))
+        (compose-preview-refresh)))))
+
+(defun compose-preview-set-device (device)
+  "Render the selected Preview with temporary DEVICE, without editing source."
+  (interactive (list (read-string "Preview device (id:… or spec:…): ")))
+  (unless (string-match-p "\\`\\(?:id:\\|spec:\\).+" device)
+    (user-error "Use an Android Studio id: or spec: device string"))
+  (compose-preview--apply-configuration
+   (list (cons "device" device) (cons "widthDp" -1) (cons "heightDp" -1))))
+
+(defun compose-preview-set-size (width height)
+  "Render the selected Preview at WIDTH by HEIGHT dp without editing source.
+System decorations are disabled so Preview dimensions take effect."
+  (interactive (list (read-number "Preview width (dp): " 360)
+                     (read-number "Preview height (dp): " 640)))
+  (unless (and (integerp width) (> width 0) (<= width 10000)
+               (integerp height) (> height 0) (<= height 10000))
+    (user-error "Dimensions must be integers between 1 and 10000 dp"))
+  (compose-preview--apply-configuration
+   (list (cons "widthDp" width) (cons "heightDp" height) (cons "showSystemUi" :json-false))))
+
+(defun compose-preview-reset-configuration ()
+  "Restore source-defined configuration for the selected Preview."
+  (interactive)
+  (compose-preview--apply-configuration nil))
 
 (defun compose-preview--current-item ()
   "Return the Preview item at point, if any."
@@ -2121,7 +2333,7 @@ When PREVIEW is nil, use the Preview card at point."
              'face (or compose-preview--status-face 'mode-line-emphasis))))
     (when compose-preview-show-key-hints
       (insert (propertize
-               "TAB fold  n/p browse  v view  / search  G group  f/0/+/- scale  w copy  o source\n\n"
+               "TAB fold  n/p browse  v view  / search  G group  f/0/+/- scale  d device  s size  r reset  i components  w copy  o source\n\n"
                'face 'shadow)))
     (cond
      ((and (null visible) compose-preview--items)
@@ -2799,6 +3011,116 @@ INDEX and COUNT identify the provider value; RENDERER-NAME may override it."
             (section (compose-preview--section-title preview)))
         (and full (not (string= full section)) full))))
 
+(defun compose-preview--valid-bounds-tree-p (nodes &optional depth budget)
+  "Validate official bounds NODES with bounded DEPTH and node BUDGET."
+  (let ((depth (or depth 0)) (budget (or budget (list 5000))))
+    (and (listp nodes) (< depth 64)
+         (seq-every-p
+          (lambda (node)
+            (cl-decf (car budget))
+            (let ((bounds (compose-preview--json-get node "bounds")))
+              (and (> (car budget) 0)
+                   (stringp (compose-preview--json-get node "name"))
+                   (stringp (compose-preview--json-get node "fileName"))
+                   (integerp (compose-preview--json-get node "lineNumber"))
+                   (integerp (compose-preview--json-get node "packageHash"))
+                   (seq-every-p (lambda (key) (integerp (compose-preview--json-get bounds key)))
+                                '("left" "top" "right" "bottom"))
+                   (<= (compose-preview--json-get bounds "left")
+                       (compose-preview--json-get bounds "right"))
+                   (<= (compose-preview--json-get bounds "top")
+                       (compose-preview--json-get bounds "bottom"))
+                   (compose-preview--valid-bounds-tree-p
+                    (compose-preview--json-get node "children") (1+ depth) budget))))
+          nodes))))
+
+(defun compose-preview--read-bounds (output image-path)
+  "Read optional official companion bounds for IMAGE-PATH inside OUTPUT.
+Missing, malformed, oversized, or out-of-directory files have no capability."
+  (condition-case nil
+      (let* ((root (file-name-as-directory (file-truename output)))
+             (image (expand-file-name image-path root))
+             (file (concat (file-name-sans-extension image) ".bounds.json")))
+        (when (and (file-regular-p file) (file-in-directory-p (file-truename file) root)
+                   (< (file-attribute-size (file-attributes file)) (* 4 1024 1024)))
+          (let ((nodes (compose-preview--read-json file)))
+            (when (and nodes (compose-preview--valid-bounds-tree-p nodes)) nodes))))
+    (error nil)))
+
+(defun compose-preview--bounds-hit (nodes x y)
+  "Return the deepest node in NODES containing physical pixel point X,Y."
+  (let (hit)
+    (dolist (node nodes hit)
+      (let ((bounds (compose-preview--json-get node "bounds")))
+        (when (and (<= (compose-preview--json-get bounds "left") x)
+                   (< x (compose-preview--json-get bounds "right"))
+                   (<= (compose-preview--json-get bounds "top") y)
+                   (< y (compose-preview--json-get bounds "bottom")))
+          (setq hit (or (compose-preview--bounds-hit
+                         (compose-preview--json-get node "children") x y) node)))))))
+
+(defun compose-preview--package-hash (package)
+  "Return signed JVM string hash for PACKAGE, as used by Compose tooling."
+  (let ((hash 0)
+        (bytes (encode-coding-string package 'utf-16be t)))
+    (cl-loop for index from 0 below (length bytes) by 2
+             for unit = (+ (* 256 (aref bytes index)) (aref bytes (1+ index)))
+             do (setq hash (logand #xffffffff (+ (* hash 31) unit))))
+    (if (> hash #x7fffffff) (- hash #x100000000) hash)))
+
+(defun compose-preview--visit-component (node source)
+  "Visit NODE's validated source location using SOURCE as the initial context."
+  (let ((name (compose-preview--json-get node "fileName"))
+        (line (compose-preview--json-get node "lineNumber"))
+        (hash (compose-preview--json-get node "packageHash")))
+    (unless (and (stringp name) (not (string-empty-p name))
+                 (equal name (file-name-nondirectory name)) (> line 0))
+      (user-error "Component has no usable source location"))
+    (let ((file (and (buffer-live-p source) (buffer-file-name source))))
+      (unless (and file (equal name (file-name-nondirectory file))
+                   (or (= hash -1)
+                       (= hash (compose-preview--package-hash
+                                (or (compose-preview--source-file-package file) "")))))
+        (setq file (read-file-name (format "Locate %s: " name) nil nil t name)))
+      (unless (and (equal (file-name-nondirectory file) name)
+                   (or (= hash -1)
+                       (= hash (compose-preview--package-hash
+                                (or (compose-preview--source-file-package file) "")))))
+        (user-error "Selected source does not match component file/package"))
+      (find-file-other-window file)
+      (goto-char (point-min))
+      (forward-line (1- line)))))
+
+(defun compose-preview-inspect-components ()
+  "Show official component bounds for the selected Preview, when available."
+  (interactive)
+  (let* ((item (compose-preview--configuration-item))
+         (nodes (compose-preview-item-bounds item))
+         (source compose-preview--source-buffer)
+         (buffer (get-buffer-create "*Compose Preview Components*")))
+    (unless nodes
+      (user-error "Renderer has no component bounds output; current pinned version is unsupported"))
+    (with-current-buffer buffer
+      (special-mode)
+      (let ((inhibit-read-only t))
+        (erase-buffer)
+        (insert (format "%s — physical pixel bounds\n\n" (compose-preview-item-name item)))
+        (cl-labels
+            ((visit (children depth)
+               (dolist (node children)
+                 (insert (make-string (* depth 2) ?\s))
+                 (insert-text-button
+                  (or (compose-preview--json-get node "name") "Component")
+                  'follow-link t
+                  'action (lambda (_button) (compose-preview--visit-component node source)))
+                 (insert (format "  %S  %s:%d\n"
+                                 (compose-preview--json-get node "bounds")
+                                 (compose-preview--json-get node "fileName")
+                                 (compose-preview--json-get node "lineNumber")))
+                 (visit (compose-preview--json-get node "children") (1+ depth)))))
+          (visit nodes 0))))
+    (display-buffer buffer)))
+
 (defun compose-preview--result-items (results output &optional metadata)
   "Convert renderer RESULTS into preview items rooted at OUTPUT.
 Use METADATA keyed by preview id to preserve annotation display settings."
@@ -2827,6 +3149,9 @@ Use METADATA keyed by preview id to preserve annotation display settings."
                     preview-id))))
        (make-compose-preview-item
         :id id :name label
+        :preview-id preview-id
+        :configuration (plist-get details :configuration)
+        :bounds (and path (compose-preview--read-bounds output path))
         :declaring-class (string-join (butlast (split-string fqn "\\." t)) ".")
         :method method-name
         :method-fqn fqn
@@ -2912,7 +3237,15 @@ Use METADATA keyed by preview id to preserve annotation display settings."
             (compose-preview--panel-status
              source (plist-get target :module-root)
              (compose-preview--session-status session source)
-             (if (plist-get session :stale) 'warning (plist-get session :face)))))
+             (if (plist-get session :stale) 'warning (plist-get session :face))))
+          (when (plist-get context :preserve-view)
+            (with-current-buffer compose-preview-results-buffer-name
+              (when-let* ((session (gethash (compose-preview--file-key source)
+                                           compose-preview--sessions)))
+                (goto-char (or (compose-preview--anchor-position (plist-get session :anchor))
+                               (min (or (plist-get session :point) (point-min)) (point-max))))
+                (when-let* ((window (get-buffer-window (current-buffer) t)))
+                  (set-window-point window (point)))))))
         (compose-preview--log
          "rendered %d preview images; %d preview%s reported issues"
          rendered-count failed-count (if (= failed-count 1) "" "s"))
@@ -3048,8 +3381,9 @@ Use METADATA keyed by preview id to preserve annotation display settings."
                                           (file-name-nondirectory source-file))
                                      (plist-get target :module-path))))
       (condition-case err
-          (let ((launcher (compose-preview--launcher-spec model))
-                (render (compose-preview--render-settings
+          (let* ((compose-preview--render-file source-file)
+                 (launcher (compose-preview--launcher-spec model))
+                 (render (compose-preview--render-settings
                          model previews target (plist-get context :generation))))
             (setq context (plist-put context :model model)
                   context (plist-put context :previews previews)
@@ -3142,7 +3476,8 @@ running; only the newest waiting file request is retained."
               (list :buffer (current-buffer) :variant variant
                     :prefix current-prefix-arg
                     :all compose-preview--refresh-all-in-file
-                    :follow compose-preview--follow-refresh))
+                    :follow compose-preview--follow-refresh
+                    :render-only compose-preview--render-only))
         (compose-preview--panel-status
          (current-buffer) default-directory "waiting for current render…"))
     (compose-preview--start-refresh variant)))
@@ -3182,7 +3517,7 @@ prompt for the module and full variant name."
          (log-buffer (generate-new-buffer
                       (format "*Compose Preview Log: %s*" (file-name-nondirectory source-file))))
          (input-signature (compose-preview--track-inputs project-root))
-         (cached-model (and compose-preview--follow-refresh
+         (cached-model (and (or compose-preview--follow-refresh compose-preview--render-only)
                             (not compose-preview-force-clean-build)
                             (compose-preview--reusable-module-model target)))
          (process-environment
@@ -3200,6 +3535,9 @@ prompt for the module and full variant name."
          (session (compose-preview--session
                    (compose-preview--file-key source-buffer)))
          context process)
+    (when (and compose-preview--render-only (not cached-model))
+      (kill-buffer log-buffer)
+      (user-error "Compiled model is out of date; save sources and refresh first"))
     (when-let* ((old-log (plist-get session :log)))
       (when (buffer-live-p old-log) (kill-buffer old-log)))
     (setf (plist-get session :target) target
@@ -3224,6 +3562,7 @@ prompt for the module and full variant name."
                         :input-signature input-signature
                         :revision (plist-get session :revision)
                         :preview-method preview-method
+                        :preserve-view compose-preview--render-only
                         :follow-refresh compose-preview--follow-refresh
                         :gradle-model-file gradle-model-file
                         :model-file model-file :log-buffer log-buffer)
@@ -3272,7 +3611,9 @@ prompt for the module and full variant name."
    ("P" "Open panel" compose-preview-open-results)
    ("a" "Auto refresh" compose-preview-auto-refresh-mode)
    ("l" "Open log" compose-preview-open-log)
-   ("v" "Set variant" compose-preview-set-variant)])
+   ("v" "Set variant" compose-preview-set-variant)
+   ("F" "Fold Preview source" compose-preview-fold-source)
+   ("U" "Unfold Preview source" compose-preview-unfold-source)])
 
 (add-hook 'after-save-hook #'compose-preview--source-saved)
 (add-hook 'android-project-model-updated-hook

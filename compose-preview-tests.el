@@ -377,6 +377,146 @@
               :variant "debug"
               :preview-task "testDebugUnitTest"))))))
 
+(ert-deftest compose-preview-configuration-override-is-copy-and-resets-on-source-change ()
+  "Temporary configuration is isolated and invalidated by annotation changes."
+  (let* ((compose-preview--sessions (make-hash-table :test #'equal))
+         (compose-preview--active-file "/tmp/A.kt")
+         (session (compose-preview--session compose-preview--active-file))
+         (annotation '(("device" . "id:pixel_5") ("widthDp" . 100)))
+         (overrides (plist-get session :overrides)))
+    (puthash "preview" (list :baseline (compose-preview--configuration-baseline annotation)
+                            :values '(("widthDp" . 360) ("heightDp" . 640))) overrides)
+    (should (= (compose-preview--json-get
+                (compose-preview--effective-annotation "preview" annotation) "widthDp") 360))
+    (should (= (compose-preview--json-get annotation "widthDp") 100))
+    (compose-preview--effective-annotation "preview" '(("device" . "id:pixel_9")))
+    (should-not (gethash "preview" overrides))))
+
+(ert-deftest compose-preview-background-settings-use-own-file-overrides ()
+  "The rendering file, not the active surface, owns configuration overrides."
+  (let* ((compose-preview--sessions (make-hash-table :test #'equal))
+         (compose-preview--active-file "/tmp/B.kt")
+         (compose-preview--render-file "/tmp/A.kt")
+         (session (compose-preview--session "/tmp/A.kt"))
+         (annotation '(("widthDp" . 100))))
+    (puthash "preview" (list :baseline (compose-preview--configuration-baseline annotation)
+                            :values '(("widthDp" . 300))) (plist-get session :overrides))
+    (should (= (compose-preview--json-get
+                (compose-preview--effective-annotation "preview" annotation) "widthDp") 300))))
+
+(ert-deftest compose-preview-size-command-rejects-invalid-dimensions ()
+  "Invalid resize values cannot start rendering or mutate source."
+  (dolist (size '(0 -1 10001 3.5))
+    (should-error (compose-preview-set-size size 640) :type 'user-error)))
+
+(ert-deftest compose-preview-bounds-read-and-hit-test ()
+  "Official companion JSON enables deepest-node physical-pixel hit testing."
+  (let* ((root (make-temp-file "preview-bounds" t))
+         (child '(("name" . "Button") ("fileName" . "A.kt") ("lineNumber" . 4)
+                  ("packageHash" . -1) ("bounds" . (("left" . 10) ("top" . 20)
+                                                  ("right" . 100) ("bottom" . 80)))
+                  ("children" . nil)))
+         (parent `(("name" . "Column") ("fileName" . "A.kt") ("lineNumber" . 2)
+                   ("packageHash" . -1) ("bounds" . (("left" . 0) ("top" . 0)
+                                                   ("right" . 200) ("bottom" . 400)))
+                   ("children" . (,child)))))
+    (unwind-protect
+        (progn
+          (compose-preview--write-json (expand-file-name "A.bounds.json" root) (vector parent))
+          (let* ((nodes (compose-preview--read-bounds root "A.png"))
+                 (hit (compose-preview--bounds-hit nodes 40 40)))
+            (should (equal (compose-preview--json-get hit "name") "Button"))
+            (should-not (compose-preview--bounds-hit nodes 300 500)))
+          (should-not (compose-preview--read-bounds root "missing.png"))
+          (with-temp-file (expand-file-name "A.bounds.json" root) (insert "invalid JSON"))
+          (should-not (compose-preview--read-bounds root "A.png")))
+      (delete-directory root t))))
+
+(ert-deftest compose-preview-component-inspection-reports-missing-capability ()
+  "Pinned renderer without bounds must not fabricate component data."
+  (cl-letf (((symbol-function 'compose-preview--configuration-item)
+             (lambda () (make-compose-preview-item :id "preview"))))
+    (should-error (compose-preview-inspect-components) :type 'user-error)))
+
+(ert-deftest compose-preview-source-folding-requires-parser ()
+  "Missing Kotlin tree-sitter support is explicit and does not hide text."
+  (cl-letf (((symbol-function 'treesit-parser-list) (lambda () nil)))
+    (should-error (compose-preview-fold-source) :type 'user-error)))
+
+(ert-deftest compose-preview-source-folding-recognizes-import-aliases ()
+  "Folding respects annotation imports, ignores ordinary and nested functions."
+  (skip-unless (and (fboundp 'treesit-language-available-p)
+                    (treesit-language-available-p 'kotlin)))
+  (with-temp-buffer
+    (setq buffer-file-name "/tmp/A.kt")
+    (insert "import androidx.compose.runtime.Composable as C\n"
+            "import androidx.compose.ui.tooling.preview.Preview as P\n"
+            "@P\n@C\nfun Card() {\n Text(\"preview\")\n}\n"
+            "fun PreviewHelper() {\n println(\"normal\")\n}\n"
+            "fun Outer() {\n @P @C fun Nested() {\n Text(\"nested\")\n }\n}\n")
+    (treesit-parser-create 'kotlin)
+    (cl-letf (((symbol-function 'compose-preview--compiled-preview-methods) (lambda () nil)))
+      (compose-preview-fold-source))
+    (should (= (length compose-preview--source-folds) 1))
+    (goto-char (point-max))
+    (insert "\n")
+    (should-not compose-preview--source-folds)
+    (compose-preview-unfold-source)))
+
+(ert-deftest compose-preview-bounds-path-cannot-escape-output ()
+  "Companion bounds outside the renderer output directory are rejected."
+  (let* ((parent (make-temp-file "preview-bounds-path" t))
+         (root (expand-file-name "output" parent)))
+    (unwind-protect
+        (progn
+          (make-directory root)
+          (with-temp-file (expand-file-name "outside.bounds.json" parent) (insert "[]"))
+          (should-not (compose-preview--read-bounds root "../outside.png")))
+      (delete-directory parent t))))
+
+(ert-deftest compose-preview-source-folding-uses-compiled-multipreview-discovery ()
+  "Custom MultiPreview names are recognized through exact compiled method IDs."
+  (skip-unless (and (fboundp 'treesit-language-available-p)
+                    (treesit-language-available-p 'kotlin)))
+  (with-temp-buffer
+    (setq buffer-file-name "/tmp/A.kt")
+    (insert "package demo\n@MyDevices\n@Composable\nfun Card() {\n Text(\"preview\")\n}\n"
+            "// @Preview @Composable\nfun FakePreview() {\n Text(\"normal\")\n}\n")
+    (treesit-parser-create 'kotlin)
+    (cl-letf (((symbol-function 'compose-preview--compiled-preview-methods)
+               (lambda () '("demo.AKt.Card"))))
+      (compose-preview-fold-source))
+    (should (= (length compose-preview--source-folds) 1))
+    (compose-preview-unfold-source)))
+
+(ert-deftest compose-preview-configuration-command-is-render-only ()
+  "Changing dimensions preserves the render-only contract and annotation ID."
+  (let ((source (generate-new-buffer " *preview-config-source*"))
+        (compose-preview--sessions (make-hash-table :test #'equal))
+        (compose-preview--work-context nil)
+        (compose-preview--source-buffer nil)
+        (item (make-compose-preview-item :preview-id "preview" :configuration nil))
+        rendered)
+    (unwind-protect
+        (progn
+          (with-current-buffer source (setq buffer-file-name "/tmp/A.kt"))
+          (setq compose-preview--source-buffer source)
+          (let ((session (compose-preview--session "/tmp/A.kt")))
+            (setf (plist-get session :target) '(:project-root "/tmp/"))
+            (cl-letf (((symbol-function 'compose-preview--configuration-item) (lambda () item))
+                      ((symbol-function 'compose-preview--reusable-module-model) (lambda (_) t))
+                      ((symbol-function 'compose-preview--save-session-view) #'ignore)
+                      ((symbol-function 'compose-preview-refresh)
+                       (lambda (&rest _)
+                         (setq rendered (list compose-preview--render-only
+                                              compose-preview--refresh-all-in-file (current-buffer))))))
+              (compose-preview-set-size 320 480))
+            (should (equal rendered (list t t source)))
+            (should (= (cdr (assoc "widthDp" (plist-get
+                                              (gethash "preview" (plist-get session :overrides)) :values)))
+                       320))))
+      (kill-buffer source))))
+
 (ert-deftest compose-preview-render-settings-expands-annotations ()
   "Renderer settings expand annotations and preserve parameter providers."
   (let* ((root (make-temp-file "compose-preview-module" t))
