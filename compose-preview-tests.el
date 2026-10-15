@@ -1362,6 +1362,167 @@
         (insert (propertize "Card" 'compose-preview-item new))
         (should (= position (compose-preview--anchor-position old)))))))
 
+(ert-deftest compose-preview-inactive-monitor-does-not-scan-projects ()
+  "Hidden or closed Preview surfaces must not repeatedly scan the project."
+  (let ((compose-preview--project-input-signatures (make-hash-table :test #'equal))
+        (compose-preview--active-file nil)
+        (compose-preview--work-context nil))
+    (puthash "/tmp/project/" 'old compose-preview--project-input-signatures)
+    (cl-letf (((symbol-function 'compose-preview--input-signature)
+               (lambda (_root) (ert-fail "inactive Preview scanned project"))))
+      (compose-preview--watch-inputs))))
+
+(ert-deftest compose-preview-gradle-daemon-disable-is-explicit ()
+  "Disabling reuse must override Gradle's own daemon-enabled default."
+  (let ((compose-preview-use-gradle-daemon nil))
+    (should (member "--no-daemon"
+                    (compose-preview--gradle-arguments ":app:preview" "/tmp/init.gradle")))))
+
+(ert-deftest compose-preview-monitor-throttles-visible-project ()
+  "Repeated idle callbacks scan only the current root at the configured interval."
+  (let* ((root "/tmp/project/")
+         (compose-preview--sessions (make-hash-table :test #'equal))
+         (compose-preview--project-input-signatures (make-hash-table :test #'equal))
+         (compose-preview--last-input-check (make-hash-table :test #'equal))
+         (compose-preview--active-file "/tmp/project/A.kt")
+         (compose-preview--work-context nil)
+         (compose-preview-results-buffer-name " *preview-monitor-throttle*")
+         (clock 100.0)
+         (scans 0))
+    (unwind-protect
+        (progn
+          (get-buffer-create compose-preview-results-buffer-name)
+          (let ((session (compose-preview--session compose-preview--active-file)))
+            (setf (plist-get session :target) (list :project-root root)))
+          (puthash root 'unchanged compose-preview--project-input-signatures)
+          (puthash "/tmp/inactive/" 'other compose-preview--project-input-signatures)
+          (cl-letf (((symbol-function 'get-buffer-window) (lambda (&rest _) t))
+                    ((symbol-function 'float-time) (lambda (&rest _) clock))
+                    ((symbol-function 'compose-preview--input-signature)
+                     (lambda (project)
+                       (should (equal project root))
+                       (cl-incf scans)
+                       'unchanged)))
+            (compose-preview--watch-inputs)
+            (setq clock 105.0)
+            (compose-preview--watch-inputs)
+            (should (= scans 1))
+            (setq clock 131.0)
+            (compose-preview--watch-inputs)
+            (should (= scans 2))
+            (let ((compose-preview--work-context '(:generation 1)))
+              (setq clock 200.0)
+              (compose-preview--watch-inputs)
+              (should (= scans 2)))))
+      (kill-buffer compose-preview-results-buffer-name))))
+
+(ert-deftest compose-preview-input-validation-is-scoped-to-operation ()
+  "Repeated validation scans once per operation, never across later operations."
+  (let ((scans 0))
+    (cl-letf (((symbol-function 'compose-preview--scan-input-signature)
+               (lambda (_root) (list (cl-incf scans)))))
+      (let ((compose-preview--input-validation-cache (make-hash-table :test #'equal)))
+        (should (equal (compose-preview--input-signature "/project/") '(1)))
+        (should (equal (compose-preview--input-signature "/project/") '(1))))
+      (should (equal (compose-preview--input-signature "/project/") '(2))))))
+
+(ert-deftest compose-preview-render-timeout-never-kills-superseding-process ()
+  "An old timeout cannot terminate a newer renderer or shared Java daemon."
+  (let ((compose-preview--process 'new-renderer)
+        (compose-preview--generation 4)
+        killed)
+    (cl-letf (((symbol-function 'process-live-p) (lambda (_) t))
+              ((symbol-function 'process-put) #'ignore)
+              ((symbol-function 'delete-process) (lambda (process) (setq killed process))))
+      (compose-preview--render-timed-out 'old-renderer 3)
+      (should-not killed)
+      (compose-preview--render-timed-out 'new-renderer 4)
+      (should (eq killed 'new-renderer)))))
+
+(ert-deftest compose-preview-render-timeout-is-cancelled-on-process-exit ()
+  "Finished renderers must not retain process timeout timers."
+  (let (cancelled cleared)
+    (cl-letf (((symbol-function 'process-get) (lambda (&rest _) 'timer))
+              ((symbol-function 'timerp) (lambda (_) t))
+              ((symbol-function 'cancel-timer) (lambda (timer) (setq cancelled timer)))
+              ((symbol-function 'process-put)
+               (lambda (_process property value) (setq cleared (list property value)))))
+      (compose-preview--cancel-render-timeout 'process)
+      (should (eq cancelled 'timer))
+      (should (equal cleared '(compose-preview-timeout nil))))))
+
+(ert-deftest compose-preview-panel-disposal-releases-owned-work-and-monitoring ()
+  "Killing the Preview panel stops its work without touching shared daemons."
+  (let ((compose-preview--active-file "/tmp/A.kt")
+        (compose-preview--follow-active t)
+        (compose-preview--follow-buffer 'source)
+        (post-command-hook '(compose-preview--follow-selected-buffer))
+        paused cancelled)
+    (cl-letf (((symbol-function 'compose-preview--pause-input-monitor)
+               (lambda () (setq paused t)))
+              ((symbol-function 'compose-preview--cancel-follow-timer) #'ignore)
+              ((symbol-function 'compose-preview--cancel-process)
+               (lambda () (setq cancelled t))))
+      (compose-preview--panel-disposed)
+      (should paused)
+      (should cancelled)
+      (should-not compose-preview--active-file)
+      (should-not compose-preview--follow-active)
+      (should-not (memq #'compose-preview--follow-selected-buffer post-command-hook)))))
+
+(ert-deftest compose-preview-input-validation-memoizes-empty-projects ()
+  "Empty signatures are cached too, but never outside the current operation."
+  (let ((compose-preview--input-validation-cache (make-hash-table :test #'equal))
+        (count 0))
+    (cl-letf (((symbol-function 'compose-preview--scan-input-signature)
+               (lambda (_) (cl-incf count) nil)))
+      (compose-preview--input-signature "/project/")
+      (compose-preview--input-signature "/project/")
+      (should (= count 1)))))
+
+(ert-deftest compose-preview-launcher-cleanup-is-bounded ()
+  "Run the launcher's actual cleanup method against a blocking Java action."
+  (let ((javac (executable-find "javac"))
+        (java (executable-find "java")))
+    (skip-unless (and javac java))
+    (let ((directory (make-temp-file "preview-cleanup-java" t))
+          (launcher (expand-file-name "ComposePreviewRenderLauncher.java")))
+      (unwind-protect
+          (let* ((source (with-temp-buffer
+                           (insert-file-contents launcher)
+                           (goto-char (point-min))
+                           (search-forward "    static void runCleanup")
+                           (let ((start (match-beginning 0)))
+                             (search-forward "    // Layoutlib leaves non-daemon threads")
+                             (buffer-substring-no-properties start (match-beginning 0)))))
+                 (probe (expand-file-name "CleanupProbe.java" directory))
+                 (output (get-buffer-create " *preview-cleanup-java-output*")))
+            (with-temp-file probe
+              (insert "public class CleanupProbe {\n" source
+                      "public static void main(String[] args) {\n"
+                      "long start = System.nanoTime();\n"
+                      "runCleanup(() -> { while (true) { try { Thread.sleep(1000); } catch (InterruptedException e) {} } }, 100, \"blocked\");\n"
+                      "long millis = (System.nanoTime() - start) / 1000000;\n"
+                      "if (millis > 2000) throw new AssertionError(\"Unbounded cleanup: \" + millis);\n"
+                      "System.out.println(\"CLEANUP-OK\");\n}\n}\n"))
+            (should (= 0 (call-process javac nil output nil probe)))
+            (let ((process (make-process :name "preview-cleanup-probe" :buffer output
+                                         :command (list java "-cp" directory "CleanupProbe")
+                                         :noquery t :sentinel #'ignore))
+                  (deadline (+ (float-time) 5)))
+              (unwind-protect
+                  (progn
+                    (while (and (process-live-p process) (< (float-time) deadline))
+                      (accept-process-output process 0.05))
+                    (should-not (process-live-p process))
+                    (should (= 0 (process-exit-status process)))
+                (when (process-live-p process) (delete-process process))))
+            (with-current-buffer output
+              (should (string-match-p "CLEANUP-OK" (buffer-string)))))
+        (when-let* ((output (get-buffer " *preview-cleanup-java-output*")))
+          (kill-buffer output))
+        (delete-directory directory t))))))
+
 (ert-deftest compose-preview-idle-monitor-invalidates-external-source-change ()
   "External source edits invalidate both file and module model caches."
   (let* ((root (file-name-as-directory (make-temp-file "preview-watch" t)))
@@ -1369,10 +1530,14 @@
          (compose-preview--sessions (make-hash-table :test #'equal))
          (compose-preview--module-models (make-hash-table :test #'equal))
          (compose-preview--project-input-signatures (make-hash-table :test #'equal))
-         (compose-preview--active-file nil)
+         (compose-preview--active-file file)
+         (compose-preview--last-input-check (make-hash-table :test #'equal))
+         (compose-preview--work-context nil)
+         (compose-preview-results-buffer-name (generate-new-buffer-name " *preview-watch*"))
          (target (list :project-root root :module-root root)))
     (unwind-protect
         (progn
+          (get-buffer-create compose-preview-results-buffer-name)
           (with-temp-file file (insert "fun A() {}"))
           (let ((session (compose-preview--session file)))
             (setf (plist-get session :target) target
@@ -1382,9 +1547,11 @@
             (puthash root (compose-preview--input-signature root)
                      compose-preview--project-input-signatures)
             (with-temp-file file (insert "fun ChangedExternally() {}"))
-            (compose-preview--watch-inputs)
+            (cl-letf (((symbol-function 'get-buffer-window) (lambda (&rest _) t)))
+              (compose-preview--watch-inputs))
             (should (plist-get session :stale))
             (should (= (hash-table-count compose-preview--module-models) 0))))
+      (kill-buffer compose-preview-results-buffer-name)
       (delete-directory root t))))
 
 (ert-deftest compose-preview-log-command-uses-source-session ()
@@ -1433,6 +1600,7 @@
     (cl-letf (((symbol-function 'process-status) (lambda (_process) 'exit))
               ((symbol-function 'process-get)
                (lambda (_process _property) '(:generation 1)))
+              ((symbol-function 'compose-preview--cancel-render-timeout) #'ignore)
               ((symbol-function 'compose-preview--finish-render)
                (lambda (_context) (setq finished t))))
       (compose-preview--render-sentinel 'process "finished\n")
@@ -1590,7 +1758,7 @@
         (compose-preview-force-clean-build t))
     (should (equal (compose-preview--gradle-arguments ":app:preview" "/init.gradle")
                    '(":app:preview" "--init-script" "/init.gradle"
-                     "--no-build-cache" "--no-parallel")))))
+                     "--no-daemon" "--no-build-cache" "--no-parallel")))))
 
 (ert-deftest compose-preview-gradle-failure-prefers-specific-diagnostic ()
   "Gradle failures surface compose-preview diagnostics in the panel."

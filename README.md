@@ -127,7 +127,12 @@ The cache holds up to `compose-preview-session-cache-size` file sessions
 (default 8), protecting the active and in-flight sessions. Relevant source,
 resource, and build-input saves in the same Gradle project invalidate cached
 results; documentation saves do not. An idle metadata monitor also detects
-external changes under the project root. Target/model changes, missing PNGs,
+external changes under the project root. It checks only the visible active
+project, at most once per `compose-preview-input-check-interval` (default 30
+seconds), and pauses while building/rendering or when the panel is hidden or
+closed. Reusing a cached model/surface still revalidates inputs immediately;
+only duplicate signature requests within one synchronous operation are merged.
+Target/model changes, missing PNGs,
 and externally modified compiled artifacts prevent stale cache reuse. Unsaved
 buffers are reported explicitly: Gradle renders saved sources, not editor text.
 Invalidation is conservatively project-wide until a reliable variant dependency
@@ -151,6 +156,42 @@ again. Set `compose-preview-follow-current-file` to nil to disable file followin
 `compose-preview-panel-width` controls the side-window
 width. Keybinding hints are shown at the top of the panel by default; set
 `compose-preview-show-key-hints` to nil to hide them.
+
+### Resource and process lifecycle
+
+Three different JVMs may appear during Preview:
+
+- **Gradle daemon** and **KotlinCompileDaemon** belong to the build toolchain.
+  Like Studio builds, Preview reuses these by default. Their memory and idle
+  shutdown settings come from the project/toolchain, not the renderer. A Java
+  process remaining after rendering is therefore not by itself a renderer leak.
+  Preview never kills shared daemons or invokes `gradle --stop` automatically.
+- **ComposePreviewRenderLauncher** is a short-lived isolated renderer, not an
+  interactive preview server. It closes its renderer/project resources and
+  disposes IJFramework. Each cleanup is bounded to 5 seconds before the JVM is
+  forcibly halted, so blocked disposal/non-daemon layoutlib threads cannot keep
+  an otherwise completed request alive indefinitely.
+
+`compose-preview-renderer-java-options` defaults to `("-Xmx1536m")`; adjust it
+for unusually large Preview sets. `compose-preview-render-timeout` defaults to
+300 seconds for the entire renderer invocation. Its exact-process timeout is
+cancelled on exit/cancellation and cannot terminate a newer generation or a
+shared daemon. Closing/killing the panel or exiting Emacs cancels owned work
+and monitoring; switching files still lets the already running render finish
+into its file cache.
+
+To avoid a persistent Gradle daemon for Preview invocations, set
+`compose-preview-use-gradle-daemon` to nil (`--no-daemon` is passed explicitly).
+Gradle may still use a single-use daemon while building, and Kotlin's separate
+compiler daemon remains governed by project settings. This trades faster warm
+builds for reduced Gradle residency; it does not stop pre-existing daemons.
+
+This follows Studio's active/deactivated lifecycle rather than treating its
+shared IDE JVM as something to reproduce per Preview. Studio
+`ComposePreviewRepresentation` pauses active updates on deactivate and disposes
+RenderTasks through delayed surface deactivation; standalone-render
+`Renderer.close()` closes its module classloader and project. The Emacs side
+retains PNGs/data, not a live layoutlib session between requests.
 
 ### Temporary Preview configuration
 

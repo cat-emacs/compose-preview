@@ -133,8 +133,28 @@ Eviction releases image and view metadata, not generated files on disk."
   :type 'boolean
   :group 'compose-preview)
 
+(defcustom compose-preview-input-check-interval 30
+  "Minimum seconds between background project metadata scans.
+Only the visible active project's inputs are monitored.  Cache activation and
+render requests still validate inputs before reusing results."
+  :type 'number
+  :group 'compose-preview)
+
+(defcustom compose-preview-render-timeout 300
+  "Maximum seconds allowed for one standalone renderer process."
+  :type 'number
+  :group 'compose-preview)
+
+(defcustom compose-preview-renderer-java-options '("-Xmx1536m")
+  "Additional JVM arguments for the short-lived Preview renderer.
+These do not change Gradle or Kotlin daemon memory settings."
+  :type '(repeat string)
+  :group 'compose-preview)
+
 (defcustom compose-preview-use-gradle-daemon t
-  "Whether preview preparation should reuse a persistent Gradle daemon."
+  "Whether preview preparation should reuse a persistent Gradle daemon.
+When nil, pass --no-daemon explicitly.  Kotlin compiler daemon policy remains
+owned by the project; Preview never stops shared build daemons."
   :type 'boolean
   :group 'compose-preview)
 
@@ -166,6 +186,12 @@ Eviction releases image and view metadata, not generated files on disk."
 
 (defvar compose-preview--project-input-signatures (make-hash-table :test #'equal)
   "Last observed source/resource/build-input signatures by project root.")
+
+(defvar compose-preview--last-input-check (make-hash-table :test #'equal)
+  "Last completed background metadata scan time by project root.")
+
+(defvar compose-preview--input-validation-cache nil
+  "Dynamically bound memoized input signatures for one synchronous operation.")
 
 (defvar compose-preview--input-watch-timer nil
   "Idle timer monitoring Preview project inputs.")
@@ -444,6 +470,7 @@ Each entry is (PROJECT-ROOT . TARGET), where TARGET is a plist containing
               compose-preview--group-header-overlays
               (make-hash-table :test #'equal))
   (add-to-invisibility-spec 'compose-preview-fold)
+  (add-hook 'kill-buffer-hook #'compose-preview--panel-disposed nil t)
   (add-hook 'post-command-hook #'compose-preview--highlight-section nil t)
   (add-hook 'window-state-change-functions
             #'compose-preview--window-state-change nil t))
@@ -486,6 +513,16 @@ Each entry is (PROJECT-ROOT . TARGET), where TARGET is a plist containing
           (file-attribute-status-change-time attributes))))
 
 (defun compose-preview--input-signature (root)
+  "Return ROOT input metadata, memoized only within a synchronous operation."
+  (if compose-preview--input-validation-cache
+      (let ((cached (gethash root compose-preview--input-validation-cache :missing)))
+        (if (eq cached :missing)
+            (puthash root (compose-preview--scan-input-signature root)
+                     compose-preview--input-validation-cache)
+          cached))
+    (compose-preview--scan-input-signature root)))
+
+(defun compose-preview--scan-input-signature (root)
   "Return metadata for relevant inputs below ROOT.
 Do not follow symlink directories or traverse build/runtime output trees."
   (let (files)
@@ -517,26 +554,42 @@ Do not follow symlink directories or traverse build/runtime output trees."
             (compose-preview--input-file-p buffer-file-name root))))
    (buffer-list))))
 
+(defun compose-preview--pause-input-monitor ()
+  "Stop background metadata work while the Preview surface is inactive."
+  (when (timerp compose-preview--input-watch-timer)
+    (cancel-timer compose-preview--input-watch-timer))
+  (setq compose-preview--input-watch-timer nil))
+
+(defun compose-preview--resume-input-monitor ()
+  "Resume throttled input monitoring for an active Preview surface."
+  (when (and compose-preview--active-file
+             (not (timerp compose-preview--input-watch-timer)))
+    (setq compose-preview--input-watch-timer
+          (run-with-idle-timer 5 t #'compose-preview--watch-inputs))))
+
 (defun compose-preview--watch-inputs ()
-  "Invalidate Preview sessions and models after external input changes."
-  (maphash
-   (lambda (root old)
-     (condition-case err
-         (let ((signature (compose-preview--input-signature root)))
-           (unless (equal signature old)
-             (puthash root signature compose-preview--project-input-signatures)
-             (compose-preview--invalidate-project-sessions root)))
-       (file-error (compose-preview--log "input monitoring: %s" (error-message-string err)))))
-   compose-preview--project-input-signatures)
-  (when-let* ((session (gethash compose-preview--active-file compose-preview--sessions))
-              (panel (get-buffer compose-preview-results-buffer-name))
-              ((get-buffer-window panel t)))
-    (with-current-buffer panel
-      (when (and compose-preview--items (null compose-preview--work-context))
-        (compose-preview--panel-status
-         compose-preview--source-buffer default-directory
-         (compose-preview--session-status session compose-preview--source-buffer)
-         (if (plist-get session :stale) 'warning (plist-get session :face)))))))
+  "Check visible Preview inputs without scanning inactive projects or builds."
+  (if (not (and compose-preview--active-file
+                (get-buffer-window compose-preview-results-buffer-name t)))
+      (compose-preview--pause-input-monitor)
+    (when-let* ((session (gethash compose-preview--active-file compose-preview--sessions))
+                (root (plist-get (plist-get session :target) :project-root)))
+      (when (and (null compose-preview--work-context)
+                 (>= (- (float-time) (gethash root compose-preview--last-input-check 0))
+                     compose-preview-input-check-interval))
+        (condition-case err
+            (let ((signature (compose-preview--input-signature root)))
+              (unless (equal signature (gethash root compose-preview--project-input-signatures))
+                (puthash root signature compose-preview--project-input-signatures)
+                (compose-preview--invalidate-project-sessions root)))
+          (file-error (compose-preview--log "input monitoring: %s" (error-message-string err))))
+        (puthash root (float-time) compose-preview--last-input-check))
+      (with-current-buffer compose-preview-results-buffer-name
+        (when (and compose-preview--items (null compose-preview--work-context))
+          (compose-preview--panel-status
+           compose-preview--source-buffer default-directory
+           (compose-preview--session-status session compose-preview--source-buffer)
+           (if (plist-get session :stale) 'warning (plist-get session :face))))))))
 
 (defun compose-preview--track-inputs (root)
   "Track ROOT's external changes with a shared idle metadata monitor."
@@ -545,9 +598,8 @@ Do not follow symlink directories or traverse build/runtime output trees."
     (when (and old (not (equal old signature)))
       (compose-preview--invalidate-project-sessions root))
     (puthash root signature compose-preview--project-input-signatures)
-    (unless (timerp compose-preview--input-watch-timer)
-      (setq compose-preview--input-watch-timer
-            (run-with-idle-timer 2 t #'compose-preview--watch-inputs)))
+    (puthash root (float-time) compose-preview--last-input-check)
+    (compose-preview--resume-input-monitor)
     signature))
 
 (defun compose-preview--source-stamp (buffer)
@@ -608,7 +660,8 @@ Do not follow symlink directories or traverse build/runtime output trees."
                compose-preview--module-models)
       (maphash (lambda (root _signature)
                  (unless (seq-some (lambda (key) (equal (car key) root)) keys)
-                   (remhash root compose-preview--project-input-signatures)))
+                   (remhash root compose-preview--project-input-signatures)
+                   (remhash root compose-preview--last-input-check)))
                compose-preview--project-input-signatures))))
 
 (defun compose-preview--show-session (session buffer)
@@ -680,7 +733,8 @@ ITEM may be a Preview ID string or a legacy Preview item."
 (defun compose-preview--activate-file (buffer)
   "Activate BUFFER's Preview session, returning non-nil for valid cached data."
   (setq compose-preview--queued-request nil)
-  (let* ((key (compose-preview--file-key buffer))
+  (let* ((compose-preview--input-validation-cache (make-hash-table :test #'equal))
+         (key (compose-preview--file-key buffer))
          (session (compose-preview--session key))
          (target (with-current-buffer buffer
                    (ignore-errors (compose-preview--target)))))
@@ -777,15 +831,28 @@ ITEM may be a Preview ID string or a legacy Preview item."
 (defun compose-preview--hide-panel ()
   "Hide the Preview side window without ending its follow session.
 Preserve the selected window because this can run from `post-command-hook'."
+  (compose-preview--pause-input-monitor)
   (save-selected-window
     (when-let* ((window (get-buffer-window compose-preview-results-buffer-name t)))
       (quit-window nil window))))
+
+(defun compose-preview--panel-disposed ()
+  "Release active Preview tasks and monitoring when its panel is killed."
+  (setq compose-preview--active-file nil
+        compose-preview--follow-active nil
+        compose-preview--follow-buffer nil)
+  (compose-preview--pause-input-monitor)
+  (compose-preview--cancel-follow-timer)
+  (compose-preview--cancel-process)
+  (remove-hook 'post-command-hook #'compose-preview--follow-selected-buffer))
 
 (defun compose-preview--cancel-process ()
   "Cancel active Preview work and invalidate its sentinels."
   (cl-incf compose-preview--generation)
   (setq compose-preview--work-context nil
         compose-preview--queued-request nil)
+  (when (processp compose-preview--process)
+    (compose-preview--cancel-render-timeout compose-preview--process))
   (when (process-live-p compose-preview--process)
     (delete-process compose-preview--process))
   (setq compose-preview--process nil))
@@ -847,6 +914,7 @@ Preserve the selected window because this can run from `post-command-hook'."
         compose-preview--active-file nil
         compose-preview--follow-buffer nil)
   (compose-preview--cancel-follow-timer)
+  (compose-preview--pause-input-monitor)
   (compose-preview--cancel-process)
   (remove-hook 'post-command-hook #'compose-preview--follow-selected-buffer)
   (when-let* ((root (compose-preview--source-project-root
@@ -1960,6 +2028,7 @@ mode uses one scale shared by every visible Preview, like Studio's surface."
                          (slot . 0)
                          (window-width . ,compose-preview-panel-width)))))
     (set-window-fringes window 8 0)
+    (compose-preview--resume-input-monitor)
     window))
 
 (defun compose-preview--panel-status (source-buffer module-root status &optional face)
@@ -3254,9 +3323,24 @@ Use METADATA keyed by preview id to preserve annotation display settings."
          rendered-count failed-count (if (= failed-count 1) "" "s"))
         (compose-preview--complete-work context))))))
 
+(defun compose-preview--cancel-render-timeout (process)
+  "Cancel PROCESS's exact renderer timeout timer."
+  (when-let* ((timer (process-get process 'compose-preview-timeout)))
+    (when (timerp timer) (cancel-timer timer))
+    (process-put process 'compose-preview-timeout nil)))
+
+(defun compose-preview--render-timed-out (process generation)
+  "Terminate only the owned renderer PROCESS if GENERATION still matches."
+  (when (and (eq process compose-preview--process)
+             (compose-preview--active-generation-p generation)
+             (process-live-p process))
+    (process-put process 'compose-preview-timed-out t)
+    (delete-process process)))
+
 (defun compose-preview--render-sentinel (process _event)
   "Handle completion of asynchronous renderer PROCESS."
   (when (memq (process-status process) '(exit signal))
+    (compose-preview--cancel-render-timeout process)
     (let* ((context (process-get process 'compose-preview-context))
            (generation (plist-get context :generation)))
       (when (compose-preview--active-generation-p generation)
@@ -3265,8 +3349,11 @@ Use METADATA keyed by preview id to preserve annotation display settings."
             (condition-case err
                 (compose-preview--finish-render context)
               (error (compose-preview--fail context "%s" (error-message-string err))))
-          (compose-preview--fail context "renderer process exited with status %d"
-                                 (process-exit-status process)))))))
+          (if (process-get process 'compose-preview-timed-out)
+              (compose-preview--fail context "renderer timed out after %s seconds"
+                                     compose-preview-render-timeout)
+            (compose-preview--fail context "renderer process exited with status %d"
+                                   (process-exit-status process))))))))
 
 (defun compose-preview--launch-renderer (context)
   "Launch the layoutlib renderer described by CONTEXT."
@@ -3290,13 +3377,18 @@ Use METADATA keyed by preview id to preserve annotation display settings."
           (make-process
            :name "compose-preview-renderer"
            :buffer log-buffer :stderr log-buffer :noquery t
-           :command (list java "-Dlayoutlib.thread.profile.timeoutms=10000"
-                          "-cp" classpath "ComposePreviewRenderLauncher"
-                          (plist-get render :settings))
+           :command (append (list java) compose-preview-renderer-java-options
+                            (list "-Dlayoutlib.thread.profile.timeoutms=10000"
+                                  "-cp" classpath "ComposePreviewRenderLauncher"
+                                  (plist-get render :settings)))
            :sentinel #'ignore)))
     (setq compose-preview--process process)
     (process-put process 'compose-preview-context context)
     (set-process-sentinel process #'compose-preview--render-sentinel)
+    (process-put process 'compose-preview-timeout
+                 (run-with-timer compose-preview-render-timeout nil
+                                 #'compose-preview--render-timed-out
+                                 process (plist-get context :generation)))
     (compose-preview--panel-status
      (plist-get context :source-buffer) (plist-get target :module-root)
      (format "rendering %d declarations…" (length previews)))))
@@ -3408,8 +3500,7 @@ Use METADATA keyed by preview id to preserve annotation display settings."
 (defun compose-preview--gradle-arguments (task-path init-script)
   "Return Gradle arguments for TASK-PATH using INIT-SCRIPT."
   (append (list task-path "--init-script" init-script)
-          (when compose-preview-use-gradle-daemon
-            (list "--daemon"))
+          (list (if compose-preview-use-gradle-daemon "--daemon" "--no-daemon"))
           (when compose-preview-force-clean-build
             (list "--no-build-cache" "--no-parallel"))))
 
@@ -3500,7 +3591,8 @@ With a prefix argument, prompt for the module and full variant name."
       (compose-preview--panel-status
        source-buffer project-root "syncing Android project model…" 'warning)
       (user-error "Android project model is loading; preview will refresh when ready")))
-  (let* ((source-buffer (current-buffer))
+  (let* ((compose-preview--input-validation-cache (make-hash-table :test #'equal))
+         (source-buffer (current-buffer))
          (target (compose-preview--target current-prefix-arg))
          (variant (or variant (plist-get target :variant)))
          (source-file buffer-file-name)
@@ -3618,6 +3710,7 @@ With a prefix argument, prompt for the module and full variant name."
    ("F" "Fold Preview source" compose-preview-fold-source)
    ("U" "Unfold Preview source" compose-preview-unfold-source)])
 
+(add-hook 'kill-emacs-hook #'compose-preview--panel-disposed)
 (add-hook 'after-save-hook #'compose-preview--source-saved)
 (add-hook 'android-project-model-updated-hook
           #'compose-preview--android-project-model-updated)

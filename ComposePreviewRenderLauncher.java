@@ -79,6 +79,7 @@ public final class ComposePreviewRenderLauncher {
         List<String> instanceIds = new ArrayList<>();
         List<String> displayNames = new ArrayList<>();
         List<String> parameterNames = new ArrayList<>();
+        Renderer rendererToClose = null;
         try {
             RenderEnvironmentBootstrapper bootstrapper = new RenderEnvironmentBootstrapper(
                     optionalString(settings, "fontsPath"),
@@ -90,7 +91,9 @@ public final class ComposePreviewRenderLauncher {
                     readStrings(settings, "resourceDirs"),
                     readStrings(settings, "rClassJars"));
             List<PreviewScreenshotResult> results = new ArrayList<>();
-            try (Renderer renderer = bootstrapper.bootstrap()) {
+            Renderer renderer = bootstrapper.bootstrap();
+            rendererToClose = renderer;
+            {
                 for (PreviewScreenshot screenshot : screenshots) {
                     ScreenshotPreviewElement previewElement = null;
                     try {
@@ -134,9 +137,22 @@ public final class ComposePreviewRenderLauncher {
             parameterNames.clear();
         }
 
-        writeResult(resultsFilePath, result, densityDpis, parameterIndices,
-                parameterCounts, parameterizedResults, instanceIds, displayNames,
-                parameterNames);
+        try {
+            writeResult(resultsFilePath, result, densityDpis, parameterIndices,
+                    parameterCounts, parameterizedResults, instanceIds, displayNames,
+                    parameterNames);
+        } finally {
+            if (rendererToClose != null) {
+                Renderer renderer = rendererToClose;
+                runCleanup(() -> {
+                    try {
+                        renderer.close();
+                    } catch (Exception failure) {
+                        throw new RuntimeException(failure);
+                    }
+                }, 5000, "renderer");
+            }
+        }
 
         int failures = 0;
         if (result.getGlobalError() != null) {
@@ -318,13 +334,32 @@ public final class ComposePreviewRenderLauncher {
         return writer.toString();
     }
 
-    // Layoutlib leaves non-daemon threads behind, so the JVM is halted explicitly.
-    private static void halt(int exitCode) {
+    static void runCleanup(Runnable cleanup, long timeoutMillis, String label) {
+        Thread thread = new Thread(() -> {
+            try {
+                cleanup.run();
+            } catch (Throwable failure) {
+                System.err.println("compose-preview: " + label + " cleanup failed: " + failure);
+            }
+        }, "compose-preview-cleanup-" + label);
+        thread.setDaemon(true);
+        thread.start();
         try {
-            Disposer.dispose(IJFramework.INSTANCE);
-        } catch (Throwable ignored) {
-            // Disposal is best effort; the process is about to end anyway.
+            thread.join(timeoutMillis);
+        } catch (InterruptedException interrupted) {
+            Thread.currentThread().interrupt();
         }
+        if (thread.isAlive()) {
+            System.err.println("compose-preview: " + label + " cleanup timed out; terminating renderer JVM");
+            thread.interrupt();
+        }
+    }
+
+    // Layoutlib leaves non-daemon threads behind; disposal must not prevent exit.
+    private static void halt(int exitCode) {
+        runCleanup(() -> Disposer.dispose(IJFramework.INSTANCE), 5000, "framework");
+        System.out.flush();
+        System.err.flush();
         Runtime.getRuntime().halt(exitCode);
     }
 
