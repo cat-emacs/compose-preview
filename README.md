@@ -25,10 +25,27 @@ staleness, and failure. A last-known target and rendered images remain usable
 while Gradle refreshes; a successful model update invalidates target metadata
 and schedules one debounced Preview refresh.
 
-### Android Studio source alignment (2026-10-10)
+### Android Studio source alignment (2026-10-19)
 
 Initial audit: `tools/adt/idea` `bba282350237`, `tools/base` `f8b1f24565f2`.
-Latest audited checkout: `tools/adt/idea` `d8518b02c677`, `tools/base` `892571744eeb`.
+Latest audited checkout: `tools/adt/idea` `460aa88f7d95`, `tools/base` `0392b774c200`.
+
+- `19bdf7910b1` reports preview-element/class-loading errors per screenshot.
+  The launcher isolates failures per card even on alpha16; normal exit 1 with
+  serialized results is consumed so successful siblings remain visible.
+- `8f43e405e88` fixes same-named Preview configuration reuse. Local Preview IDs
+  include provider parameters, wrapper, full annotation configuration, and
+  annotation index rather than just a sanitized display name. IDs change on
+  annotation edits; old overrides cannot alias a different card.
+- `0eab2119615` replaces `.bounds.json` with unified component `.json` containing
+  source locations, semantics, parameters, and modifiers. Both formats are
+  accepted, with Preview ID/method validation for the unified format.
+- `694b3a00813`/`7d6d1b36cf5` reduce repeated R-class work and correct framework
+  resource-ID mapping. These changes and inflate-only rendering require a newer
+  renderer; Google Maven still publishes alpha16, so they are not claimed here.
+- `493d150540f` avoids initializing AndroidUiDispatcher.Main during disposal,
+  which could deadlock. Existing bounded standalone cleanup remains in place;
+  the upstream cleaner fix is not copied into the configuration repository.
 
 - `eb0328f5d0b`/`69c22dd0ed6` preserve Focus-mode configuration and user zoom
   across refreshes. Temporary per-annotation overrides here follow that rule.
@@ -220,9 +237,13 @@ not a regex-only folding fallback. Wildcard imports require compiled discovery.
 
 ### Optional component bounds
 
-The reader accepts Studio's official `<image-stem>.bounds.json` wire format:
-component name, source filename/line/package hash, physical-pixel bounds, and
-children. `i` opens a component tree with source links. Unknown source locations
+The reader accepts both the earlier `<image-stem>.bounds.json` wire format and
+Studio's unified `<image-stem>.json` (or result `componentTreePath`). Unified
+trees are matched to the result's Preview ID and method before consumption;
+component source locations are normalized and semantics, modifiers, and
+parameters are preserved and displayed by `i` alongside physical-pixel bounds
+and source links. Empty image paths from future inflate-only results are not
+interpreted as PNGs. Unknown source locations
 remain non-navigable; other source files require explicit selection and
 filename/package validation. Missing, malformed, oversized, or out-of-output
 companions do not affect PNG rendering. A deepest-node physical-pixel hit-test
@@ -231,7 +252,8 @@ yet wired up.
 
 The pinned renderer `0.0.1-alpha16` does **not** emit these files. Component
 inspection therefore reports unsupported until a compatible renderer produces
-real companion data. No renderer upgrade or fake bounds generation is implied.
+real companion data. No renderer upgrade, extraction flag, inflate-only UI, or
+fake bounds generation is implied.
 
 ### Preview discovery
 

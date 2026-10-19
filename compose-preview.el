@@ -297,6 +297,7 @@ Each entry is (PROJECT-ROOT . TARGET), where TARGET is a plist containing
   preview-id
   configuration
   bounds
+  component-tree
   error)
 
 (defface compose-preview-section-heading
@@ -1854,11 +1855,33 @@ METHOD may be an unqualified name or a full JVM method name."
           :current (and (file-readable-p class-file)
                         (file-newer-than-file-p class-file source)))))
 
+(defun compose-preview--identity-data (value)
+  "Normalize JSON VALUE key order for stable Preview identity hashing."
+  (cond
+   ((hash-table-p value)
+    (let (pairs)
+      (maphash (lambda (key item) (push (cons key item) pairs)) value)
+      (compose-preview--identity-data pairs)))
+   ((and (consp value) (consp (car value)) (stringp (caar value)))
+    (mapcar (lambda (pair) (cons (car pair) (compose-preview--identity-data (cdr pair))))
+            (sort (copy-sequence value) (lambda (a b) (string< (car a) (car b))))))
+   ((consp value) (mapcar #'compose-preview--identity-data value))
+   ((vectorp value) (mapcar #'compose-preview--identity-data value))
+   (t value)))
+
 (defun compose-preview--preview-id (preview annotation index)
-  "Return stable id for PREVIEW ANNOTATION at INDEX."
-  (let ((name (compose-preview--json-get annotation "name")))
+  "Identify PREVIEW ANNOTATION at INDEX independently of its display name.
+Include provider parameters and annotation configuration, not a sanitized name
+alone; same-named previews must not share overrides or renderer metadata."
+  (let* ((name (compose-preview--json-get annotation "name"))
+         (identity (list (compose-preview--json-get preview "methodFQN")
+                         (compose-preview--identity-data
+                          (compose-preview--json-get preview "methodParams"))
+                         (compose-preview--json-get preview "previewWrapperFQN")
+                         (compose-preview--identity-data annotation) index)))
     (concat (compose-preview--json-get preview "methodFQN") "_"
-            (compose-preview--sanitize (or name (number-to-string index))))))
+            (compose-preview--sanitize (or name (number-to-string index))) "_"
+            (substring (secure-hash 'sha256 (prin1-to-string identity)) 0 16))))
 
 (defun compose-preview--configuration-baseline (annotation)
   "Return source-defined device and dimensions from ANNOTATION."
@@ -3106,6 +3129,79 @@ INDEX and COUNT identify the provider value; RENDERER-NAME may override it."
                     (compose-preview--json-get node "children") (1+ depth) budget))))
           nodes))))
 
+(defun compose-preview--component-properties (node field)
+  "Validate optional string property map FIELD in component NODE."
+  (let ((properties (compose-preview--json-get node field)))
+    (unless (or (null properties)
+                (and (listp properties)
+                     (seq-every-p (lambda (pair)
+                                    (and (consp pair) (stringp (car pair))
+                                         (stringp (cdr pair)))) properties)))
+      (error "Invalid component %s map" field))
+    properties))
+
+(defun compose-preview--normalize-components (nodes &optional depth budget)
+  "Normalize current Studio component NODES to the shared inspector shape.
+Preserve semantics, modifiers, parameters, and optional source locations."
+  (let ((depth (or depth 0)) (budget (or budget (list 5000))))
+    (unless (and (listp nodes) (< depth 64)) (error "Invalid component tree depth"))
+    (mapcar
+     (lambda (node)
+       (cl-decf (car budget))
+       (unless (> (car budget) 0) (error "Component tree exceeds node budget"))
+       (let* ((location (compose-preview--json-get node "sourceLocation"))
+              (name (compose-preview--json-get node "name"))
+              (file (and location (compose-preview--json-get location "fileName")))
+              (line (and location (compose-preview--json-get location "lineNumber")))
+              (hash (and location (compose-preview--json-get location "packageHash"))))
+         (unless (and (stringp name)
+                      (or (null location)
+                          (and (stringp file) (integerp line)
+                               (or (null hash) (integerp hash)))))
+           (error "Invalid component source location"))
+         `(("name" . ,name)
+           ("fileName" . ,(or file ""))
+           ("lineNumber" . ,(or line -1))
+           ("packageHash" . ,(or hash -1))
+           ("bounds" . ,(compose-preview--json-get node "bounds"))
+           ("semantics" . ,(compose-preview--component-properties node "semantics"))
+           ("parameters" . ,(compose-preview--component-properties node "parameters"))
+           ("modifiers" . ,(compose-preview--component-properties node "modifiers"))
+           ("children" . ,(compose-preview--normalize-components
+                           (compose-preview--json-get node "children") (1+ depth) budget)))))
+     nodes)))
+
+(defun compose-preview--read-component-tree (output image-path result)
+  "Read optional unified component JSON for RESULT within OUTPUT.
+Validate Preview identity before exposing current Studio schema to the UI."
+  (condition-case nil
+      (let* ((root (file-name-as-directory (file-truename output)))
+             (explicit (compose-preview--json-get result "componentTreePath"))
+             (path (or explicit (and image-path
+                                     (concat (file-name-sans-extension image-path) ".json"))))
+             (file (and (stringp path) (expand-file-name path root))))
+        (when (and file (file-regular-p file)
+                   (file-in-directory-p (file-truename file) root)
+                   (< (file-attribute-size (file-attributes file)) (* 4 1024 1024)))
+          (let* ((tree (compose-preview--read-json file))
+                 (method (or (compose-preview--json-get tree "methodFQN")
+                             (compose-preview--json-get tree "methodFqn")))
+                 (nodes (compose-preview--normalize-components
+                         (compose-preview--json-get tree "components"))))
+            (when (and (stringp method)
+                       (stringp (compose-preview--json-get tree "previewId"))
+                       (assoc "components" tree)
+                       (equal method (compose-preview--json-get result "methodFQN"))
+                       (equal (compose-preview--json-get tree "previewId")
+                              (compose-preview--json-get result "previewId"))
+                       (integerp (compose-preview--json-get tree "width"))
+                       (integerp (compose-preview--json-get tree "height"))
+                       (>= (compose-preview--json-get tree "width") 0)
+                       (>= (compose-preview--json-get tree "height") 0)
+                       (compose-preview--valid-bounds-tree-p nodes))
+              (list :tree tree :nodes nodes)))))
+    (error nil)))
+
 (defun compose-preview--read-bounds (output image-path)
   "Read optional official companion bounds for IMAGE-PATH inside OUTPUT.
 Missing, malformed, oversized, or out-of-directory files have no capability."
@@ -3189,6 +3285,10 @@ Missing, malformed, oversized, or out-of-directory files have no capability."
                                  (compose-preview--json-get node "bounds")
                                  (compose-preview--json-get node "fileName")
                                  (compose-preview--json-get node "lineNumber")))
+                 (dolist (field '("semantics" "parameters" "modifiers"))
+                   (when-let* ((properties (compose-preview--json-get node field)))
+                     (insert (make-string (+ 2 (* depth 2)) ?\s)
+                             (format "%s: %S\n" field properties))))
                  (visit (compose-preview--json-get node "children") (1+ depth)))))
           (visit nodes 0))))
     (display-buffer buffer)))
@@ -3199,11 +3299,13 @@ Use METADATA keyed by preview id to preserve annotation display settings."
   (mapcar
    (lambda (result)
      (let* ((fqn (compose-preview--json-get result "methodFQN"))
-            (path (compose-preview--json-get result "imagePath"))
+            (raw-path (compose-preview--json-get result "imagePath"))
+            (path (and (stringp raw-path) (not (string-empty-p raw-path)) raw-path))
             (preview-id (compose-preview--json-get result "previewId"))
             (instance-id (compose-preview--json-get result "instanceId"))
             (parameter-index (compose-preview--json-get result "parameterIndex"))
             (parameter-count (compose-preview--json-get result "parameterCount"))
+            (component-tree (compose-preview--read-component-tree output path result))
             (details (and metadata (gethash preview-id metadata)))
             (method-name (car (last (split-string fqn "\\." t))))
             (parameter-name (or (plist-get details :parameter-name)
@@ -3223,7 +3325,9 @@ Use METADATA keyed by preview id to preserve annotation display settings."
         :id id :name label
         :preview-id preview-id
         :configuration (plist-get details :configuration)
-        :bounds (and path (compose-preview--read-bounds output path))
+        :bounds (or (plist-get component-tree :nodes)
+                    (and path (compose-preview--read-bounds output path)))
+        :component-tree (plist-get component-tree :tree)
         :declaring-class (string-join (butlast (split-string fqn "\\." t)) ".")
         :method method-name
         :method-fqn fqn
@@ -3264,7 +3368,8 @@ Use METADATA keyed by preview id to preserve annotation display settings."
              (failed-count (length failed))
              (rendered-count
               (seq-count (lambda (result)
-                           (compose-preview--json-get result "imagePath"))
+                           (let ((path (compose-preview--json-get result "imagePath")))
+                             (and (stringp path) (not (string-empty-p path)))))
                          result-list)))
         (when-let* ((key (compose-preview--file-key source)))
           (let ((session (compose-preview--session key)))
@@ -3345,7 +3450,12 @@ Use METADATA keyed by preview id to preserve annotation display settings."
            (generation (plist-get context :generation)))
       (when (compose-preview--active-generation-p generation)
         (setq compose-preview--process nil)
-        (if (zerop (process-exit-status process))
+        (if (and (not (process-get process 'compose-preview-timed-out))
+                 (or (zerop (process-exit-status process))
+                     (and (eq (process-status process) 'exit)
+                          (= (process-exit-status process) 1)
+                          (when-let* ((file (plist-get (plist-get context :render) :results)))
+                            (file-readable-p file)))))
             (condition-case err
                 (compose-preview--finish-render context)
               (error (compose-preview--fail context "%s" (error-message-string err))))

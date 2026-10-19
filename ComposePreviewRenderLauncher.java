@@ -16,6 +16,7 @@ import com.android.tools.render.Renderer;
 import com.android.tools.render.common.PreviewRenderingResult;
 import com.android.tools.render.common.PreviewScreenshot;
 import com.android.tools.render.common.PreviewScreenshotResult;
+import com.android.tools.render.common.ScreenshotError;
 import com.android.tools.render.common.ScreenshotPreviewElement;
 import com.android.tools.render.compose.ComposeScreenshot;
 import com.android.tools.render.framework.IJFramework;
@@ -107,8 +108,15 @@ public final class ComposePreviewRenderLauncher {
                             previewElement == null
                                     ? new ArrayList<>()
                                     : resolvePreviewMetadata(previewElement);
-                    List<PreviewScreenshotResult> screenshotResults =
-                            renderer.render(screenshot, outputFolder);
+                    List<PreviewScreenshotResult> screenshotResults;
+                    try {
+                        screenshotResults = renderer.render(screenshot, outputFolder);
+                    } catch (Throwable failure) {
+                        // Class loading/element failures belong to this card, not the batch.
+                        screenshotResults = java.util.Collections.singletonList(
+                                new PreviewScreenshotResult(screenshot.getPreviewId(),
+                                        screenshot.getMethodFQN(), null, new ScreenshotError(failure)));
+                    }
                     results.addAll(screenshotResults);
                     boolean parameterized = screenshot instanceof ComposeScreenshot
                             && !((ComposeScreenshot) screenshot).getMethodParams().isEmpty();

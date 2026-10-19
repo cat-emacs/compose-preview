@@ -409,6 +409,75 @@
   (dolist (size '(0 -1 10001 3.5))
     (should-error (compose-preview-set-size size 640) :type 'user-error)))
 
+(ert-deftest compose-preview-identity-distinguishes-names-configurations-and-providers ()
+  "Duplicate names or sanitized-name collisions never alias card overrides."
+  (let* ((preview '(("methodFQN" . "demo.CardKt.Card")))
+         (one '(("name" . "Phone") ("widthDp" . 320)))
+         (two '(("name" . "Phone") ("widthDp" . 640)))
+         (provider-a '(("methodFQN" . "demo.CardKt.Card")
+                       ("methodParams" . ((("provider" . "demo.A"))))))
+         (provider-b '(("methodFQN" . "demo.CardKt.Card")
+                       ("methodParams" . ((("provider" . "demo.B")))))))
+    (should-not (equal (compose-preview--preview-id preview one 0)
+                       (compose-preview--preview-id preview two 0)))
+    (should-not (equal (compose-preview--preview-id preview '(("name" . "a b")) 0)
+                       (compose-preview--preview-id preview '(("name" . "a_b")) 0)))
+    (should-not (equal (compose-preview--preview-id provider-a one 0)
+                       (compose-preview--preview-id provider-b one 0)))
+    (should (equal (compose-preview--preview-id preview one 0)
+                   (compose-preview--preview-id preview (reverse one) 0)))))
+
+(ert-deftest compose-preview-unified-component-tree-preserves-details-and-identity ()
+  "Consume current Studio component schema, with strict card identity checks."
+  (let* ((root (make-temp-file "preview-components" t))
+         (file (expand-file-name "card.json" root))
+         (node '(("name" . "Button")
+                 ("bounds" . (("left" . 0) ("top" . 0) ("right" . 100) ("bottom" . 40)))
+                 ("sourceLocation" . (("fileName" . "Card.kt") ("lineNumber" . 7)
+                                      ("packageHash" . 123)))
+                 ("semantics" . (("text" . "Click")))
+                 ("modifiers" . (("clickable" . "true")))
+                 ("parameters" . (("enabled" . "true")))))
+         (tree `(("previewId" . "preview") ("methodFQN" . "demo.CardKt.Card")
+                 ("width" . 100) ("height" . 40) ("components" . [,node])))
+         (result '(("previewId" . "preview") ("methodFQN" . "demo.CardKt.Card")
+                   ("imagePath" . "card.png") ("componentTreePath" . "card.json"))))
+    (unwind-protect
+        (progn
+          (compose-preview--write-json file tree)
+          (let* ((items (compose-preview--result-items (list result) root))
+                 (item (car items))
+                 (component (car (compose-preview-item-bounds item))))
+            (should (compose-preview-item-component-tree item))
+            (should (equal (compose-preview--json-get component "fileName") "Card.kt"))
+            (should (equal (compose-preview--json-get component "semantics") '(("text" . "Click"))))
+            (should (equal (compose-preview--json-get component "modifiers") '(("clickable" . "true")))))
+          (setf (alist-get "previewId" tree nil nil #'equal) "other")
+          (compose-preview--write-json file tree)
+          (should-not (compose-preview--read-component-tree root "card.png" result))
+          (should-not (compose-preview--read-component-tree
+                       root "card.png" '(("componentTreePath" . "../outside.json"))))
+          (setf (alist-get "previewId" tree nil nil #'equal) "preview"
+                (alist-get "components" tree nil nil #'equal)
+                [(("name" . "Malformed") ("bounds" . (("left" . "bad"))))])
+          (compose-preview--write-json file tree)
+          (should-not (compose-preview--read-component-tree root "card.png" result)))
+      (delete-directory root t))))
+
+(ert-deftest compose-preview-empty-image-path-is-not-an-image ()
+  "Inflate-only protocol output must not turn the output directory into a PNG."
+  (let* ((result '(("methodFQN" . "demo.Card") ("previewId" . "card") ("imagePath" . "")))
+         (item (car (compose-preview--result-items (list result) "/tmp/output/"))))
+    (should-not (compose-preview-item-files item))))
+
+(ert-deftest compose-preview-unified-component-tree-allows-no-source-location ()
+  "Runtime nodes without source must still be inspectable, not navigable."
+  (let ((nodes (compose-preview--normalize-components
+                '((("name" . "Layout")
+                   ("bounds" . (("left" . 0) ("top" . 0) ("right" . 20) ("bottom" . 30))))))))
+    (should (compose-preview--valid-bounds-tree-p nodes))
+    (should-error (compose-preview--visit-component (car nodes) nil) :type 'user-error)))
+
 (ert-deftest compose-preview-bounds-read-and-hit-test ()
   "Official companion JSON enables deepest-node physical-pixel hit testing."
   (let* ((root (make-temp-file "preview-bounds" t))
@@ -544,7 +613,9 @@
                (settings (compose-preview--read-json (plist-get render :settings)))
                (screenshots (compose-preview--json-get settings "screenshots"))
                (metadata (plist-get render :metadata))
-               (phone-id "com.example.FooKt.Preview_Phone"))
+               (phone-id (compose-preview--preview-id
+                          (car previews)
+                          (cadr (compose-preview--json-get (car previews) "annotations")) 1)))
           (should (= (length screenshots) 2))
           (should (equal (compose-preview--json-get settings "rClassJars")
                          '("/R.jar")))
@@ -1592,6 +1663,49 @@
                       ((symbol-function 'compose-preview--show-session) #'ignore))
               (should-not (compose-preview--activate-file source)))))
       (kill-buffer source))))
+
+(ert-deftest compose-preview-render-sentinel-consumes-partial-failure-results ()
+  "Exit 1 with serialized card results still publishes successful Preview cards."
+  (let* ((file (make-temp-file "preview-partial-results" nil ".json"))
+         (context (list :generation 7 :render (list :results file)))
+         (compose-preview--generation 7)
+         finished)
+    (unwind-protect
+        (cl-letf (((symbol-function 'process-status) (lambda (_) 'exit))
+                  ((symbol-function 'process-exit-status) (lambda (_) 1))
+                  ((symbol-function 'process-get)
+                   (lambda (_process key) (and (eq key 'compose-preview-context) context)))
+                  ((symbol-function 'compose-preview--cancel-render-timeout) #'ignore)
+                  ((symbol-function 'compose-preview--finish-render)
+                   (lambda (ctx) (setq finished ctx)))
+                  ((symbol-function 'compose-preview--fail)
+                   (lambda (&rest _) (ert-fail "discarded per-card results"))))
+          (compose-preview--render-sentinel 'process "exited abnormally with code 1")
+          (should (eq finished context)))
+      (delete-file file))))
+
+(ert-deftest compose-preview-render-sentinel-timeout-never-publishes-results ()
+  "Timeout is a batch failure even when an old result file remains readable."
+  (let* ((file (make-temp-file "preview-timeout-results" nil ".json"))
+         (context (list :generation 7 :render (list :results file)))
+         (compose-preview--generation 7)
+         failed)
+    (unwind-protect
+        (cl-letf (((symbol-function 'process-status) (lambda (_) 'exit))
+                  ((symbol-function 'process-exit-status) (lambda (_) 1))
+                  ((symbol-function 'process-get)
+                   (lambda (_process key)
+                     (pcase key
+                       ('compose-preview-context context)
+                       ('compose-preview-timed-out t))))
+                  ((symbol-function 'compose-preview--cancel-render-timeout) #'ignore)
+                  ((symbol-function 'compose-preview--finish-render)
+                   (lambda (&rest _) (ert-fail "published timed out result")))
+                  ((symbol-function 'compose-preview--fail)
+                   (lambda (&rest _) (setq failed t))))
+          (compose-preview--render-sentinel 'process "exit")
+          (should failed))
+      (delete-file file))))
 
 (ert-deftest compose-preview-stale-render-sentinel-is-ignored ()
   "A superseded renderer process cannot replace current panel results."
