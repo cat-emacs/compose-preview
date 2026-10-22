@@ -1,2 +1,6 @@
 *.elc
 .test-deps/
+.gradle/
+.kotlin/
+**/build/
+__pycache__/

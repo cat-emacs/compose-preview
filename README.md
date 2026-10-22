@@ -1,412 +1,261 @@
 # Compose Preview
 
-Android Studio-style Jetpack Compose `@Preview` browsing from Emacs.
+A **Kotlin/JVM CLI** and an **Emacs frontend** for Android Studio Compose Preview.
+Rendering uses Google's published standalone layoutlib renderer, not generated
+screenshot tests, Paparazzi, or project build-file rewriting.
 
-Requires Emacs 29.1 or newer and Transient 0.3.0 or newer. Source folding also
-requires tree-sitter support and an installed Kotlin grammar; rendering does not.
+## Repository layout
 
-Previews are rendered by `compose-preview-renderer`, the standalone layoutlib
-renderer that Android Studio publishes and uses for its own Compose screenshot
-support. Nothing is injected into the project: no generated sources, no extra
-test plugins, no build file rewriting, no snapshot testing framework.
+```text
+cli/        Kotlin project/build/cache/process orchestration and backend tests
+renderer/   Java adapter around the published Studio renderer
+gradle/     Invocation-local model init script and version-gated adapters
+lisp/       Emacs Grid/Focus frontend, source navigation and frontend ERT
+bin/        Repository CLI entry point
+TODO.md     Official CLI replacement gates and deferred capabilities
+```
 
-## Status
+The CLI owns the Gradle → discovery → javac → renderer chain, persistent compiled
+model receipts, process timeouts/cancellation and run artifacts. Elisp owns
+editor target selection through `android-project`, per-file UI sessions, local
+image filtering/layout, view state, and source folding. It no longer launches
+Gradle, javac, or the renderer itself. Both clients consume the same backend.
 
-The Emacs, Gradle, and renderer paths are implemented end to end. A refresh
-returns immediately, builds and renders in background processes, and updates a
-persistent side-window panel without clearing the last successful images while
-work is in progress. The panel shows build, render, ready, and failure status.
-It groups results by Android Studio's `@Preview(group = "...")` setting and
-renders each group as a collapsible section; ungrouped previews appear under
-`Default`. Saving can also trigger a debounced refresh when
-`compose-preview-auto-refresh-mode` is enabled in the source buffer. When
-`android-project` is available, the panel also reflects project-model syncing,
-staleness, and failure. A last-known target and rendered images remain usable
-while Gradle refreshes; a successful model update invalidates target metadata
-and schedules one debounced Preview refresh.
+## Requirements and installation
 
-### Android Studio source alignment (2026-10-19)
+- JDK **17+** to run the CLI. Project Gradle/AGP may require a specific JDK;
+  use that project's `JAVA_HOME`. A local Kotlin installation is **not** required.
+- Android SDK and the project's Gradle wrapper for real builds.
+- Emacs **29.1+**, Transient **0.3.0+**, `android-project` **0.1.0+** for the
+  optional Emacs frontend. Kotlin tree-sitter grammar is needed only for source
+  folding, not rendering.
+- Network access on first build to resolve Gradle/AGP, detector, renderer and
+  layoutlib artifacts. CLI operations require no separate authentication.
 
-Initial audit: `tools/adt/idea` `bba282350237`, `tools/base` `f8b1f24565f2`.
-Latest audited checkout: `tools/adt/idea` `460aa88f7d95`, `tools/base` `0392b774c200`.
+```sh
+./gradlew :cli:test :cli:installDist
+./bin/compose-preview --help
+./bin/compose-preview doctor --json
 
-- `19bdf7910b1` reports preview-element/class-loading errors per screenshot.
-  The launcher isolates failures per card even on alpha16; normal exit 1 with
-  serialized results is consumed so successful siblings remain visible.
-- `8f43e405e88` fixes same-named Preview configuration reuse. Local Preview IDs
-  include provider parameters, wrapper, full annotation configuration, and
-  annotation index rather than just a sanitized display name. IDs change on
-  annotation edits; old overrides cannot alias a different card.
-- `0eab2119615` replaces `.bounds.json` with unified component `.json` containing
-  source locations, semantics, parameters, and modifiers. Both formats are
-  accepted, with Preview ID/method validation for the unified format.
-- `694b3a00813`/`7d6d1b36cf5` reduce repeated R-class work and correct framework
-  resource-ID mapping. These changes and inflate-only rendering require a newer
-  renderer; Google Maven still publishes alpha16, so they are not claimed here.
-- `493d150540f` avoids initializing AndroidUiDispatcher.Main during disposal,
-  which could deadlock. Existing bounded standalone cleanup remains in place;
-  the upstream cleaner fix is not copied into the configuration repository.
+# Install a complete distribution; only Java is needed afterwards.
+make install-local                   # defaults to ~/.local
+# Or: make install-local PREFIX=/some/prefix
+compose-preview doctor --json
+```
 
-- `eb0328f5d0b`/`69c22dd0ed6` preserve Focus-mode configuration and user zoom
-  across refreshes. Temporary per-annotation overrides here follow that rule.
-- `afdbcbd403c` folds Preview source bodies through PSI; the optional Emacs
-  implementation uses Kotlin tree-sitter plus compiled MultiPreview discovery.
-- `adc4145e60a`/`a9d6fc92471` share ComposeViewInfo and emit companion bounds in
-  standalone-render. The optional reader follows that protocol but remains
-  unavailable with the currently published alpha16 renderer.
+`./gradlew :cli:distZip :cli:distTar` builds distributable archives containing
+runtime jars, Gradle scripts, renderer adapter source, and `lisp/`. Installed
+commands locate assets relative to their distribution, independently of cwd.
+The repository `bin/compose-preview` requires `:cli:installDist` first; it does
+not build itself or download dependencies merely to display help/doctor.
+No Python runtime is used.
 
-- Studio `2efbd2291cb` releases source-file references and clears surface flows
-  on disposal. File sessions here use file keys, bounded caches, and release
-  their log buffers when evicted.
-- Studio `53f0b33e47c` releases queued actions on cancellation/timeout/eviction;
-  this implementation retains only one latest waiting request.
-- Studio `4b5595b44fd` delays shared classloader disposal until render references
-  are released. Here renderer JVMs remain isolated, and artifact cleanup protects
-  in-flight and cached references; no shared JVM/classloader cache was added.
-- Studio `d6d5210164c` propagates variants through active source-provider
-  configurations. This requires a reliable dependency/configuration model and
-  is not approximated by variant-name guessing here.
-- New MediaQuery DeviceSpec/interactive states and Compose Preview sidecar Web
-  UI work are not yet part of the pinned standalone renderer integration.
+## CLI commands
 
-## How It Works
+```sh
+# Environment/resource checks; no project build.
+compose-preview doctor --json
 
-Rendering happens in three steps.
+# Build and discover annotations/providers; no image rendering.
+compose-preview list --project /work/app --module :app --variant debug --json
 
-1. A Gradle init script registers `composePreviewModel` on the target module.
-   The task resolves layoutlib and the renderer from Google's Maven repository,
-   collects the module's classpath through AGP's public `ScopedArtifacts` API,
-   discovers `@Preview` functions from compiled bytecode, and writes everything
-   to a JSON model file.
-2. Emacs filters the model to the current Kotlin file or containing preview
-   function, writes a rendering settings file, and compiles the fixed launcher
-   once per renderer version under `compose-preview-cache-directory`.
-3. The launcher renders in a separate JVM and writes a results file with one
-   PNG per preview. Gradle and the renderer run asynchronously on one serialized
-   chain. Switching files does not cancel running work: it finishes into the
-   original file's cache, then the latest pending file request starts.
+# Render a source file. Does not edit @Preview or build.gradle(.kts).
+compose-preview render --project /work/app --module :app --variant debug \
+  --file /work/app/app/src/main/kotlin/example/Home.kt \
+  --out /tmp/home-preview --json
 
-## Emacs UI
+# Reuse a fresh module model when possible (otherwise build).
+compose-preview render --project /work/app --module :app --reuse \
+  --file /work/app/app/src/main/kotlin/example/Other.kt --json
 
-Run `M-x compose-preview-refresh` from a Kotlin source buffer. The command opens
-a panel on the right and returns immediately. Inside the panel:
+# Exact compiled model escape hatch; rejects absent/invalid validation receipt.
+compose-preview render --model /cache/models/.../model-HASH.json --no-build \
+  --file /work/app/app/src/main/kotlin/example/Home.kt --json
 
-- click a group title, or press `TAB` / `RET` anywhere in its section, to fold
-  or unfold it with Magit-style `>` / `v` indicators and heading highlight;
-- `S-TAB` folds all groups when all are open, otherwise it unfolds all groups;
-- `v` switches between the grouped Grid and single-item Focus view.
-  Grid packs previews into wrapping rows by their displayed width, matching
-  Android Studio's Preview grid;
-- `n` / `p` move like Magit: in Grid they visit section headings then visible
-  cards, and `TAB` folds the section at point; in Focus they cycle items;
-- `/` filters by Preview name, function, or group, and `G` selects one group;
-- `f` applies Android Studio-style Zoom to Fit to the complete visible layout,
-  `0` restores Android Studio-style Actual Size, and `+` / `-` zoom;
-- `w` copies the current card's original PNG data to the system clipboard
-  (macOS, Windows, and Linux via `wl-copy` or `xclip`);
-- click a Preview title, or press `o` on its card, to visit the exact source
-  declaration;
-- `g` refreshes from its associated source buffer;
-- `l` opens the Gradle and renderer log;
-- `d` temporarily selects a Studio `id:` or `spec:` device for the selected card;
-- `s` sets temporary width/height in dp (disables system decorations);
-- `r` resets that card to the source-defined configuration;
-- `i` opens the component tree when the renderer emits companion bounds;
-- `q` closes the side window.
+# Exact annotation ID obtained from list; optional temporary overrides.
+compose-preview render --project /work/app --module :app --no-build \
+  --preview-id 'example.HomeKt.Home_HASH' --overrides /tmp/overrides.json --json
 
-Grid sections follow Android Studio organization groups: every instance of
-the same `@Preview` function, including `@PreviewParameter` values, lives in
-one collapsible section named after the composable. `G` still filters by
-`@Preview(group = "...")`. Fold state, view mode, filters, focused item, and
-zoom are preserved across automatic and manual refreshes; a refresh itself
-returns to the top of the panel. Actual Size maps the rendered PNG back through
-the Preview device density and the host display scale, matching Android
-Studio's design-surface coordinates. Fit mode applies one shared scale to the
-visible layout, accounts for both panel width and height, and recomputes after
-window resizing, filtering, view changes, or section folding.
-Renderer issues are isolated to their Preview cards: successful images remain
-visible, and a card can show both its image and a fidelity warning with a link
-to the render log. `@PreviewParameter` values appear as separate Grid items
-under the same method section, using Android Studio titles such as
-`LoginPreview - Login (user 0)`.
+# Cleanup defaults to dry run. Explicit --apply deletes only marked run paths.
+compose-preview cache prune --dry-run --older-than 86400 --json
+compose-preview cache prune --apply --keep /cache/runs/RUN_ID --json
+```
 
-Run `M-x compose-preview-auto-refresh-mode` in a source buffer to refresh all
-previews in that file after each save. Saves are debounced by
-`compose-preview-auto-refresh-delay`; automatic refresh is buffer-local and is
-off by default. While a Preview panel is active, selecting another Kotlin file
-activates its file session after `compose-preview-file-switch-delay`. Switching
-back to a fresh, complete file surface restores its images, Grid/Focus, filters,
-folds, zoom, and browsing position without Gradle or rendering. An inactive
-file's running task may complete and cache its results, but cannot replace the
-active file's panel. Only the latest waiting file request is retained.
+Prefer explicit `--module` for composite builds or relocated module directories.
+Without it, `--file` infers only the ordinary nearest Gradle build directory;
+it does not evaluate settings DSL or guess which of several modules is selected.
+The CLI currently defaults to variant `debug`; Emacs passes the user's actual
+selected target. `list` may compile the module to discover complete MultiPreview
+and PreviewParameter metadata; it is not a source-only scan.
 
-The cache holds up to `compose-preview-session-cache-size` file sessions
-(default 8), protecting the active and in-flight sessions. Relevant source,
-resource, and build-input saves in the same Gradle project invalidate cached
-results; documentation saves do not. An idle metadata monitor also detects
-external changes under the project root. It checks only the visible active
-project, at most once per `compose-preview-input-check-interval` (default 30
-seconds), and pauses while building/rendering or when the panel is hidden or
-closed. Reusing a cached model/surface still revalidates inputs immediately;
-only duplicate signature requests within one synchronous operation are merged.
-Target/model changes, missing PNGs,
-and externally modified compiled artifacts prevent stale cache reuse. Unsaved
-buffers are reported explicitly: Gradle renders saved sources, not editor text.
-Invalidation is conservatively project-wide until a reliable variant dependency
-graph is available; inactive saves do not steal focus.
+Temporary override input, keyed by the annotation ID returned by `list`:
 
-File switching within the same module/variant can reuse the last compiled
-module model without Gradle, but only when its input and classpath/resource
-signatures still match and relevant buffers are saved. Manual refresh still
-runs Gradle. This is validated model reuse, not Studio Fast Preview or
-incremental compilation. Changes outside the project root (such as external
-included builds or replaced toolchains) may still require manual refresh.
-
-Each file retains its latest build/render log (`l`). Browsing position is
-restored by Preview ID when possible, rather than only a text offset. Cleanup
-reclaims unreferenced generation files created by the current Emacs session;
-it preserves cached/in-flight images, stable Gradle models, shared layoutlib
-and launcher caches, symlinks, and unowned files. Selecting a non-Kotlin buffer
-hides the panel without cancelling background rendering. Pressing `q` ends the
-follow session and cancels outstanding work; the next manual refresh starts it
-again. Set `compose-preview-follow-current-file` to nil to disable file following.
-`compose-preview-panel-width` controls the side-window
-width. Keybinding hints are shown at the top of the panel by default; set
-`compose-preview-show-key-hints` to nil to hide them.
-
-### Resource and process lifecycle
-
-Three different JVMs may appear during Preview:
-
-- **Gradle daemon** and **KotlinCompileDaemon** belong to the build toolchain.
-  Like Studio builds, Preview reuses these by default. Their memory and idle
-  shutdown settings come from the project/toolchain, not the renderer. A Java
-  process remaining after rendering is therefore not by itself a renderer leak.
-  Preview never kills shared daemons or invokes `gradle --stop` automatically.
-- **ComposePreviewRenderLauncher** is a short-lived isolated renderer, not an
-  interactive preview server. It closes its renderer/project resources and
-  disposes IJFramework. Each cleanup is bounded to 5 seconds before the JVM is
-  forcibly halted, so blocked disposal/non-daemon layoutlib threads cannot keep
-  an otherwise completed request alive indefinitely.
-
-`compose-preview-renderer-java-options` defaults to `("-Xmx1536m")`; adjust it
-for unusually large Preview sets. `compose-preview-render-timeout` defaults to
-300 seconds for the entire renderer invocation. Its exact-process timeout is
-cancelled on exit/cancellation and cannot terminate a newer generation or a
-shared daemon. Closing/killing the panel or exiting Emacs cancels owned work
-and monitoring; switching files still lets the already running render finish
-into its file cache.
-
-To avoid a persistent Gradle daemon for Preview invocations, set
-`compose-preview-use-gradle-daemon` to nil (`--no-daemon` is passed explicitly).
-Gradle may still use a single-use daemon while building, and Kotlin's separate
-compiler daemon remains governed by project settings. This trades faster warm
-builds for reduced Gradle residency; it does not stop pre-existing daemons.
-
-This follows Studio's active/deactivated lifecycle rather than treating its
-shared IDE JVM as something to reproduce per Preview. Studio
-`ComposePreviewRepresentation` pauses active updates on deactivate and disposes
-RenderTasks through delayed surface deactivation; standalone-render
-`Renderer.close()` closes its module classloader and project. The Emacs side
-retains PNGs/data, not a live layoutlib session between requests.
-
-### Temporary Preview configuration
-
-Select a card (or use Focus mode) and press `d`/`s` to change its render
-configuration without editing `@Preview` or Gradle files. Changes are keyed by
-annotation Preview ID; parameterized instances of the same annotation share
-that override. Changing the source-defined device/dimensions clears an older
-override. `r` restores the original annotation settings.
-
-Configuration changes require a fresh compiled module model and saved relevant
-buffers. They run only the renderer, never Gradle; if the model is stale, save
-and refresh first. Controls reject changes while rendering is in progress.
-Focus, manual zoom, filters, folds, and the selected card are retained. This is
-not live canvas dragging or an interactive running composition.
-
-### Preview source folding
-
-`M-x compose-preview-fold-source` (`F` in the source command menu) folds only
-multiline block bodies of Preview functions using the Kotlin tree-sitter parser.
-Imports and aliases for official `Preview`/`Composable` are recognized directly;
-custom MultiPreview annotations are recognized through fresh compiled model
-discovery. Ordinary functions and functions nested inside other function bodies
-are not folded. Edits clear the overlays; `compose-preview-unfold-source` (`U`)
-removes them explicitly. No parser means an explicit unsupported message,
-not a regex-only folding fallback. Wildcard imports require compiled discovery.
-
-### Optional component bounds
-
-The reader accepts both the earlier `<image-stem>.bounds.json` wire format and
-Studio's unified `<image-stem>.json` (or result `componentTreePath`). Unified
-trees are matched to the result's Preview ID and method before consumption;
-component source locations are normalized and semantics, modifiers, and
-parameters are preserved and displayed by `i` alongside physical-pixel bounds
-and source links. Empty image paths from future inflate-only results are not
-interpreted as PNGs. Unknown source locations
-remain non-navigable; other source files require explicit selection and
-filename/package validation. Missing, malformed, oversized, or out-of-output
-companions do not affect PNG rendering. A deepest-node physical-pixel hit-test
-helper is provided for future image interactions; image-click selection is not
-yet wired up.
-
-The pinned renderer `0.0.1-alpha16` does **not** emit these files. Component
-inspection therefore reports unsupported until a compatible renderer produces
-real companion data. No renderer upgrade, extraction flag, inflate-only UI, or
-fake bounds generation is implied.
-
-### Preview discovery
-
-Discovery uses `compose-preview-detector`, the same bytecode scanner AGP uses.
-Multipreview annotations expand exactly as they do in Studio, so
-`@PreviewScreenSizes`, `@PreviewFontScale`, `@PreviewLightDark` and custom
-multipreview annotations all work. `@PreviewParameter` providers are expanded
-by the renderer itself; each provider value is a separate Preview instance
-under the same method section. Titles use the Kotlin parameter name and index,
-or a custom `PreviewParameterProvider.getDisplayName` when one is defined.
-
-### Why a launcher instead of the renderer's own CLI
-
-The renderer ships a CLI entry point, but it constructs
-`RenderEnvironmentBootstrapper` without `rClassJars`. That leaves the renderer
-with no registered resource packages, so `ViewLoader` never parses any R class.
-Because the renderer runs with final resource ids, every id a library reads
-through its own R class then resolves to `0`. In practice this means previews
-render as blank images, and `ComposeViewAdapter` fails while attaching the
-lifecycle owner.
-
-`ComposePreviewRenderLauncher.java` calls the eight-argument bootstrapper with
-`rClassJars`, which is the same entry point Studio's screenshot test engine
-uses. Everything else reuses the renderer's own model classes and JSON
-serialization. The launcher is compiled once against the resolved renderer jars.
-
-A future renderer release will make the launcher unnecessary for discovery:
-`Renderer.render` on Studio's main branch expands multipreview itself, so only a
-method name has to be passed. That change is not in `0.0.1-alpha16`.
-
-### Resource apk
-
-layoutlib resolves resources against a resource apk whose ids must match the R
-classes on the classpath. The module's local test component provides both from
-the same `aapt2` link, so the task uses `APK_FOR_LOCAL_TEST` and the matching
-non-namespaced R jar. AGP only links that apk when Android resources are
-requested for local tests, so the init script enables
-`testOptions.unitTests.includeAndroidResources` for the target module.
-
-### Kotlin Multiplatform
-
-Traditional Kotlin Multiplatform modules using `androidTarget` with
-`com.android.application` or `com.android.library` follow the ordinary Android
-variant path. Modules using the newer
-`com.android.kotlin.multiplatform.library` plugin are supported on AGP 9.3.x by
-a version-gated adapter under `adapters/`.
-
-The adapter creates a temporary Android host-test compilation when the module
-does not already define one, then enables Android resources for that compilation.
-It also supplies neutral values for otherwise-unset placeholders found in
-dependency AAR manifests, since layoutlib only needs the linked resources. This
-only changes the in-memory Gradle model for the preview invocation; it does not
-edit the project's build file. If the module already defines a host test, it
-must include Android resources. The Android Compose tooling runtime must also be
-on the Android target's runtime classpath:
-
-```kotlin
-kotlin {
-    android {
-        androidResources.enable = true
-
-        // Optional: compose-preview creates this temporarily when absent.
-        withHostTestBuilder {}.configure {
-            isIncludeAndroidResources = true
-        }
-    }
-    sourceSets.androidMain.dependencies {
-        implementation("androidx.compose.ui:ui-tooling:<compose-version>")
-    }
+```json
+{
+  "example.HomeKt.Home_HASH": {
+    "baseline": {"device": null, "widthDp": null, "heightDp": null, "showSystemUi": null},
+    "values": {"widthDp": 360, "heightDp": 640, "showSystemUi": false}
+  }
 }
 ```
 
-The tooling dependency provides `ComposeViewAdapter`; Compose Multiplatform's
-common `uiToolingPreview` dependency provides the `@Preview` annotation but not
-that Android runtime implementation.
+Use the exact `configuration` baseline returned by discovery. If source
+configuration changes, old overrides are ignored. Allowed fields are `device`
+(Studio `id:`/`spec:`), `widthDp`, `heightDp` and `showSystemUi`. Size overrides
+must disable system decorations to take effect. CLI renders saved source files;
+Emacs rejects unsaved relevant buffers before invoking it.
 
-AGP's public Variant API exposes the KMP host-test component but not its
-layoutlib resource APK or matching runtime R jar. The AGP 9.3 adapter contains
-the only two internal artifact lookups used by this package; project classes,
-dependency classpaths, task registration, and rendering continue to use public
-APIs. An unverified AGP version or changed internal artifact model fails with a
-specific compatibility error rather than guessing intermediate paths.
+### JSON / exit contract
 
-## Verified Against
+`--json` is accepted before or after the command. stdout contains **one** JSON
+object; Gradle/compiler/renderer output goes to stderr. `--result-file PATH`
+atomically writes the render envelope for editor clients.
 
-- `Android-screenshot-testing-playground`, AGP 8.11.1 / Gradle 8.13, library
-  module. Rendered sizes match the official
-  `com.android.compose.screenshot` plugin output for every shared preview, and
-  the shared preview is 99.94% pixel-identical.
-- `nowinandroid`, AGP 9.3.2 / Gradle 9.7.1, with Isolated Projects and the
-  configuration cache enabled and a flavored variant (`demoDebug`). 21 preview
-  declarations expanded to 40 renders with no errors.
-- `com.android.kotlin.multiplatform.library`, AGP 9.3.2 / Gradle 9.7.1, using
-  the `androidMain` variant and host-test resources. Both an `androidMain`
-  Preview reading a string through the module R class and a Compose
-  Multiplatform Preview declared in `commonMain` rendered through layoutlib as
-  non-empty 630 x 263 PNGs. The model task reused Gradle's configuration cache;
-  removing the host test verified that the adapter creates it temporarily.
-- A production AGP 9.3 Android KMP module without a declared host test, whose
-  dependency manifests contain unset placeholders. The adapter created the
-  temporary resource host test without changing the build file, collected 427
-  Preview declarations, and rendered all six `@PreviewParameter` values for the
-  selected Preview.
-
-These checks are focused runtime validation rather than repository test
-fixtures: this personal configuration repository does not add new test files.
-The existing ERT suite asserts the adapter boundary, AGP version gate, required
-artifact keys, and user-facing configuration diagnostics.
-
-## Installation
-
-```elisp
-(use-package android-project
-  :vc (:url "https://github.com/cat-emacs/android-project"))
-(use-package compose-preview
-  :vc (:url "https://github.com/cat-emacs/compose-preview")
-  :commands compose-preview)
+```json
+{
+  "schemaVersion": 1,
+  "status": "ready",
+  "target": {"projectRoot": "/work/app", "moduleRoot": "/work/app/app", "modulePath": ":app", "variant": "debug"},
+  "modelPath": "/cache/models/.../model-HASH.json",
+  "outputDirectory": "/cache/runs/UUID",
+  "reusedModel": true,
+  "stale": false,
+  "declarations": [],
+  "results": [],
+  "globalError": null
+}
 ```
 
-Android target metadata comes from android-project; android-mode and adb are
-not required. The renderer, Preview-specific Gradle task, and desktop/KMP
-fallback paths remain owned by compose-preview. The old
-`compose-preview-use-android-mode-flavors` option aliases
-`compose-preview-use-android-project-flavors`.
+Results preserve renderer `previewId`, `methodFQN`, parameter-instance identity,
+error diagnostics and optional component paths, plus source annotation metadata
+for clients. Nonempty PNG paths are absolute. Annotation IDs include method,
+provider parameters, wrapper, full annotation configuration and annotation index;
+display names are never identity. Partial failures preserve healthy siblings.
 
-## Configuration
+| Exit | Meaning |
+|---|---|
+| 0 | Success, including no Preview declarations |
+| 1 | Partial card failures or inputs changed during rendering (`stale`) |
+| 2 | Input/setup/build/global/protocol failure |
+| signal | Cancellation; owned child tasks are terminated by shutdown cleanup |
 
-The init script reads these environment variables:
+Failures use `{"schemaVersion":1,"status":"failed","error":{"kind":"...","message":"..."}}`.
+Unknown renderer capabilities are not advertised as supported. `doctor` reports
+Java, installed resources, pinned versions and authentication requirements; it
+is not proof that a particular Android project can build.
 
-| Variable | Meaning |
-| --- | --- |
-| `COMPOSE_PREVIEW_MODULE_PATH` | Gradle path of the target module, required |
-| `COMPOSE_PREVIEW_MODEL_FILE` | Where to write the JSON model, required |
-| `COMPOSE_PREVIEW_ADAPTER_DIRECTORY` | Versioned AGP adapters; set by Emacs |
-| `COMPOSE_PREVIEW_VARIANT` | Variant name, defaults to `debug` |
-| `COMPOSE_PREVIEW_LAYOUTLIB_VERSION` | Defaults to the version AGP pins |
-| `COMPOSE_PREVIEW_RENDERER_VERSION` | Standalone renderer version |
-| `COMPOSE_PREVIEW_DETECTOR_VERSION` | Preview detector version |
+### Cache and process policy
 
-Projects with product flavors need a full variant name, for example
-`demoDebug`. Projects using Isolated Projects reject
-`--no-configuration-cache`, so the task is configuration-cache compatible and
-that flag must not be passed.
+- Models are keyed by build root, module, variant and renderer versions. Input
+  and classpath/resource signatures plus model-content hashes form a receipt.
+- `--reuse` revalidates a receipt; `--no-build` fails instead of silently
+  rebuilding. Explicit `--model` also requires its matching receipt.
+- Builds are locked per target; launcher compilation is locked per source/
+  classpath hash. Returned compiled snapshots are immutable by content hash.
+- Inputs changing during build invalidate the build receipt; changes during
+  rendering return stale results rather than claiming freshness.
+- Run output directories are immutable and must be empty. Cache prune defaults
+  to dry run, preserves `--keep`, skips active locks/symlinks/unowned directories,
+  and never removes project build outputs or shared Gradle caches.
+- Models/launchers are deliberately not auto-pruned yet. Do not apply run cleanup
+  while an external editor still references an old run without passing `--keep`.
+- Renderer JVMs default to `-Xmx1536m`, total timeout 300 seconds, bounded
+  renderer/framework cleanup, then process exit. `--java-option=...` can override
+  renderer JVM options; build timeout is separately configurable.
+- Cancellation terminates owned client/renderer children, not shared
+  GradleDaemon/KotlinCompileDaemon. `--no-daemon` explicitly opts out of Gradle
+  reuse but does not stop pre-existing daemons or govern Kotlin daemon settings.
+- Input tracking is conservative within the selected project root. External
+  included builds and toolchain/environment changes can require a manual build.
+
+## Emacs frontend (`lisp/`)
+
+Install the CLI distribution first, or build the bundled one. Configure VC
+installation to use `:lisp-dir "lisp"`:
+
+```elisp
+(use-package compose-preview
+  :vc (:url "https://github.com/cat-emacs/compose-preview" :lisp-dir "lisp")
+  :commands compose-preview
+  :custom
+  ;; nil checks PATH, then the repository bin/ entry point.
+  (compose-preview-cli-program nil))
+```
+
+No root-level compatibility loader is installed. Existing manual load paths
+must point to `lisp/`. Cat Emacs' Android module is updated accordingly.
+`android-project` remains responsible for editor selected module/variant state;
+standalone CLI use does not require Emacs or `android-project`.
+
+Run `M-x compose-preview-refresh` from Kotlin source, or use `M-x compose-preview`.
+The frontend invokes the CLI asynchronously and consumes schemaVersion=1 output.
+
+| Key | Action |
+|---|---|
+| `g` / `l` | Refresh / file build-render log |
+| `v`, `n`, `p` | Grid/Focus and card/section navigation |
+| `TAB`, `S-TAB` | Fold section / toggle all |
+| `/`, `G` | Local search / annotation-group filter |
+| `f`, `0`, `+`, `-` | Fit / density-aware Actual Size / zoom |
+| `d`, `s`, `r` | Temporary device / dp size / reset (CLI `--no-build`) |
+| `i`, `o` | Optional component inspection / Preview source |
+| `w` | Copy original PNG (macOS, Windows, Linux via wl-copy/xclip) |
+| `q` | Close, cancel owned work, pause monitoring |
+
+File sessions preserve images, focus, zoom, folds, filtering and card-position
+anchors. Activation displays cached images immediately, then asks the CLI to
+validate the compiled model and previous run; a fresh identical request returns
+`reusedImages=true` without rebuilding or rendering. File switching does not cancel the in-flight request: it caches the
+original result and runs only the latest waiting file. Inactive results cannot
+replace another file's surface. Default in-memory session limit is 8.
+`compose-preview-auto-refresh-mode` enables debounced save refresh. UI input
+monitoring is throttled (30 seconds), visible-project-only, and stops when the
+panel closes. These UI image-session signatures are not a second compiled
+model cache: the CLI independently validates every build/render reuse.
+
+Source folding (`compose-preview-fold-source` / `compose-preview-unfold-source`)
+uses Kotlin tree-sitter with annotation imports/aliases. Custom MultiPreview
+methods use fresh CLI discovery; nested ordinary functions are not folded.
+Missing grammar is explicit; there is no regex-only folding fallback.
+
+## Studio alignment and official CLI TODO
+
+Pinned published renderer: `0.0.1-alpha16`; layoutlib: `16.1.0-jdk17`; detector:
+`32.5.0-alpha05`. AGP KMP adapter remains explicitly gated to **9.3.x**.
+Configuration cache/Isolated Projects remain supported by invocation-local
+Gradle adapters; project build files and test sources are not rewritten.
+
+Audited Studio checkout: `tools/adt/idea` `460aa88f7d95`, `tools/base` `0392b774c200`.
+Relevant upstream work includes per-card failures (`19bdf7910b1`), correct Preview
+configuration identity (`8f43e405e88`), unified component JSON (`0eab2119615`),
+R-class work per classloader (`694b3a00813`), and safe cleanup of uninitialized
+AndroidUiDispatcher.Main (`493d150540f`). Published alpha16 does not include all
+of these. Local per-card handling and bounded cleanup work with alpha16; no
+main-only performance improvement is claimed.
+
+The optional inspector accepts both older `.bounds.json` and unified component
+JSON, validates card identity/source locations, and preserves semantics,
+modifiers and parameters. **Alpha16 does not emit component trees**: inspection
+reports unsupported without fabricating data. Image-click selection,
+inflate-only and Interactive/Animation Preview are not implemented.
+
+The official artifact includes `com.android.tools.render.common.MainKt`, but
+its entry point is not yet a replacement for the project's reliable R-class
+bootstrap/metadata/cleanup adapter. See [TODO.md](TODO.md) for the explicit gates
+for replacing our launcher with the official CLI. The backend adapter can change
+without changing the project CLI protocol or Emacs frontend.
 
 ## Development
 
-Run package checks from this directory:
-
 ```sh
-make install-deps
-make lint
-make build
-make test
+./gradlew :cli:test :cli:installDist   # Kotlin backend
+make install-deps                   # isolated Emacs test dependencies
+make lint build test                # Elisp frontend
+make install-local                  # test installed CLI from another directory
 ```
 
-Licensed under GPL-3.0-or-later.
+Backend tests cover model/input/artifact receipts, identities, overrides,
+timeouts, discovery and safe prune. Frontend ERT covers UI/state/source behavior
+and the CLI-result seam. Real Android/KMP/partial-failure smoke tests require a
+local Android SDK and representative Gradle projects; unit tests do not
+synchronize, upgrade, or delete user package/project state.

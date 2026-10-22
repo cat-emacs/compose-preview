@@ -5,7 +5,23 @@ on:
   pull_request:
 
 jobs:
-  ci:
+  cli:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+      - uses: gradle/actions/setup-gradle@v4
+      - run: ./gradlew :cli:test :cli:installDist
+      - name: Installed CLI smoke outside checkout
+        run: |
+          CLI="$PWD/cli/build/install/compose-preview/bin/compose-preview"
+          cd /tmp
+          "$CLI" --help
+          "$CLI" doctor --json
+  emacs:
     uses: cat-emacs/.github/.github/workflows/emacs-package.yml@v1
     with:
       install-command: make install-deps

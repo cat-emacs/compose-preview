@@ -21,29 +21,6 @@
     (should (equal (compose-preview--module-root-from-name project-root "app:feature")
                    "/tmp/project/app/feature/"))))
 
-(ert-deftest compose-preview-model-files-separate-gradle-cache-and-render-snapshots ()
-  "Gradle model paths stay stable while renderer snapshots remain isolated."
-  (let ((target '(:module-root "/tmp/project/app/" :variant "androidMain")))
-    (should (equal (compose-preview--model-file target)
-                   "/tmp/project/app/build/compose-preview/emacs/model-androidMain.json"))
-    (should (equal (compose-preview--model-file target 7)
-                   "/tmp/project/app/build/compose-preview/emacs/model-androidMain-7.json"))))
-
-(ert-deftest compose-preview-successful-gradle-snapshots-model-before-rendering ()
-  "A successful active Gradle process snapshots its stable model."
-  (let ((compose-preview--generation 3)
-        events)
-    (cl-letf (((symbol-function 'process-status) (lambda (_process) 'exit))
-              ((symbol-function 'process-exit-status) (lambda (_process) 0))
-              ((symbol-function 'process-get)
-               (lambda (_process _property) '(:generation 3)))
-              ((symbol-function 'compose-preview--snapshot-model)
-               (lambda (_context) (push 'snapshot events)))
-              ((symbol-function 'compose-preview--start-render)
-               (lambda (_context) (push 'render events))))
-      (compose-preview--gradle-sentinel 'process "finished\n")
-      (should (equal (nreverse events) '(snapshot render))))))
-
 (ert-deftest compose-preview-current-buffer-class-prefix ()
   "Kotlin source buffers map to generated file facade class names."
   (with-temp-buffer
@@ -62,9 +39,7 @@
           (cl-letf (((symbol-function 'read-multiple-choice)
                      (lambda (&rest _) (error "kill prompt"))))
             (should (equal (compose-preview--source-file-class-prefix file)
-                           (concat "com.example." (file-name-base file) "Kt")))
-            (should (member "com.example.Card"
-                            (compose-preview--source-declaring-prefixes file)))))
+                           (concat "com.example." (file-name-base file) "Kt")))))
       (delete-file file))))
 
 (ert-deftest compose-preview-current-preview-method ()
@@ -107,50 +82,6 @@
     (search-forward "Text(\"nested\")")
     (should (equal (compose-preview--current-preview-method-fqn)
                    "com.example.Second$Nested.Card"))))
-
-(ert-deftest compose-preview-select-model-previews ()
-  "Model previews are narrowed to source functions and the selected method."
-  (let* ((source (make-temp-file "Foo" nil ".kt"))
-         (source-name (file-name-nondirectory source))
-         (previews
-          (list
-           (list (cons "methodFQN" "com.example.FooKt.First")
-                 (cons "sourceFile" source-name))
-           (list (cons "methodFQN" "com.example.FooKt.Second")
-                 (cons "sourceFile" source-name))
-           (list (cons "methodFQN" "com.example.BarKt.First")
-                 (cons "sourceFile" "Bar.kt"))
-           (list (cons "methodFQN" "com.example.First.First")
-                 (cons "sourceFile" source-name))
-           (list (cons "methodFQN" "com.example.Second.First")
-                 (cons "sourceFile" source-name))
-           (list (cons "methodFQN" "com.example.Outer$Nested.First")
-                 (cons "sourceFile" source-name))
-           (list (cons "methodFQN" "com.other.BazKt.First")
-                 (cons "sourceFile" source-name))))
-         (model (list (cons "previews" previews))))
-    (unwind-protect
-        (progn
-          (with-temp-file source
-            (insert "package com.example\nfun First() {}\nfun Helper() {}\n"))
-          (should (equal
-                   (mapcar (lambda (preview)
-                             (compose-preview--json-get preview "methodFQN"))
-                           (compose-preview--select-model-previews
-                            model source nil))
-                   '("com.example.FooKt.First"
-                     "com.example.First.First"
-                     "com.example.Second.First"
-                     "com.example.Outer$Nested.First")))
-          (should (equal
-                   (mapcar (lambda (preview)
-                             (compose-preview--json-get preview "methodFQN"))
-                           (compose-preview--select-model-previews
-                            model source "com.example.Second.First"))
-                   '("com.example.Second.First")))
-          (should-not (compose-preview--select-model-previews
-                       model source "Second")))
-      (delete-file source))))
 
 (ert-deftest compose-preview-target-prefers-android-project-source-metadata ()
   "Target lookup follows Android Studio-style module metadata for KMP files."
@@ -196,6 +127,37 @@
       (should-error (compose-preview-refresh) :type 'user-error))
     (should (equal refreshed "/tmp/project/"))
     (should (string-match-p "syncing" status))))
+
+(ert-deftest compose-preview-cli-sentinel-consumes-partial-and-cleans-request ()
+  "A partial CLI response reaches the UI; temporary request files are removed."
+  (let* ((directory (make-temp-file "preview-cli-response" t))
+         (file (expand-file-name "result.json" directory))
+         (context (list :generation 10 :result-file file :request-directory directory))
+         (compose-preview--generation 10)
+         consumed)
+    (compose-preview--write-json file '(("schemaVersion" . 1) ("status" . "partial")))
+    (cl-letf (((symbol-function 'process-status) (lambda (_) 'exit))
+              ((symbol-function 'process-exit-status) (lambda (_) 1))
+              ((symbol-function 'process-get) (lambda (_process _key) context))
+              ((symbol-function 'compose-preview--finish-cli-result)
+               (lambda (ctx response) (setq consumed (list ctx (compose-preview--json-get response "status"))))))
+      (compose-preview--cli-sentinel 'process "exit"))
+    (should (equal consumed (list context "partial")))
+    (should-not (file-exists-p directory))))
+
+(ert-deftest compose-preview-stale-cli-response-only-cleans-request ()
+  "Old CLI completions release their own request without affecting current work."
+  (let* ((directory (make-temp-file "preview-cli-stale" t))
+         (context (list :generation 3 :request-directory directory))
+         (compose-preview--generation 4)
+         (compose-preview--process 'current))
+    (cl-letf (((symbol-function 'process-status) (lambda (_) 'exit))
+              ((symbol-function 'process-get) (lambda (_process _key) context))
+              ((symbol-function 'compose-preview--finish-cli-result)
+               (lambda (&rest _) (ert-fail "published stale CLI response"))))
+      (compose-preview--cli-sentinel 'old "exit"))
+    (should (eq compose-preview--process 'current))
+    (should-not (file-exists-p directory))))
 
 (ert-deftest compose-preview-project-model-pending-requires-no-last-known-model ()
   "Preview waits only when Android sync has no usable model."
@@ -377,55 +339,10 @@
               :variant "debug"
               :preview-task "testDebugUnitTest"))))))
 
-(ert-deftest compose-preview-configuration-override-is-copy-and-resets-on-source-change ()
-  "Temporary configuration is isolated and invalidated by annotation changes."
-  (let* ((compose-preview--sessions (make-hash-table :test #'equal))
-         (compose-preview--active-file "/tmp/A.kt")
-         (session (compose-preview--session compose-preview--active-file))
-         (annotation '(("device" . "id:pixel_5") ("widthDp" . 100)))
-         (overrides (plist-get session :overrides)))
-    (puthash "preview" (list :baseline (compose-preview--configuration-baseline annotation)
-                            :values '(("widthDp" . 360) ("heightDp" . 640))) overrides)
-    (should (= (compose-preview--json-get
-                (compose-preview--effective-annotation "preview" annotation) "widthDp") 360))
-    (should (= (compose-preview--json-get annotation "widthDp") 100))
-    (compose-preview--effective-annotation "preview" '(("device" . "id:pixel_9")))
-    (should-not (gethash "preview" overrides))))
-
-(ert-deftest compose-preview-background-settings-use-own-file-overrides ()
-  "The rendering file, not the active surface, owns configuration overrides."
-  (let* ((compose-preview--sessions (make-hash-table :test #'equal))
-         (compose-preview--active-file "/tmp/B.kt")
-         (compose-preview--render-file "/tmp/A.kt")
-         (session (compose-preview--session "/tmp/A.kt"))
-         (annotation '(("widthDp" . 100))))
-    (puthash "preview" (list :baseline (compose-preview--configuration-baseline annotation)
-                            :values '(("widthDp" . 300))) (plist-get session :overrides))
-    (should (= (compose-preview--json-get
-                (compose-preview--effective-annotation "preview" annotation) "widthDp") 300))))
-
 (ert-deftest compose-preview-size-command-rejects-invalid-dimensions ()
   "Invalid resize values cannot start rendering or mutate source."
   (dolist (size '(0 -1 10001 3.5))
     (should-error (compose-preview-set-size size 640) :type 'user-error)))
-
-(ert-deftest compose-preview-identity-distinguishes-names-configurations-and-providers ()
-  "Duplicate names or sanitized-name collisions never alias card overrides."
-  (let* ((preview '(("methodFQN" . "demo.CardKt.Card")))
-         (one '(("name" . "Phone") ("widthDp" . 320)))
-         (two '(("name" . "Phone") ("widthDp" . 640)))
-         (provider-a '(("methodFQN" . "demo.CardKt.Card")
-                       ("methodParams" . ((("provider" . "demo.A"))))))
-         (provider-b '(("methodFQN" . "demo.CardKt.Card")
-                       ("methodParams" . ((("provider" . "demo.B")))))))
-    (should-not (equal (compose-preview--preview-id preview one 0)
-                       (compose-preview--preview-id preview two 0)))
-    (should-not (equal (compose-preview--preview-id preview '(("name" . "a b")) 0)
-                       (compose-preview--preview-id preview '(("name" . "a_b")) 0)))
-    (should-not (equal (compose-preview--preview-id provider-a one 0)
-                       (compose-preview--preview-id provider-b one 0)))
-    (should (equal (compose-preview--preview-id preview one 0)
-                   (compose-preview--preview-id preview (reverse one) 0)))))
 
 (ert-deftest compose-preview-unified-component-tree-preserves-details-and-identity ()
   "Consume current Studio component schema, with strict card identity checks."
@@ -483,11 +400,11 @@
   (let* ((root (make-temp-file "preview-bounds" t))
          (child '(("name" . "Button") ("fileName" . "A.kt") ("lineNumber" . 4)
                   ("packageHash" . -1) ("bounds" . (("left" . 10) ("top" . 20)
-                                                  ("right" . 100) ("bottom" . 80)))
+                                                    ("right" . 100) ("bottom" . 80)))
                   ("children" . nil)))
          (parent `(("name" . "Column") ("fileName" . "A.kt") ("lineNumber" . 2)
                    ("packageHash" . -1) ("bounds" . (("left" . 0) ("top" . 0)
-                                                   ("right" . 200) ("bottom" . 400)))
+                                                     ("right" . 200) ("bottom" . 400)))
                    ("children" . (,child)))))
     (unwind-protect
         (progn
@@ -571,9 +488,9 @@
           (with-current-buffer source (setq buffer-file-name "/tmp/A.kt"))
           (setq compose-preview--source-buffer source)
           (let ((session (compose-preview--session "/tmp/A.kt")))
-            (setf (plist-get session :target) '(:project-root "/tmp/"))
+            (setf (plist-get session :target) '(:project-root "/tmp/")
+                  (plist-get session :stale) nil)
             (cl-letf (((symbol-function 'compose-preview--configuration-item) (lambda () item))
-                      ((symbol-function 'compose-preview--reusable-module-model) (lambda (_) t))
                       ((symbol-function 'compose-preview--save-session-view) #'ignore)
                       ((symbol-function 'compose-preview-refresh)
                        (lambda (&rest _)
@@ -586,56 +503,10 @@
                        320))))
       (kill-buffer source))))
 
-(ert-deftest compose-preview-render-settings-expands-annotations ()
-  "Renderer settings expand annotations and preserve parameter providers."
-  (let* ((root (make-temp-file "compose-preview-module" t))
-         (target (list :module-root root))
-         (model '(("layoutlibPath" . "/layoutlib")
-                  ("fontsPath" . "/layoutlib/data/fonts")
-                  ("classPath" . ("/classes"))
-                  ("projectClassPath" . ("/classes"))
-                  ("rClassJars" . ("/R.jar"))
-                  ("namespace" . "com.example")
-                  ("resourceApkPath" . "/resources.ap_")))
-         (previews
-          (list
-           (list
-            (cons "methodFQN" "com.example.FooKt.Preview")
-            (cons "previewWrapperFQN" nil)
-            (cons "methodParams"
-                  (list (list (cons "provider" "com.example.Provider"))))
-            (cons "parameterNames" (list "user"))
-            (cons "annotations"
-                  (list nil (list (cons "name" "Phone")
-                                  (cons "group" "Devices"))))))))
-    (unwind-protect
-        (let* ((render (compose-preview--render-settings model previews target))
-               (settings (compose-preview--read-json (plist-get render :settings)))
-               (screenshots (compose-preview--json-get settings "screenshots"))
-               (metadata (plist-get render :metadata))
-               (phone-id (compose-preview--preview-id
-                          (car previews)
-                          (cadr (compose-preview--json-get (car previews) "annotations")) 1)))
-          (should (= (length screenshots) 2))
-          (should (equal (compose-preview--json-get settings "rClassJars")
-                         '("/R.jar")))
-          (should (equal (plist-get (gethash phone-id metadata) :group)
-                         "Devices"))
-          (should (equal (plist-get (gethash phone-id metadata) :preview-name)
-                         "Phone"))
-          (should (equal (plist-get (gethash phone-id metadata) :parameter-name)
-                         "user"))
-          (should (equal (compose-preview--json-get
-                          (car (compose-preview--json-get
-                                (car screenshots) "methodParams"))
-                          "provider")
-                         "com.example.Provider")))
-      (delete-directory root t))))
-
 (ert-deftest compose-preview-init-script-configures-layoutlib-model ()
   "Init script collects Studio renderer inputs without snapshot frameworks."
   (with-temp-buffer
-    (insert-file-contents (expand-file-name "preview.init.gradle"))
+    (insert-file-contents (expand-file-name "gradle/preview.init.gradle"))
     (let ((script (buffer-string)))
       (should (string-match-p "compose-preview-renderer" script))
       (should (string-match-p "PreviewMethodFinder" script))
@@ -657,7 +528,7 @@
   "Android KMP internal artifacts stay isolated behind an AGP version gate."
   (with-temp-buffer
     (insert-file-contents
-     (expand-file-name "adapters/agp-9.3-kmp.init.gradle"))
+     (expand-file-name "gradle/adapters/agp-9.3-kmp.init.gradle"))
     (let ((adapter (buffer-string)))
       (should (string-match-p "com.android.kotlin.multiplatform.library" adapter))
       (should (string-match-p "ANDROID_GRADLE_PLUGIN_VERSION" adapter))
@@ -675,14 +546,14 @@
 (ert-deftest compose-preview-launcher-passes-r-class-jars ()
   "Launcher uses Studio's bootstrapper entry point with R class jars."
   (with-temp-buffer
-    (insert-file-contents (expand-file-name "ComposePreviewRenderLauncher.java"))
+    (insert-file-contents (expand-file-name "renderer/ComposePreviewRenderLauncher.java"))
     (let ((source (buffer-string)))
       (should (string-match-p "RenderEnvironmentBootstrapper" source))
       (should (string-match-p "readStrings(settings, \"rClassJars\")" source))
       (should (string-match-p "displayName" source))
       (should (string-match-p "instanceId" source))))
   (with-temp-buffer
-    (insert-file-contents (expand-file-name "compose-preview.el"))
+    (insert-file-contents (expand-file-name "cli/src/main/kotlin/cat/preview/Main.kt"))
     (should (string-match-p "layoutlib.thread.profile.timeoutms"
                             (buffer-string)))))
 
@@ -936,7 +807,7 @@
                      ("imagePath" . "phone.png")
                      ("densityDpi" . 480))))
          (_ (puthash id '(:preview-name "Phone" :group "Devices"
-                          :source-file "Foo.kt") metadata))
+					:source-file "Foo.kt") metadata))
          (items (compose-preview--result-items results "/tmp/rendered/" metadata))
          (item (car items)))
     (should (equal (compose-preview-item-name item) "CardPreview - Phone"))
@@ -969,7 +840,7 @@
                      ("displayName" . "LoginPreview - Login (param0 1)")
                      ("parameterName" . "param0 1"))))
          (_ (puthash id '(:preview-name "Login" :group "Auth"
-                          :source-file "Foo.kt" :parameter-name "user")
+					:source-file "Foo.kt" :parameter-name "user")
                      metadata))
          (items (compose-preview--result-items results "/tmp/rendered/" metadata)))
     (should (equal (mapcar #'compose-preview-item-id items)
@@ -1091,44 +962,13 @@
     (should (looking-at-p "fun Card"))
     (should (save-excursion (re-search-backward "class Second" nil t)))))
 
-(ert-deftest compose-preview-finish-render-keeps-partial-results ()
-  "Individual render failures do not discard successful Preview results."
-  (let* ((results-file (make-temp-file "compose-preview-results" nil ".json"))
-         (compose-preview--last-result-items nil)
-         rendered)
-    (unwind-protect
-        (progn
-          (with-temp-file results-file
-            (insert "{\"screenshotResults\":["
-                    "{\"methodFQN\":\"com.example.FooKt.Good\","
-                    "\"previewId\":\"com.example.FooKt.Good_0\","
-                    "\"imagePath\":\"good.png\"},"
-                    "{\"methodFQN\":\"com.example.FooKt.Bad\","
-                    "\"previewId\":\"com.example.FooKt.Bad_0\","
-                    "\"error\":{\"message\":\"boom\"}}]}"))
-          (with-current-buffer (get-buffer-create compose-preview-results-buffer-name)
-            (compose-preview-results-mode))
-          (cl-letf (((symbol-function 'compose-preview--render-results)
-                     (lambda (_root _images items _source)
-                       (setq rendered items)))
-                    ((symbol-function 'compose-preview--log) #'ignore))
-            (compose-preview--finish-render
-             `(:target (:module-root "/tmp/")
-               :render (:results ,results-file :output "/tmp/"))))
-          (should (= (length rendered) 2))
-          (should-not (compose-preview-item-error (car rendered)))
-          (should (compose-preview-item-error (cadr rendered))))
-      (delete-file results-file)
-      (when-let* ((buffer (get-buffer compose-preview-results-buffer-name)))
-        (kill-buffer buffer)))))
-
 (ert-deftest compose-preview-fallback-target-cache-does-not-cross-modules ()
   "Without android-project, a project cache cannot redirect another module."
   (let ((compose-preview-use-android-project-flavors nil)
         (compose-preview--target-cache
          '(("/tmp/project" . (:project-root "/tmp/project/"
-                              :module-root "/tmp/project/a/"
-                              :module-path ":a" :variant "debug")))))
+					    :module-root "/tmp/project/a/"
+					    :module-path ":a" :variant "debug")))))
     (cl-letf (((symbol-function 'compose-preview--find-project-root)
                (lambda () "/tmp/project/"))
               ((symbol-function 'compose-preview--find-module-root)
@@ -1150,7 +990,6 @@
   (let* ((root (file-name-as-directory (make-temp-file "preview-cache-project" t)))
          (source (generate-new-buffer " *preview-cache-source*"))
          (compose-preview--sessions (make-hash-table :test #'equal))
-         (compose-preview--module-models (make-hash-table :test #'equal))
          (compose-preview--project-input-signatures (make-hash-table :test #'equal))
          (compose-preview--input-watch-timer nil)
          (compose-preview--active-file nil)
@@ -1196,11 +1035,11 @@
                      (lambda (&rest _) (setq painted t)))
                     ((symbol-function 'compose-preview--complete-work) #'ignore)
                     ((symbol-function 'compose-preview--log) #'ignore))
-            (compose-preview--finish-render
-             (list :generation 1 :source-buffer source
+            (compose-preview--finish-cli-result
+             (list :generation 1 :source-buffer source :source-file "/tmp/A.kt"
                    :stamp (compose-preview--source-stamp source)
-                   :target '(:module-root "/tmp/" :project-root "/tmp/")
-                   :render '(:results "unused" :output "/tmp/"))))
+                   :target '(:module-root "/tmp/" :project-root "/tmp/"))
+             '(("outputDirectory" . "/tmp/") ("results" . nil) ("status" . "ready"))))
           (should-not painted)
           (should (equal (plist-get (gethash "/tmp/A.kt" compose-preview--sessions)
                                     :items)
@@ -1270,32 +1109,6 @@
       (should (plist-get session :stale))
       (should (= (plist-get session :revision) 1)))))
 
-(ert-deftest compose-preview-in-flight-invalidated-result-stays-stale ()
-  "A model change during rendering cannot publish a fresh cached session."
-  (let ((source (generate-new-buffer " *preview-stale-source*"))
-        (compose-preview--sessions (make-hash-table :test #'equal))
-        (compose-preview--active-file "/tmp/B.kt")
-        (compose-preview--work-context '(:generation 1)))
-    (unwind-protect
-        (progn
-          (with-current-buffer source (setq buffer-file-name "/tmp/A.kt"))
-          (let ((session (compose-preview--session "/tmp/A.kt")))
-            (setf (plist-get session :target) '(:project-root "/tmp/project/"))
-            (compose-preview--invalidate-project-sessions "/tmp/project/")
-            (cl-letf (((symbol-function 'compose-preview--read-json)
-                       (lambda (_) '(("screenshotResults" . nil))))
-                      ((symbol-function 'compose-preview--result-items)
-                       (lambda (&rest _) nil))
-                      ((symbol-function 'compose-preview--complete-work) #'ignore)
-                      ((symbol-function 'compose-preview--log) #'ignore))
-              (compose-preview--finish-render
-               (list :generation 1 :revision nil :source-buffer source
-                     :stamp (compose-preview--source-stamp source)
-                     :target '(:project-root "/tmp/project/" :module-root "/tmp/")
-                     :render '(:results "unused" :output "/tmp/"))))
-            (should (plist-get session :stale))))
-      (kill-buffer source))))
-
 (ert-deftest compose-preview-hidden-session-status-does-not-open-panel ()
   "Background progress on a deactivated file cannot reopen its panel."
   (let ((source (generate-new-buffer " *preview-inactive-source*"))
@@ -1361,55 +1174,6 @@
             (should-not (equal before (compose-preview--input-signature root)))))
       (delete-directory root t))))
 
-(ert-deftest compose-preview-module-model-reuse-validates-inputs-and-artifacts ()
-  "Module model reuse rejects changed sources and compiled classpath files."
-  (let* ((root (file-name-as-directory (make-temp-file "preview-model-cache" t)))
-         (target (list :project-root root :module-root root :module-path ":app" :variant "debug"))
-         (file (expand-file-name "model.json" root))
-         (classes (expand-file-name "build/classes/A.class" root))
-         (model (list (cons "classPath" (list classes))))
-         (compose-preview--module-models (make-hash-table :test #'equal)))
-    (unwind-protect
-        (progn
-          (make-directory (file-name-directory classes) t)
-          (with-temp-file classes (insert "bytecode"))
-          (with-temp-file file (insert "{}"))
-          (puthash (compose-preview--module-model-key target)
-                   (list :file file :model model
-                         :inputs (compose-preview--input-signature root)
-                         :artifacts (compose-preview--model-artifact-signature model))
-                   compose-preview--module-models)
-          (should (compose-preview--reusable-module-model target))
-          (with-temp-file classes (insert "changed-bytecode"))
-          (should-not (compose-preview--reusable-module-model target)))
-      (delete-directory root t))))
-
-(ert-deftest compose-preview-artifact-cleanup-only-deletes-owned-unreferenced-paths ()
-  "Cleanup protects cached images and never deletes unowned generation names."
-  (let* ((root (file-name-as-directory (make-temp-file "preview-cleanup" t)))
-         (live (expand-file-name "rendered-1" root))
-         (dead (expand-file-name "rendered-2" root))
-         (unowned (expand-file-name "rendered-3" root))
-         (compose-preview--artifact-roots (list root))
-         (compose-preview--owned-artifacts (list live dead))
-         (compose-preview--work-context nil)
-         (compose-preview--module-models (make-hash-table :test #'equal))
-         (compose-preview--sessions (make-hash-table :test #'equal))
-         (compose-preview--last-result-items nil)
-         (compose-preview-results-buffer-name " *nonexistent-preview-cleanup*"))
-    (unwind-protect
-        (progn
-          (dolist (directory (list live dead unowned)) (make-directory directory))
-          (let ((image (expand-file-name "A.png" live))
-                (session (compose-preview--session "/tmp/A.kt")))
-            (with-temp-file image (insert "PNG"))
-            (setf (plist-get session :images) (list image)))
-          (compose-preview--cleanup-artifacts)
-          (should (file-directory-p live))
-          (should-not (file-exists-p dead))
-          (should (file-directory-p unowned)))
-      (delete-directory root t))))
-
 (ert-deftest compose-preview-session-status-reports-unsaved-and-stale ()
   "Cached images must not masquerade as fresh results after source changes."
   (let ((source (generate-new-buffer " *preview-status-unsaved*")))
@@ -1442,12 +1206,6 @@
     (cl-letf (((symbol-function 'compose-preview--input-signature)
                (lambda (_root) (ert-fail "inactive Preview scanned project"))))
       (compose-preview--watch-inputs))))
-
-(ert-deftest compose-preview-gradle-daemon-disable-is-explicit ()
-  "Disabling reuse must override Gradle's own daemon-enabled default."
-  (let ((compose-preview-use-gradle-daemon nil))
-    (should (member "--no-daemon"
-                    (compose-preview--gradle-arguments ":app:preview" "/tmp/init.gradle")))))
 
 (ert-deftest compose-preview-monitor-throttles-visible-project ()
   "Repeated idle callbacks scan only the current root at the configured interval."
@@ -1497,31 +1255,6 @@
         (should (equal (compose-preview--input-signature "/project/") '(1))))
       (should (equal (compose-preview--input-signature "/project/") '(2))))))
 
-(ert-deftest compose-preview-render-timeout-never-kills-superseding-process ()
-  "An old timeout cannot terminate a newer renderer or shared Java daemon."
-  (let ((compose-preview--process 'new-renderer)
-        (compose-preview--generation 4)
-        killed)
-    (cl-letf (((symbol-function 'process-live-p) (lambda (_) t))
-              ((symbol-function 'process-put) #'ignore)
-              ((symbol-function 'delete-process) (lambda (process) (setq killed process))))
-      (compose-preview--render-timed-out 'old-renderer 3)
-      (should-not killed)
-      (compose-preview--render-timed-out 'new-renderer 4)
-      (should (eq killed 'new-renderer)))))
-
-(ert-deftest compose-preview-render-timeout-is-cancelled-on-process-exit ()
-  "Finished renderers must not retain process timeout timers."
-  (let (cancelled cleared)
-    (cl-letf (((symbol-function 'process-get) (lambda (&rest _) 'timer))
-              ((symbol-function 'timerp) (lambda (_) t))
-              ((symbol-function 'cancel-timer) (lambda (timer) (setq cancelled timer)))
-              ((symbol-function 'process-put)
-               (lambda (_process property value) (setq cleared (list property value)))))
-      (compose-preview--cancel-render-timeout 'process)
-      (should (eq cancelled 'timer))
-      (should (equal cleared '(compose-preview-timeout nil))))))
-
 (ert-deftest compose-preview-panel-disposal-releases-owned-work-and-monitoring ()
   "Killing the Preview panel stops its work without touching shared daemons."
   (let ((compose-preview--active-file "/tmp/A.kt")
@@ -1557,7 +1290,7 @@
         (java (executable-find "java")))
     (skip-unless (and javac java))
     (let ((directory (make-temp-file "preview-cleanup-java" t))
-          (launcher (expand-file-name "ComposePreviewRenderLauncher.java")))
+          (launcher (expand-file-name "renderer/ComposePreviewRenderLauncher.java")))
       (unwind-protect
           (let* ((source (with-temp-buffer
                            (insert-file-contents launcher)
@@ -1587,19 +1320,18 @@
                       (accept-process-output process 0.05))
                     (should-not (process-live-p process))
                     (should (= 0 (process-exit-status process)))
-                (when (process-live-p process) (delete-process process))))
-            (with-current-buffer output
-              (should (string-match-p "CLEANUP-OK" (buffer-string)))))
-        (when-let* ((output (get-buffer " *preview-cleanup-java-output*")))
-          (kill-buffer output))
-        (delete-directory directory t))))))
+                    (when (process-live-p process) (delete-process process))))
+              (with-current-buffer output
+		(should (string-match-p "CLEANUP-OK" (buffer-string)))))
+            (when-let* ((output (get-buffer " *preview-cleanup-java-output*")))
+              (kill-buffer output))
+            (delete-directory directory t))))))
 
 (ert-deftest compose-preview-idle-monitor-invalidates-external-source-change ()
   "External source edits invalidate both file and module model caches."
   (let* ((root (file-name-as-directory (make-temp-file "preview-watch" t)))
          (file (expand-file-name "A.kt" root))
          (compose-preview--sessions (make-hash-table :test #'equal))
-         (compose-preview--module-models (make-hash-table :test #'equal))
          (compose-preview--project-input-signatures (make-hash-table :test #'equal))
          (compose-preview--active-file file)
          (compose-preview--last-input-check (make-hash-table :test #'equal))
@@ -1613,15 +1345,12 @@
           (let ((session (compose-preview--session file)))
             (setf (plist-get session :target) target
                   (plist-get session :stale) nil)
-            (puthash (compose-preview--module-model-key target) '(:file "old")
-                     compose-preview--module-models)
             (puthash root (compose-preview--input-signature root)
                      compose-preview--project-input-signatures)
             (with-temp-file file (insert "fun ChangedExternally() {}"))
             (cl-letf (((symbol-function 'get-buffer-window) (lambda (&rest _) t)))
               (compose-preview--watch-inputs))
-            (should (plist-get session :stale))
-            (should (= (hash-table-count compose-preview--module-models) 0))))
+            (should (plist-get session :stale))))
       (kill-buffer compose-preview-results-buffer-name)
       (delete-directory root t))))
 
@@ -1663,62 +1392,6 @@
                       ((symbol-function 'compose-preview--show-session) #'ignore))
               (should-not (compose-preview--activate-file source)))))
       (kill-buffer source))))
-
-(ert-deftest compose-preview-render-sentinel-consumes-partial-failure-results ()
-  "Exit 1 with serialized card results still publishes successful Preview cards."
-  (let* ((file (make-temp-file "preview-partial-results" nil ".json"))
-         (context (list :generation 7 :render (list :results file)))
-         (compose-preview--generation 7)
-         finished)
-    (unwind-protect
-        (cl-letf (((symbol-function 'process-status) (lambda (_) 'exit))
-                  ((symbol-function 'process-exit-status) (lambda (_) 1))
-                  ((symbol-function 'process-get)
-                   (lambda (_process key) (and (eq key 'compose-preview-context) context)))
-                  ((symbol-function 'compose-preview--cancel-render-timeout) #'ignore)
-                  ((symbol-function 'compose-preview--finish-render)
-                   (lambda (ctx) (setq finished ctx)))
-                  ((symbol-function 'compose-preview--fail)
-                   (lambda (&rest _) (ert-fail "discarded per-card results"))))
-          (compose-preview--render-sentinel 'process "exited abnormally with code 1")
-          (should (eq finished context)))
-      (delete-file file))))
-
-(ert-deftest compose-preview-render-sentinel-timeout-never-publishes-results ()
-  "Timeout is a batch failure even when an old result file remains readable."
-  (let* ((file (make-temp-file "preview-timeout-results" nil ".json"))
-         (context (list :generation 7 :render (list :results file)))
-         (compose-preview--generation 7)
-         failed)
-    (unwind-protect
-        (cl-letf (((symbol-function 'process-status) (lambda (_) 'exit))
-                  ((symbol-function 'process-exit-status) (lambda (_) 1))
-                  ((symbol-function 'process-get)
-                   (lambda (_process key)
-                     (pcase key
-                       ('compose-preview-context context)
-                       ('compose-preview-timed-out t))))
-                  ((symbol-function 'compose-preview--cancel-render-timeout) #'ignore)
-                  ((symbol-function 'compose-preview--finish-render)
-                   (lambda (&rest _) (ert-fail "published timed out result")))
-                  ((symbol-function 'compose-preview--fail)
-                   (lambda (&rest _) (setq failed t))))
-          (compose-preview--render-sentinel 'process "exit")
-          (should failed))
-      (delete-file file))))
-
-(ert-deftest compose-preview-stale-render-sentinel-is-ignored ()
-  "A superseded renderer process cannot replace current panel results."
-  (let ((compose-preview--generation 2)
-        finished)
-    (cl-letf (((symbol-function 'process-status) (lambda (_process) 'exit))
-              ((symbol-function 'process-get)
-               (lambda (_process _property) '(:generation 1)))
-              ((symbol-function 'compose-preview--cancel-render-timeout) #'ignore)
-              ((symbol-function 'compose-preview--finish-render)
-               (lambda (_context) (setq finished t))))
-      (compose-preview--render-sentinel 'process "finished\n")
-      (should-not finished))))
 
 (ert-deftest compose-preview-auto-refresh-uses-source-buffer ()
   "Debounced refresh runs in its original source buffer."
@@ -1776,18 +1449,16 @@
   (let (hidden failed)
     (cl-letf (((symbol-function 'compose-preview--read-json)
                (lambda (_file) '(("previews"))))
-              ((symbol-function 'compose-preview--select-model-previews)
-               (lambda (&rest _) nil))
               ((symbol-function 'compose-preview--hide-panel)
                (lambda () (setq hidden t)))
               ((symbol-function 'compose-preview--fail)
                (lambda (&rest _) (setq failed t)))
               ((symbol-function 'compose-preview--log) #'ignore))
-      (compose-preview--start-render
-       '(:model-file "/tmp/model.json"
-         :source-file "/tmp/Plain.kt"
-         :follow-refresh t
-         :target (:module-path ":app")))
+      (let ((compose-preview--active-file "/tmp/Plain.kt"))
+        (compose-preview--finish-cli-result
+         (list :source-buffer (current-buffer) :source-file "/tmp/Plain.kt"
+               :follow-refresh t :target '(:module-path ":app"))
+         '(("outputDirectory" . "/tmp/") ("results" . nil) ("status" . "ready"))))
       (should hidden)
       (should-not failed))))
 
@@ -1861,56 +1532,6 @@
        "compose-preview: Android KMP failed")
       (should (equal status "failed — Android KMP failed"))
       (should (equal logged "Android KMP failed")))))
-
-(ert-deftest compose-preview-gradle-arguments-reuse-daemon-and-caches ()
-  "Preview Gradle invocations reuse the daemon and incremental caches."
-  (let ((compose-preview-use-gradle-daemon t)
-        (compose-preview-force-clean-build nil))
-    (should (equal (compose-preview--gradle-arguments ":app:preview" "/init.gradle")
-                   '(":app:preview" "--init-script" "/init.gradle" "--daemon"))))
-  (let ((compose-preview-use-gradle-daemon nil)
-        (compose-preview-force-clean-build t))
-    (should (equal (compose-preview--gradle-arguments ":app:preview" "/init.gradle")
-                   '(":app:preview" "--init-script" "/init.gradle"
-                     "--no-daemon" "--no-build-cache" "--no-parallel")))))
-
-(ert-deftest compose-preview-gradle-failure-prefers-specific-diagnostic ()
-  "Gradle failures surface compose-preview diagnostics in the panel."
-  (with-temp-buffer
-    (insert "* What went wrong:\n"
-            "> compose-preview: Android KMP resources are unavailable\n")
-    (should (equal
-             (compose-preview--gradle-failure-message
-              (list :log-buffer (current-buffer)) 1)
-             "compose-preview: Android KMP resources are unavailable"))))
-
-(ert-deftest compose-preview-launcher-compilation-is-asynchronous ()
-  "A stale launcher cache starts javac without blocking Emacs."
-  (let ((context '(:generation 1
-                   :target (:project-root "/tmp/" :module-root "/tmp/")
-                   :source-buffer nil
-                   :launcher (:javac "/jdk/bin/javac"
-                              :classpath "/renderer.jar"
-                              :directory "/tmp/launcher/"
-                              :source "/package/Launcher.java")
-                   :log-buffer nil))
-        command sentinel)
-      (with-temp-buffer
-        (setf (plist-get context :log-buffer) (current-buffer))
-        (cl-letf (((symbol-function 'make-directory) #'ignore)
-                  ((symbol-function 'make-process)
-                   (lambda (&rest args)
-                     (setq command (plist-get args :command))
-                     'javac-process))
-                  ((symbol-function 'process-put) #'ignore)
-                  ((symbol-function 'set-process-sentinel)
-                   (lambda (_process function) (setq sentinel function)))
-                  ((symbol-function 'compose-preview--panel-status) #'ignore))
-          (compose-preview--compile-launcher context)))
-      (should (equal (car command) "/jdk/bin/javac"))
-      (should (equal (seq-take (cdr command) 3)
-                     '("-nowarn" "--release" "17")))
-      (should (eq sentinel #'compose-preview--launcher-sentinel))))
 
 (provide 'compose-preview-tests)
 

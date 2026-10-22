@@ -1,0 +1,16 @@
+#!/bin/sh
+set -eu
+# Resolve installed symlinks without assuming the caller's working directory.
+SCRIPT=$0
+while [ -L "$SCRIPT" ]; do
+  DIR=$(CDPATH= cd -- "$(dirname -- "$SCRIPT")" && pwd)
+  LINK=$(readlink "$SCRIPT")
+  case "$LINK" in /*) SCRIPT=$LINK ;; *) SCRIPT=$DIR/$LINK ;; esac
+done
+HOME_DIR=$(CDPATH= cd -- "$(dirname -- "$SCRIPT")/.." && pwd)
+PROGRAM="$HOME_DIR/cli/build/install/compose-preview/bin/compose-preview"
+if [ ! -x "$PROGRAM" ]; then
+  echo 'compose-preview CLI is not built. Run ./gradlew :cli:installDist or make install-local.' >&2
+  exit 2
+fi
+exec "$PROGRAM" "$@"
