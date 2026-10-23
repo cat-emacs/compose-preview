@@ -1282,6 +1282,43 @@
                (lambda (_root) (ert-fail "inactive Preview scanned project"))))
       (compose-preview--watch-inputs))))
 
+(ert-deftest compose-preview-dependency-file-invalidation-is-targeted-with-ready-graph ()
+  "Known unrelated source changes do not invalidate a ready target graph."
+  (let ((target '(:project-root "/tmp/entry/" :build-root "/tmp/entry/" :module-root "/tmp/entry/app/"
+                  :module-path ":app" :variant "debug"))
+        (snapshot '(:state ready :edges ((:build-root "/tmp/external" :module-path ":lib"))))
+        (compose-preview-use-android-project-flavors t))
+    (cl-letf (((symbol-function 'file-in-directory-p)
+               (lambda (file dir) (string-prefix-p (file-name-as-directory dir) file)))
+              ((symbol-function 'compose-preview--android-project-status) (lambda (&rest _) '(:state ready)))
+              ((symbol-function 'android-project-dependencies) (lambda (&rest _) snapshot))
+              ((symbol-function 'android-project-variants)
+               (lambda (&rest _) '((:build-root "/tmp/entry" :module-path ":unrelated" :module-root "/tmp/entry/unrelated")
+                                   (:build-root "/tmp/external" :module-path ":lib" :module-root "/tmp/external/lib")))))
+      (let ((session (list :target target :input-roots '("/tmp/entry/" "/tmp/external/"))))
+        (should (compose-preview--session-affected-by-file-p session "/tmp/external/lib/src/A.kt"))
+        (should-not (compose-preview--session-affected-by-file-p session "/tmp/entry/unrelated/src/A.kt"))
+        (should (compose-preview--session-affected-by-file-p session "/tmp/entry/unrelated/build.gradle.kts"))
+        (setq snapshot '(:state partial :edges nil))
+        (should (compose-preview--session-affected-by-file-p session "/tmp/entry/unrelated/src/A.kt"))))))
+
+(ert-deftest compose-preview-input-diff-detects-added-removed-and-edited-paths ()
+  "Metadata diff handles file deletion without rescanning quadratic pairs."
+  (should (equal (sort (compose-preview--changed-input-files
+                       '(("a" . 1) ("b" . 2) ("c" . 3))
+                       '(("a" . 1) ("c" . 4) ("d" . 5))) #'string<)
+                 '("b" "c" "d"))))
+
+(ert-deftest compose-preview-missing-graph-protects-all-discovered-builds ()
+  "No ready dependency graph means conservative external input protection."
+  (cl-letf (((symbol-function 'android-project-dependencies) (lambda (&rest _) '(:state not-requested)))
+            ((symbol-function 'android-project-variants)
+             (lambda (&rest _) '((:model-build-roots ("/tmp/entry" "/tmp/external"))))))
+    (let ((roots (compose-preview--dependency-input-roots
+                  '(:project-root "/tmp/entry/" :build-root "/tmp/entry/" :module-path ":app" :variant "debug"))))
+      (should (member "/tmp/external/" roots))
+      (should (member "/tmp/entry/" roots)))))
+
 (ert-deftest compose-preview-monitor-throttles-visible-project ()
   "Repeated idle callbacks scan only the current root at the configured interval."
   (let* ((root "/tmp/project/")

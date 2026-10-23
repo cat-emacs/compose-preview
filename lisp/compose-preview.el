@@ -558,10 +558,15 @@ Do not follow symlink directories or traverse build/runtime output trees."
                  (>= (- (float-time) (gethash root compose-preview--last-input-check 0))
                      compose-preview-input-check-interval))
         (condition-case err
-            (let ((signature (compose-preview--input-signature root)))
-              (unless (equal signature (gethash root compose-preview--project-input-signatures))
-                (puthash root signature compose-preview--project-input-signatures)
-                (compose-preview--invalidate-project-sessions root)))
+            (dolist (input-root (compose-preview--session-input-roots session))
+              (let ((signature (compose-preview--input-signature input-root)))
+                (unless (equal signature (gethash input-root compose-preview--project-input-signatures))
+                  (let ((old (gethash input-root compose-preview--project-input-signatures)))
+                    (puthash input-root signature compose-preview--project-input-signatures)
+                    (if old
+                        (compose-preview--invalidate-changed-files
+                         (compose-preview--changed-input-files old signature))
+                      (compose-preview--invalidate-project-sessions input-root))))))
           (file-error (compose-preview--log "input monitoring: %s" (error-message-string err))))
         (puthash root (float-time) compose-preview--last-input-check))
       (with-current-buffer compose-preview-results-buffer-name
@@ -571,12 +576,23 @@ Do not follow symlink directories or traverse build/runtime output trees."
            (compose-preview--session-status session compose-preview--source-buffer)
            (if (plist-get session :stale) 'warning (plist-get session :face))))))))
 
+(defun compose-preview--changed-input-files (old current)
+  "Return changed paths between OLD and CURRENT metadata signatures."
+  (let ((previous (make-hash-table :test #'equal)) changed)
+    (dolist (entry old) (puthash (car entry) (cdr entry) previous))
+    (dolist (entry current)
+      (unless (equal (gethash (car entry) previous :missing) (cdr entry))
+        (push (car entry) changed))
+      (remhash (car entry) previous))
+    (maphash (lambda (file _metadata) (push file changed)) previous)
+    changed))
+
 (defun compose-preview--track-inputs (root)
   "Track ROOT's external changes with a shared idle metadata monitor."
   (let ((signature (compose-preview--input-signature root))
         (old (gethash root compose-preview--project-input-signatures)))
     (when (and old (not (equal old signature)))
-      (compose-preview--invalidate-project-sessions root))
+      (compose-preview--invalidate-changed-files (compose-preview--changed-input-files old signature)))
     (puthash root signature compose-preview--project-input-signatures)
     (puthash root (float-time) compose-preview--last-input-check)
     (compose-preview--resume-input-monitor)
@@ -692,7 +708,8 @@ Do not follow symlink directories or traverse build/runtime output trees."
   "Return an honest cache/build status for SESSION and source BUFFER."
   (let ((root (plist-get (plist-get session :target) :project-root)))
     (cond
-     ((and root (compose-preview--project-unsaved-p root))
+     ((and root (seq-some #'compose-preview--project-unsaved-p
+                           (compose-preview--session-input-roots session)))
       "unsaved changes — preview uses saved sources")
      ((and (plist-get session :stale) (plist-get session :items))
       "out of date — last rendered images")
@@ -715,17 +732,21 @@ Do not follow symlink directories or traverse build/runtime output trees."
               (not (equal (compose-preview--source-stamp buffer)
                           (plist-get session :stamp)))
               (not (seq-every-p #'file-exists-p (plist-get session :images)))
-              (when-let* ((root (plist-get target :project-root)))
-                (let ((old (gethash root compose-preview--project-input-signatures))
-                      (signature (compose-preview--track-inputs root)))
-                  (and old (not (equal old signature))))))
+              (seq-some
+               (lambda (root)
+                 (let ((old (gethash root compose-preview--project-input-signatures))
+                       (signature (compose-preview--track-inputs root)))
+                   (and old
+                        (seq-some (lambda (file) (compose-preview--session-affected-by-file-p session file))
+                                  (compose-preview--changed-input-files old signature)))))
+               (compose-preview--session-input-roots session)))
       (setf (plist-get session :stale) t))
     (compose-preview--show-session session buffer)
     (compose-preview--evict-sessions)
     (and target
          (not (buffer-modified-p buffer))
          (not (plist-get session :stale))
-         (not (compose-preview--project-unsaved-p (plist-get target :project-root)))
+         (not (seq-some #'compose-preview--project-unsaved-p (compose-preview--session-input-roots session)))
          (equal target (plist-get session :target))
          (equal (compose-preview--source-stamp buffer)
                 (plist-get session :stamp))
@@ -736,18 +757,87 @@ Do not follow symlink directories or traverse build/runtime output trees."
   "Invalidate cached and in-flight Preview sessions belonging to ROOT."
   (maphash
    (lambda (_key session)
-     (when (equal (plist-get (plist-get session :target) :project-root) root)
+     (when (member (file-name-as-directory root)
+                   (mapcar #'file-name-as-directory (compose-preview--session-input-roots session)))
        (setf (plist-get session :stale) t
              (plist-get session :revision)
              (1+ (or (plist-get session :revision) 0)))))
    compose-preview--sessions))
 
+(defun compose-preview--dependency-input-roots (target)
+  "Return roots affecting TARGET, requesting its dependency model asynchronously."
+  (let* ((root (plist-get target :project-root))
+         (build (or (plist-get target :build-root) root))
+         (snapshot (and compose-preview-use-android-project-flavors
+                        (fboundp 'android-project-dependencies)
+                        (android-project-dependencies
+                         (cons (directory-file-name build) (plist-get target :module-path))
+                         (plist-get target :variant) root)))
+         (entries (and compose-preview-use-android-project-flavors
+                       (fboundp 'android-project-variants) (android-project-variants root)))
+         ;; Keep entry/owning-build protection even with a ready graph.
+         (roots (list root build)))
+    (dolist (edge (plist-get snapshot :edges))
+      (when (plist-get edge :build-root)
+        (push (plist-get edge :build-root) roots)))
+    ;; Source dependencies do not describe convention/plugin build inputs.
+    ;; Keep all discovered builds protected even when the source graph is ready.
+    (dolist (entry entries)
+      (setq roots (append (plist-get entry :model-build-roots) roots)))
+    (delete-dups (mapcar #'file-name-as-directory (delq nil roots)))))
+
+(defun compose-preview--session-input-roots (session)
+  "Return the roots protected by SESSION's last request."
+  (or (plist-get session :input-roots)
+      (when-let* ((target (plist-get session :target)))
+        (delete-dups (delq nil (list (plist-get target :project-root)
+                                    (plist-get target :build-root)))))))
+
+(defun compose-preview--session-affected-by-file-p (session file)
+  "Conservatively test whether FILE can change SESSION's rendered artifacts."
+  (let* ((target (plist-get session :target))
+         (root (plist-get target :project-root))
+         (snapshot (and (fboundp 'android-project-dependencies)
+                        compose-preview-use-android-project-flavors
+                        (android-project-dependencies
+                         (cons (directory-file-name (or (plist-get target :build-root) root))
+                               (plist-get target :module-path)) (plist-get target :variant) root)))
+         (entries (and (eq (plist-get snapshot :state) 'ready)
+                       (eq (plist-get (compose-preview--android-project-status root) :state) 'ready)
+                       (android-project-variants root)))
+         (owner (and entries (seq-find (lambda (entry)
+                                        (let ((dir (plist-get entry :module-root)))
+                                          (and dir (file-in-directory-p file dir))))
+                                      (sort (copy-sequence entries)
+                                            (lambda (a b) (> (length (plist-get a :module-root))
+                                                             (length (plist-get b :module-root)))))))))
+    (cond
+     ;; Build scripts, unknown ownership and incomplete models use broad fallback.
+     ((or (not owner) (not (eq (plist-get snapshot :state) 'ready))
+          (not (member (file-name-extension file) '("kt" "java" "xml" "png" "webp" "jpg" "ttf" "otf"))))
+      (seq-some (lambda (dir) (file-in-directory-p file dir)) (compose-preview--session-input-roots session)))
+     ((and (equal (plist-get owner :build-root) (directory-file-name (or (plist-get target :build-root) root)))
+           (equal (plist-get owner :module-path) (plist-get target :module-path))) t)
+     (t (seq-some (lambda (edge)
+                    (and (equal (plist-get edge :build-root) (plist-get owner :build-root))
+                         (equal (plist-get edge :module-path) (plist-get owner :module-path))))
+                  (plist-get snapshot :edges))))))
+
+(defun compose-preview--invalidate-changed-files (files)
+  "Invalidate sessions affected by changed input FILES."
+  (maphash
+   (lambda (_key session)
+     (when (and (plist-get session :target)
+                (seq-some (lambda (file) (compose-preview--session-affected-by-file-p session file)) files))
+       (setf (plist-get session :stale) t
+             (plist-get session :revision) (1+ (or (plist-get session :revision) 0)))))
+   compose-preview--sessions))
+
 (defun compose-preview--source-saved ()
   "Invalidate file sessions after source or resource changes in their project."
-  (when-let* ((root (compose-preview--find-project-root))
-              (file buffer-file-name)
-              ((compose-preview--input-file-p file root)))
-    (compose-preview--invalidate-project-sessions root)))
+  (when-let* ((file buffer-file-name))
+    (when (compose-preview--input-file-p file (or (compose-preview--find-project-root) default-directory))
+      (compose-preview--invalidate-changed-files (list file)))))
 
 (defun compose-preview--drain-request ()
   "Start the latest pending request when no render chain is running."
@@ -3068,6 +3158,9 @@ running; only the newest waiting file request is retained."
                           (compose-preview--cache-key (plist-get target :module-root)))
                    (equal (compose-preview--json-get reported "component")
                           (or (plist-get (plist-get target :component) :kind) "main"))
+                   (equal (sort (mapcar #'compose-preview--cache-key
+                                        (compose-preview--json-get reported "inputRoots")) #'string<)
+                          (sort (mapcar #'compose-preview--cache-key (plist-get context :input-roots)) #'string<))
                    (equal (compose-preview--json-get reported "componentName")
                           (or (plist-get (plist-get target :component) :name) (plist-get target :variant))))
         (error "CLI returned a different target")))
@@ -3129,6 +3222,7 @@ running; only the newest waiting file request is retained."
   (let* ((source (current-buffer))
          (target (compose-preview--validate-target (compose-preview--target current-prefix-arg) variant))
          (variant (plist-get target :variant))
+         (input-roots (compose-preview--dependency-input-roots target))
          (key (compose-preview--file-key source))
          (method (unless compose-preview--refresh-all-in-file (compose-preview--current-preview-method-fqn)))
          (generation (cl-incf compose-preview--generation))
@@ -3151,6 +3245,7 @@ running; only the newest waiting file request is retained."
                                 "--layoutlib-version" compose-preview-layoutlib-version
                                 "--detector-version" compose-preview-detector-version
                                 "--timeout" (number-to-string compose-preview-render-timeout))
+                          (apply #'append (mapcar (lambda (dir) (list "--input-root" dir)) input-roots))
                           (when method (list "--method" method))
                           (when compose-preview--render-only '("--no-build"))
                           (when compose-preview--follow-refresh '("--reuse"))
@@ -3163,8 +3258,7 @@ running; only the newest waiting file request is retained."
          (overrides (make-hash-table :test #'equal))
          context process)
     (setf (plist-get target :variant) variant)
-    (when (or (compose-preview--project-unsaved-p default-directory)
-              (compose-preview--project-unsaved-p (plist-get target :build-root)))
+    (when (seq-some #'compose-preview--project-unsaved-p input-roots)
       (delete-directory request t)
       (kill-buffer log)
       (user-error "Save modified project sources before rendering"))
@@ -3176,9 +3270,10 @@ running; only the newest waiting file request is retained."
     (compose-preview--write-json override-file overrides)
     (when-let* ((old (plist-get session :log)))
       (when (buffer-live-p old) (kill-buffer old)))
-    (setf (plist-get session :target) target (plist-get session :stale) t
+    (setf (plist-get session :target) target (plist-get session :input-roots) input-roots
+          (plist-get session :stale) t
           (plist-get session :log) log)
-    (setq context (list :generation generation :target target :source-buffer source :source-file key
+    (setq context (list :generation generation :target target :input-roots input-roots :source-buffer source :source-file key
                         :stamp (compose-preview--source-stamp source) :revision (plist-get session :revision)
                         :preview-method method :follow-refresh compose-preview--follow-refresh
                         :preserve-view compose-preview--render-only
@@ -3191,7 +3286,7 @@ running; only the newest waiting file request is retained."
                 compose-preview--process process)
           (process-put process 'compose-preview-context context)
           (set-process-sentinel process #'compose-preview--cli-sentinel)
-          (compose-preview--track-inputs default-directory)
+          (dolist (dir input-roots) (compose-preview--track-inputs dir))
           (compose-preview--panel-status source (plist-get target :module-root)
                                          (if compose-preview--render-only "rendering from compiled model…" "building/rendering via CLI…"))
           process)

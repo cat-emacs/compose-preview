@@ -46,7 +46,7 @@ versioned ZIP/tar.gz archives and `SHA256SUMS`. Verify, extract and add `bin/` t
 PATH. JDK 17+ must already be installed. CLI versions are independent of core.
 
 Source builds need GitHub Packages credentials to download
-`org.cat-emacs:android-project-core:0.1.4` (development, not yet published).
+`org.cat-emacs:android-project-core:0.1.5` (development, not yet published).
 Use the explicit local repository below until release. Supply `GITHUB_ACTOR` and `GITHUB_TOKEN`
 securely using a classic PAT with `read:packages` or an authorized Actions token.
 GitHub requires authentication even for public Maven packages. Never commit tokens.
@@ -182,6 +182,17 @@ without building when the compiled model is fresh.
 
 ## Cache, cancellation and limits
 
+- Preview requests the active target's dependency graph asynchronously. Ready
+  graphs allow known unrelated module source saves to leave other sessions alone.
+  Build scripts, unknown ownership, stale/partial/missing graphs retain broad
+  invalidation over discovered builds. Only the visible session is monitored.
+  CLI baseline signatures remain conservative across the entry/owning build;
+  this does not claim fully incremental compilation or eliminate every rebuild.
+- `--input-root DIR` adds dependency-build inputs to CLI identity, receipts and
+  render-time revalidation; it never removes entry/owning-build baseline roots.
+  The frontend forwards graph roots plus all discovered builds, including
+  convention/plugin builds not represented by source dependency edges. Standalone CLI callers must supply
+  external roots themselves; this is not full automatic dependency discovery.
 - Reuse validates source/resource inputs, compiled artifacts, environment, core
   and renderer identity. Inputs changing during build/render cannot be reported
   as fresh. External build inputs can still require a manual build.

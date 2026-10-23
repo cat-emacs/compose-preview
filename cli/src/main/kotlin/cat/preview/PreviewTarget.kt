@@ -13,11 +13,13 @@ internal data class PreviewTarget(
     val variant: String,
     val component: String,
     val componentName: String,
-    val moduleRoot: Path? = null
+    val moduleRoot: Path? = null,
+    val inputRoots: List<Path> = emptyList()
 ) {
     init {
         if (!Regex(":(?:[\\w.+-]+(?::[\\w.+-]+)*)?").matches(modulePath))
             throw Failure("Invalid Gradle module path", "input")
+        if (inputRoots.any { !it.isAbsolute }) throw Failure("Dependency input roots must be absolute", "input")
         if (variant.isBlank() || componentName.isBlank()) throw Failure("Empty variant/component name", "input")
         if (component != "main")
             throw Failure("Preview component '$component' ($componentName) is unsupported; only main is implemented", "unsupported")
@@ -27,27 +29,33 @@ internal data class PreviewTarget(
 
     fun json(): JsonObject = obj("projectRoot" to projectRoot.toString(), "buildRoot" to buildRoot.toString(),
         "modulePath" to modulePath, "variant" to variant, "component" to component,
-        "componentName" to componentName, "moduleRoot" to moduleRoot?.toString())
+        "componentName" to componentName, "moduleRoot" to moduleRoot?.toString(),
+        "inputRoots" to inputRoots.map { it.toString() })
 
     fun verify(model: JsonObject) {
         val actual = fromModel(model)
         if (projectRoot != actual.projectRoot || buildRoot != actual.buildRoot || modulePath != actual.modulePath ||
             variant != actual.variant || component != actual.component || componentName != actual.componentName ||
-            (moduleRoot != null && moduleRoot != actual.moduleRoot))
+            (moduleRoot != null && moduleRoot != actual.moduleRoot) || inputRoots != actual.inputRoots)
             throw Failure("Gradle returned another target's model", "model")
     }
 
     companion object {
         fun fromModel(model: JsonObject): PreviewTarget {
             fun field(key: String) = model.text(key) ?: throw Failure("Model missing target field $key; rebuild required", "stale-model")
+            val roots=model.get("inputRoots")
+            if(roots != null && (!roots.isJsonArray || roots.asJsonArray.any {
+                !it.isJsonPrimitive || !it.asJsonPrimitive.isString || !Path.of(it.asString).isAbsolute
+            })) throw Failure("Invalid model input roots", "protocol")
             return PreviewTarget(Path.of(field("projectRoot")).toAbsolutePath().normalize(),
                 Path.of(field("buildRoot")).toAbsolutePath().normalize(), field("modulePath"), field("variant"),
-                field("component"), field("componentName"), Path.of(field("moduleRoot")).toAbsolutePath().normalize())
+                field("component"), field("componentName"), Path.of(field("moduleRoot")).toAbsolutePath().normalize(),
+                model.getAsJsonArray("inputRoots")?.map { Path.of(it.asString).toAbsolutePath().normalize() } ?: emptyList())
         }
     }
 }
 
 internal fun targetInputs(target: PreviewTarget, assets: Path): String {
-    val roots = listOf(target.projectRoot, target.buildRoot).distinct()
+    val roots = (listOf(target.projectRoot, target.buildRoot) + target.inputRoots).distinct()
     return cat.android.project.io.jsonHash(roots.map { listOf(it.toString(), inputSignature(it, assets)) })
 }

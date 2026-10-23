@@ -89,7 +89,7 @@ internal class Options(arguments: List<String>) {
         command = args.firstOrNull() ?: "help"
         action = if (command == "cache") args.getOrNull(1) else null
         val booleans = setOf("no-build", "reuse", "no-daemon", "clean", "dry-run", "apply", "help")
-        val known = booleans + setOf("project", "module", "variant", "model", "file", "method", "preview-id", "out", "overrides", "result-file", "previous-result", "cache-dir", "build-root", "module-root", "component", "component-name", "timeout", "build-timeout", "renderer-version", "layoutlib-version", "detector-version", "java-option", "older-than", "keep")
+        val known = booleans + setOf("project", "module", "variant", "model", "file", "method", "preview-id", "out", "overrides", "result-file", "previous-result", "cache-dir", "input-root", "build-root", "module-root", "component", "component-name", "timeout", "build-timeout", "renderer-version", "layoutlib-version", "detector-version", "java-option", "older-than", "keep")
         var index = if (command == "cache") 2 else 1
         while (index < args.size) {
             val argument = args[index++]
@@ -188,7 +188,8 @@ internal class Engine(val options: Options, val assets: Path, val processes: Pro
             throw Failure("Specify --module when --build-root differs from --project", "input")
         val variant=options.get("variant", "debug")!!
         return PreviewTarget(root,buildRoot,module,variant,
-            options.get("component", "main")!!,options.get("component-name",variant)!!,options.path("module-root"))
+            options.get("component", "main")!!,options.get("component-name",variant)!!,options.path("module-root"),
+            options.all("input-root").map { Path.of(it).toAbsolutePath().normalize() }.distinct().sorted())
     }
     fun validate(model: JsonObject): JsonObject {
         for (key in listOf("projectRoot", "moduleRoot", "modulePath", "variant", "namespace", "javaExecutable", "layoutlibPath"))
@@ -219,7 +220,9 @@ internal class Engine(val options: Options, val assets: Path, val processes: Pro
                 variant=options.get("variant") ?: target.variant,
                 component=options.get("component") ?: target.component,
                 componentName=options.get("component-name") ?: target.componentName,
-                moduleRoot=options.path("module-root") ?: target.moduleRoot)
+                moduleRoot=options.path("module-root") ?: target.moduleRoot,
+                inputRoots=if(options.all("input-root").isEmpty()) target.inputRoots else
+                    options.all("input-root").map { Path.of(it).toAbsolutePath().normalize() }.distinct().sorted())
             expected.verify(model)
             val signature = targetInputs(target, assets)
             val artifacts = artifactSignature(model)
@@ -270,7 +273,9 @@ internal class Engine(val options: Options, val assets: Path, val processes: Pro
                 buildPreviewModel(root,task,arguments,env,options.seconds("build-timeout",600))
             }
             val model = validate(readJson(path))
+            model.add("inputRoots",gson.toJsonTree(target.inputRoots.map { it.toString() }))
             target.verify(model)
+            atomicJson(path,model)
             val after = targetInputs(target, assets)
             if (before != after) throw Failure("Inputs changed while building; retry", "stale-model")
             val artifact = artifactSignature(model) ?: throw Failure("Missing compiled artifacts", "model")
@@ -453,6 +458,7 @@ Usage: compose-preview <command> [options] [--json]
   render --model MODEL --no-build --file FILE
   cache prune [--dry-run | --apply] [--older-than SECONDS] [--keep RUN]
 Target options: --build-root DIR --module-root DIR --component main --component-name VARIANT
+Input options: --input-root DIR (repeat for dependency builds; always extends baseline roots)
 Model options: --reuse --no-build --no-daemon --clean --cache-dir DIR
 Render options: --preview-id ID --overrides JSON --method FQN --result-file FILE
                --timeout SECONDS --build-timeout SECONDS --java-option=-Xmx1536m
@@ -479,7 +485,7 @@ fun main(arguments: Array<String>) {
                     "versions" to versions,"authRequired" to false,
                     "capabilities" to obj("componentTree" to false,"inflateOnly" to false,
                         "warmRenderer" to false,"staticCallbacks" to false,"projectSync" to false,
-                        "projectBackend" to "android-project-core", "projectCoreVersion" to "0.1.4",
+                        "projectBackend" to "android-project-core", "projectCoreVersion" to "0.1.5",
                         "backend" to "studio-launcher"))
             }
             "list" -> {

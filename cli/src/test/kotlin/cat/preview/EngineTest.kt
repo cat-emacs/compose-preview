@@ -97,6 +97,22 @@ class EngineTest {
             assertNotEquals(before,targetInputs(target,assets()))
         } finally { external.resolve("build.gradle").deleteExisting(); external.deleteExisting() }
     }
+    @Test fun `dependency source roots invalidate exact receipts and separate identities`() {
+        val (path,model)=fixture()
+        val external=Files.createTempDirectory("preview-dependency-input")
+        try {
+            external.resolve("Source.kt").writeText("initial")
+            model.add("inputRoots",cat.android.project.io.jsonCodec.toJsonTree(listOf(external.toString())))
+            atomicJson(path,model)
+            atomicJson(path.resolveSibling("model.receipt.json"),obj("environment" to buildEnvironment(),"modelHash" to hash(model),
+                "inputs" to targetInputs(PreviewTarget.fromModel(model),assets()),"artifacts" to artifactSignature(model)))
+            engine(options("--model",path.toString(),"--no-build")) { assertTrue(it.prepare().reused) }
+            external.resolve("Source.kt").writeText("changed without rebuilding the dependency")
+            engine(options("--model",path.toString(),"--no-build")) { assertEquals("stale-model",assertFailsWith<Failure> { it.prepare() }.kind) }
+            val target=PreviewTarget.fromModel(model)
+            assertNotEquals(hash(target.json()),hash(target.copy(inputRoots=emptyList()).json()))
+        } finally { external.resolve("Source.kt").deleteExisting(); external.deleteExisting() }
+    }
     @Test fun `obsolete project CLI selection is not accepted`() {
         assertFailsWith<Failure> { Options(listOf("render","--project-cli","unused")) }
     }
