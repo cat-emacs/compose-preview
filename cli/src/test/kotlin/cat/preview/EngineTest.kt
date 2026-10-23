@@ -1,5 +1,12 @@
 package cat.preview
 
+import cat.android.project.io.atomicJson
+import cat.android.project.io.jsonArray as array
+import cat.android.project.io.jsonHash as hash
+import cat.android.project.io.jsonObject as obj
+import cat.android.project.io.jsonStrings as strings
+import cat.android.project.io.jsonText as text
+import cat.android.project.io.readJsonObject as readJson
 import com.google.gson.JsonArray
 import com.google.gson.JsonObject
 import java.nio.file.*
@@ -26,6 +33,35 @@ class EngineTest {
         val processes = Processes()
         try { return block(Engine(options,assets(),processes)) } finally { processes.close() }
     }
+    @Test fun `Preview embeds project core and preserves build environment and configuration cache`() {
+        val home=Path.of(System.getProperty("preview.test.gradle.home"))
+        root.resolve("settings.gradle").writeText("rootProject.name='preview-core-fixture'\n")
+        root.resolve("build.gradle").writeText("""
+            tasks.register('probe') {
+                def marker = providers.environmentVariable('COMPOSE_PREVIEW_CORE_TEST')
+                def output = layout.buildDirectory.file('probe.txt')
+                doLast { output.get().asFile.parentFile.mkdirs(); output.get().asFile.text = marker.get() }
+            }
+            tasks.register('broken') { doLast { throw new GradleException('EXPECTED_CORE_FAILURE') } }
+            tasks.register('slow') { doLast { Thread.sleep(30000) } }
+        """.trimIndent())
+        buildPreviewModel(root,":probe",listOf("--configuration-cache"),mapOf("COMPOSE_PREVIEW_CORE_TEST" to "in-process"),120,home)
+        assertEquals("in-process",root.resolve("build/probe.txt").readText())
+        assertTrue(root.resolve(".gradle/configuration-cache").exists())
+        val failed=assertFailsWith<Failure> { buildPreviewModel(root,":broken",emptyList(),emptyMap(),120,home) }
+        assertEquals("gradle",failed.kind)
+        assertTrue(failed.message!!.contains("EXPECTED_CORE_FAILURE"))
+        val timeout=assertFailsWith<Failure> { buildPreviewModel(root,":slow",emptyList(),emptyMap(),1,home) }
+        assertEquals("timeout",timeout.kind)
+        buildPreviewModel(root,":probe",emptyList(),mapOf("COMPOSE_PREVIEW_CORE_TEST" to "after-cancel"),120,home)
+        assertEquals("after-cancel",root.resolve("build/probe.txt").readText())
+    }
+    @Test fun `obsolete project CLI selection is not accepted`() {
+        assertFailsWith<Failure> { Options(listOf("render","--project-cli","unused")) }
+    }
+    @Test fun `project sync is not a Preview command`() {
+        assertFailsWith<Failure> { Options(listOf("project","sync","--json")) }
+    }
     @Test fun `input signature ignores documentation and outputs`() {
         root.resolve("A.kt").writeText("fun A() {}")
         val before = inputSignature(root,assets())
@@ -34,6 +70,22 @@ class EngineTest {
         assertEquals(before,inputSignature(root,assets()))
         root.resolve("A.kt").writeText("fun Changed() {}")
         assertNotEquals(before,inputSignature(root,assets()))
+    }
+    @Test fun `Preview resource policy stays broader than project model inputs`() {
+        val image=root.resolve("res/drawable/image.png")
+        image.parent.createDirectories()
+        image.writeText("resource")
+        val previewBefore=inputSignature(root,assets())
+        val projectBefore=cat.android.project.projectInputSignature(root)
+        image.writeText("changed resource")
+        assertNotEquals(previewBefore,inputSignature(root,assets()))
+        assertEquals(projectBefore,cat.android.project.projectInputSignature(root))
+        val run=root.resolve("owned-render")
+        run.createDirectories()
+        atomicJson(run.resolve(".compose-preview-run.json"),obj("owner" to OWNER))
+        val beforeRun=inputSignature(root,assets())
+        run.resolve("render.png").writeText("output")
+        assertEquals(beforeRun,inputSignature(root,assets()))
     }
     @Test fun `identity separates configuration provider and annotation position`() {
         val p = obj("methodFQN" to "demo.AKt.Card", "methodParams" to listOf(mapOf("provider" to "A")))

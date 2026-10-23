@@ -1,11 +1,24 @@
 package cat.preview
 
+import cat.android.project.GradleTooling
+import cat.android.project.ProjectFailure
+import cat.android.project.io.atomicJson
+import cat.android.project.io.canonicalJson as canonical
+import cat.android.project.io.contentHash
+import cat.android.project.io.fileStamp as stamp
+import cat.android.project.io.jsonArray as array
+import cat.android.project.io.jsonCodec as gson
+import cat.android.project.io.jsonHash as hash
+import cat.android.project.io.jsonObject as obj
+import cat.android.project.io.jsonStrings as strings
+import cat.android.project.io.jsonText as text
+import cat.android.project.io.readJsonObject as readJson
+import cat.android.project.io.symbolicLinkTarget
+import cat.android.project.io.walkFiles
 import com.google.gson.*
 import java.io.File
 import java.nio.channels.FileChannel
 import java.nio.file.*
-import java.nio.file.attribute.BasicFileAttributes
-import java.security.MessageDigest
 import java.time.Instant
 import java.util.UUID
 import java.util.concurrent.TimeUnit
@@ -13,60 +26,19 @@ import kotlin.io.path.*
 import kotlin.system.exitProcess
 
 internal const val OWNER = "cat-emacs-compose-preview-v1"
-internal val gson = GsonBuilder().serializeNulls().disableHtmlEscaping().create()
 internal val versions = mapOf("renderer" to "0.0.1-alpha16", "layoutlib" to "16.1.0-jdk17", "detector" to "32.5.0-alpha05")
 internal val skipped = setOf(".git", ".gradle", ".idea", "build", "node_modules", "__pycache__")
 internal val suffixes = setOf("kt", "kts", "java", "groovy", "xml", "properties", "toml", "gradle", "jar", "aar", "png", "webp", "jpg", "jpeg", "svg", "ttf", "otf", "json")
 internal class Failure(message: String, val kind: String = "error") : RuntimeException(message)
-internal fun obj(vararg values: Pair<String, Any?>): JsonObject = gson.toJsonTree(mapOf(*values)).asJsonObject
-internal fun JsonObject.text(key: String): String? = get(key)?.takeUnless { it.isJsonNull }?.let {
-    if (!it.isJsonPrimitive || !it.asJsonPrimitive.isString) throw Failure("Expected string: $key", "protocol")
-    it.asString
-}
-internal fun JsonObject.array(key: String): JsonArray = get(key)?.takeUnless { it.isJsonNull }?.asJsonArray ?: JsonArray()
-internal fun JsonObject.strings(key: String): List<String> = array(key).map { it.asString }
-internal fun readJson(path: Path): JsonObject = Files.newBufferedReader(path).use { JsonParser.parseReader(it).asJsonObject }
-internal fun atomicJson(path: Path, value: JsonObject) {
-    Files.createDirectories(path.parent)
-    val temporary = Files.createTempFile(path.parent, ".preview-", ".json")
-    try {
-        Files.newBufferedWriter(temporary).use { gson.toJson(value, it) }
-        try { Files.move(temporary, path, StandardCopyOption.ATOMIC_MOVE, StandardCopyOption.REPLACE_EXISTING) }
-        catch (_: AtomicMoveNotSupportedException) { Files.move(temporary, path, StandardCopyOption.REPLACE_EXISTING) }
-    } finally { Files.deleteIfExists(temporary) }
-}
-internal fun canonical(value: JsonElement): JsonElement = when {
-    value.isJsonObject -> JsonObject().also { output -> value.asJsonObject.entrySet().sortedBy { it.key }.forEach { (k,v) -> output.add(k, canonical(v)) } }
-    value.isJsonArray -> JsonArray().also { output -> value.asJsonArray.forEach { output.add(canonical(it)) } }
-    else -> value
-}
-internal fun hash(value: Any?): String = MessageDigest.getInstance("SHA-256").digest(gson.toJson(canonical(gson.toJsonTree(value))).toByteArray()).joinToString("") { "%02x".format(it) }
-internal fun stamp(path: Path): List<Any>? = try {
-    Files.readAttributes(path, BasicFileAttributes::class.java).let {
-        val changed = try { Files.getAttribute(path,"unix:ctime").toString() } catch (_: UnsupportedOperationException) { it.creationTime().toString() } catch (_: IllegalArgumentException) { it.creationTime().toString() }
-        listOf(it.size(), it.lastModifiedTime().toString(), changed)
-    }
-} catch (_: NoSuchFileException) { null }
 internal fun ownedRun(directory: Path): Boolean = try {
     readJson(directory.resolve(".compose-preview-run.json")).text("owner") == OWNER
 } catch (_: Exception) { false }
-internal fun files(root: Path, excludeOutputs: Boolean): List<Path> {
-    val result = mutableListOf<Path>()
-    if (!Files.isDirectory(root)) return result
-    Files.walkFileTree(root, object : SimpleFileVisitor<Path>() {
-        override fun preVisitDirectory(dir: Path, attrs: BasicFileAttributes): FileVisitResult =
-            if (dir != root && excludeOutputs && (dir.fileName.toString() in skipped || ownedRun(dir))) FileVisitResult.SKIP_SUBTREE else FileVisitResult.CONTINUE
-        override fun visitFile(file: Path, attrs: BasicFileAttributes): FileVisitResult {
-            result.add(file)
-            return FileVisitResult.CONTINUE
-        }
-        override fun visitFileFailed(file: Path, error: java.io.IOException): FileVisitResult = throw error
-    })
-    return result.sortedBy { it.toString() }
+internal fun files(root: Path, excludeOutputs: Boolean): List<Path> = walkFiles(root) {
+    excludeOutputs && (it.fileName.toString() in skipped || ownedRun(it))
 }
 internal fun inputSignature(root: Path, assets: Path): String {
     val relevant = files(root, true).filter { it.extension in suffixes || it.any { p -> p.toString() in setOf("res", "assets", "composeResources") } }
-    return hash((relevant + files(assets.resolve("gradle"), false).filter { it.extension == "gradle" }).map { listOf(it.toString(), stamp(it), if (Files.isSymbolicLink(it)) Files.readSymbolicLink(it).toString() else null) })
+    return hash((relevant + files(assets.resolve("gradle"), false).filter { it.extension == "gradle" }).map { listOf(it.toString(), stamp(it), symbolicLinkTarget(it)) })
 }
 internal fun artifactSignature(model: JsonObject): String? {
     val paths = (model.strings("classPath") + model.strings("projectClassPath") + model.strings("rendererClassPath") + model.strings("rClassJars") + listOfNotNull(model.text("resourceApkPath"))).distinct().sorted()
@@ -77,10 +49,23 @@ internal fun artifactSignature(model: JsonObject): String? {
     })
 }
 
-internal fun buildEnvironment(): String = hash(
+internal fun buildPreviewModel(root: Path, task: String, arguments: List<String>, env: Map<String,String>, timeout: Long, installation: Path? = null) {
+    try {
+        GradleTooling(installation).use { it.build(root,task,arguments,env,timeout) }
+    } catch (error: ProjectFailure) {
+        throw Failure(error.message ?: "Project build failed",error.kind)
+    }
+}
+
+private val projectCoreIdentity: String by lazy {
+    val location=Path.of(GradleTooling::class.java.protectionDomain.codeSource.location.toURI())
+    contentHash(location)
+}
+internal fun buildEnvironment(): String = hash(listOf(
+    projectCoreIdentity,
     listOf("JAVA_HOME", "ANDROID_HOME", "ANDROID_SDK_ROOT", "GRADLE_USER_HOME",
         "JAVA_TOOL_OPTIONS", "JDK_JAVA_OPTIONS", "GRADLE_OPTS").associateWith { System.getenv(it) }
-)
+))
 
 internal fun rendererEnvironment(model: JsonObject, assets: Path): String {
     val executable = Path.of(model.text("javaExecutable")!!).toRealPath()
@@ -102,10 +87,10 @@ internal class Options(arguments: List<String>) {
         val args = arguments.filter { it != "--json" }
         json = "--json" in arguments
         command = args.firstOrNull() ?: "help"
-        action = if (command in setOf("cache", "project")) args.getOrNull(1) else null
+        action = if (command == "cache") args.getOrNull(1) else null
         val booleans = setOf("no-build", "reuse", "no-daemon", "clean", "dry-run", "apply", "help")
         val known = booleans + setOf("project", "module", "variant", "model", "file", "method", "preview-id", "out", "overrides", "result-file", "previous-result", "cache-dir", "timeout", "build-timeout", "renderer-version", "layoutlib-version", "detector-version", "java-option", "older-than", "keep")
-        var index = if (command in setOf("cache", "project")) 2 else 1
+        var index = if (command == "cache") 2 else 1
         while (index < args.size) {
             val argument = args[index++]
             if (!argument.startsWith("--")) throw Failure("Unexpected argument: $argument", "input")
@@ -261,7 +246,7 @@ internal class Engine(val options: Options, val assets: Path, val processes: Pro
             } else {
                 val arguments = listOf("--init-script", assets.resolve("gradle/preview.init.gradle").toString(), "--console=plain") +
                     if (options.flag("clean")) listOf("--no-build-cache", "--no-parallel") else emptyList()
-                GradleTooling().use { tooling -> tooling.build(root, task, arguments, env, options.seconds("build-timeout",600)) }
+                buildPreviewModel(root,task,arguments,env,options.seconds("build-timeout",600))
             }
             val model = validate(readJson(path))
             if (model.text("modulePath") != module || model.text("variant") != variant || Path.of(model.text("projectRoot")!!).normalize() != root)
@@ -442,7 +427,6 @@ private fun assets(): Path {
 private val help = """compose-preview — Android Studio project-level Preview CLI (JDK 17+)
 Usage: compose-preview <command> [options] [--json]
   doctor                      Check runtime and installed resources (no auth)
-  project sync --project DIR    Shared Gradle/AGP V2 project model
   list --project DIR --module :app [--variant debug] [--file FILE]
   render --project DIR --module :app --file FILE [--out EMPTY_DIR]
   render --model MODEL --no-build --file FILE
@@ -472,12 +456,9 @@ fun main(arguments: Array<String>) {
                     "resources" to resources,"sdk" to (System.getenv("ANDROID_SDK_ROOT") ?: System.getenv("ANDROID_HOME")),
                     "versions" to versions,"authRequired" to false,
                     "capabilities" to obj("componentTree" to false,"inflateOnly" to false,
-                        "warmRenderer" to false,"staticCallbacks" to false,"projectSync" to true,
-                        "gradleToolingApi" to "9.6.1","agpModelConsumer" to "9.3.0","backend" to "studio-launcher"))
-            }
-            "project" -> {
-                if (options.action != "sync") throw Failure("Use project sync", "input")
-                projectSync(options,home)
+                        "warmRenderer" to false,"staticCallbacks" to false,"projectSync" to false,
+                        "projectBackend" to "android-project-core", "projectCoreVersion" to "0.1.1",
+                        "backend" to "studio-launcher"))
             }
             "list" -> {
                 val compiled = engine.prepare()
@@ -494,7 +475,7 @@ fun main(arguments: Array<String>) {
         }
     } catch (error: Exception) {
         code=2
-        obj("schemaVersion" to 1,"status" to "failed","error" to obj("kind" to ((error as? Failure)?.kind ?: "error"),"message" to (error.message ?: error.javaClass.simpleName)))
+        obj("schemaVersion" to 1,"status" to "failed","error" to obj("kind" to ((error as? Failure)?.kind ?: (error as? ProjectFailure)?.kind ?: "error"),"message" to (error.message ?: error.javaClass.simpleName)))
     } finally { processes?.close() }
     val emitted = try {
         options?.path("result-file")?.let { atomicJson(it,result) }

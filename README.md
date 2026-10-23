@@ -32,12 +32,18 @@ Gradle, javac, or the renderer itself. Both clients consume the same backend.
 - Network access on first build to resolve Gradle/AGP, detector, renderer and
   layoutlib artifacts. CLI operations require no separate authentication.
 
+Source builds resolve the versioned core from GitHub Packages. Supply
+`GITHUB_ACTOR` and `GITHUB_TOKEN` through your credential manager; the token must
+be a classic PAT with `read:packages` (or an authorized Actions token). Do not
+commit credentials. GitHub's Maven registry requires authentication even for
+public packages. Installed distributions need no registry credentials.
+
 ```sh
 ./gradlew :cli:test :cli:installDist
 ./bin/compose-preview --help
 ./bin/compose-preview doctor --json
 
-# Install a complete distribution; only Java is needed afterwards.
+# Install Preview with its core dependency bundled; only JDK 17+ is needed.
 make install-local                   # defaults to ~/.local
 # Or: make install-local PREFIX=/some/prefix
 compose-preview doctor --json
@@ -56,8 +62,8 @@ No Python runtime is used.
 # Environment/resource checks; no project build.
 compose-preview doctor --json
 
-# Shared Gradle/AGP project synchronization; no image rendering.
-compose-preview project sync --project /work/app --json
+# Independent Project System (install from cat-emacs/android-project).
+android-project sync --project /work/app --json
 
 # Build and discover annotations/providers; no image rendering.
 compose-preview list --project /work/app --module :app --variant debug --json
@@ -90,41 +96,56 @@ it does not evaluate settings DSL or guess which of several modules is selected.
 The CLI currently defaults to variant `debug`; Emacs passes the user's actual
 selected target.
 
-### Shared Tooling API project backend
+### Independent Project System dependency
 
-There is **one CLI**, not a second executable maintained by `android-project`.
-`project sync` uses the project's wrapper distribution through Gradle Tooling
-API 9.6.1 and reads Gradle build/module structure plus AGP V2 `Versions` and
-`BasicAndroidProject`. BuildAction results are our serializable DTOs, not raw
-Gradle/AGP proxies. Module identity includes the owning build root, and included
-builds are traversed independently. AGP model versions and module-specific basic
-model issues are reported, not hidden; modules without an AGP V2 basic model
-(including some KMP libraries) retain targets through the supplement.
+[`android-project`](https://github.com/cat-emacs/android-project) owns the
+Kotlin core, Tooling API/AGP models, project collector and independent CLI.
+Its standalone project CLI requires no Preview, renderer or layoutlib.
+The two CLIs share the same core library, not each other's executables:
 
-The result is schemaVersion=1/kind=android-project with `modules`, `buildRoots`,
-`targets`, and capabilities. Targets also carry `modelBuildRoots` so the editor
-can persist and watch included/plugin build inputs. Public Variant API/KGP data from the bundled
-`gradle/project.init.gradle` supplements application/test IDs, default variant
-preferences, components and KMP source roots. It executes a lightweight `help`
-build and a separate model action on the same connection: full AGP V2 parity,
-dependency resolution and phased variant propagation are not yet claimed.
-Project sync uses `--no-configuration-cache --no-configure-on-demand`; those
-flags are **not** copied into Preview build invocations.
+```text
+compose-preview CLI -> android-project-core <- android-project CLI
+Preview / Logcat Emacs frontends -> android-project.el -> android-project CLI
+```
 
-`android-project.el` asynchronously invokes this command, validates the JSON,
-and owns Emacs last-known metadata, file invalidation and persisted selected
-module/variant. Preview and Logcat continue using its public APIs. It no longer
-ships or runs a competing Gradle collector/CLI. Install the shared executable
-on PATH, or set `android-project-cli-program` to the same command configured in
-`compose-preview-cli-program` when using a checkout.
+`android-project.el` invokes `android-project sync` and owns editor metadata,
+cache and selection. Preview/Logcat consume its public APIs. This CLI no longer
+provides `project sync` or owns a duplicate project collector. Project model
+capabilities and limitations are documented in that repository.
 
-Preview builds now run `composePreviewModel` via Tooling API `BuildLauncher`,
-with project wrapper/JDK/environment, progress diagnostics on stderr,
-CancellationToken and bounded timeouts. Connections close after an operation;
-shared Gradle daemons are never stopped. Tooling API always uses a daemon, so
-explicit `--no-daemon` uses the existing Gradle-client subprocess path instead
-of pretending it can disable Tooling API daemon usage. `list` may compile the module to discover complete MultiPreview
-and PreviewParameter metadata; it is not a source-only scan.
+Preview directly calls the core's `GradleTooling` inside its own JVM, passing
+its `composePreviewModel` task/init script and Preview-specific environment.
+There is no `android-project build` child process, no second CLI JVM and no
+`--project-cli`/`ANDROID_PROJECT_CLI` selection. Installed Preview distributions
+bundle core and its transitive runtime jars, and do not require the project
+executable on PATH. The Emacs frontend still uses the separate project CLI for
+project synchronization through `android-project.el`.
+
+Source builds pin `org.cat-emacs:android-project-core:0.1.1`
+with `https://maven.pkg.github.com/cat-emacs/android-project` as the default registry.
+Version 0.1.1 is published and its jar has been verified after download.
+No sibling checkout or `mavenLocal()` is used. CI has `packages:read`; the package must permit the
+consumer repository's Actions token, otherwise configure the
+`PACKAGES_READ_TOKEN` Actions secret (classic PAT with `read:packages`).
+
+For explicit core development only, `make project-core ANDROID_PROJECT_DIR=/checkout`
+publishes to `.test-deps/project-core-repository` without installing a CLI. Then
+use `./gradlew -PandroidProjectRepository="$PWD/.test-deps/project-core-repository" ...`
+or `make cli-build PROJECT_CORE_REPOSITORY="$PWD/.test-deps/project-core-repository"`.
+The default remains the versioned registry, never an implicit local fallback.
+
+Shared IO/JSON/hash implementations come from core's `cat.android.project.io`.
+Preview still owns resource/font/image suffixes, marked-run exclusions, artifact
+receipts and render identity; project-model input policy remains in core. CLI
+parsers and business result schemas are intentionally separate.
+
+The project backend uses the wrapper/JDK/environment, CancellationToken and
+bounded timeout, with diagnostics on stderr. Closing/cancelling an owned
+operation never stops shared daemons. Sync-only configuration-cache flags do not
+leak into Preview builds. Explicit `--no-daemon` retains the direct Gradle-client
+subprocess path because Tooling API always uses a daemon. `list` may compile the
+module to discover complete MultiPreview/PreviewParameter metadata; it is not a
+source-only scan.
 
 Temporary override input, keyed by the annotation ID returned by `list`:
 
@@ -230,7 +251,8 @@ installation to use `:lisp-dir "lisp"`:
 No root-level compatibility loader is installed. Existing manual load paths
 must point to `lisp/`. Cat Emacs' Android module is updated accordingly.
 `android-project` remains responsible for editor selected module/variant state;
-standalone CLI use does not require Emacs or `android-project`.
+standalone CLI use does not require Emacs or the `android-project` executable;
+the shared project core is bundled as a library.
 
 Run `M-x compose-preview-refresh` from Kotlin source, or use `M-x compose-preview`.
 The frontend invokes the CLI asynchronously and consumes schemaVersion=1 output.
@@ -279,7 +301,8 @@ Recent mainline work adds warm renderer/library caching (`ebdebd5074a`,
 DeviceSpec parent state (`2d4dccca121`) and diamond MultiPreview wrapper handling
 (`9eb8c371bdc`). The frontend now resolves selected cards against the latest
 items by stable ID; removed cards cannot mutate configuration. The CLI binds
-image caches to validated input/artifact/backend signatures. Warm JVM reuse,
+image caches to validated input/artifact/backend signatures. Build receipts also
+bind the exact embedded project-core artifact content, including local rebuilds. Warm JVM reuse,
 callback execution and upstream device/wrapper behavior remain unavailable on
 published alpha16 and are explicitly tracked in TODO.md, not emulated through
 private renderer patches.
@@ -309,7 +332,8 @@ without changing the project CLI protocol or Emacs frontend.
 ## Development
 
 ```sh
-./gradlew :cli:test :cli:installDist   # Kotlin backend
+# GITHUB_ACTOR / GITHUB_TOKEN provided securely in the environment
+./gradlew :cli:test :cli:installDist   # Kotlin backend, resolving published core
 make install-deps                   # isolated Emacs test dependencies
 make lint build test                # Elisp frontend
 make install-local                  # test installed CLI from another directory

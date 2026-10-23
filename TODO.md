@@ -33,14 +33,21 @@
 
 ## Deliberately not part of the initial CLI extraction
 
-- [x] Tooling API wrapper connection, cancellable Preview task execution, and
-  shared `project sync` GradleBuild/AGP V2 basic capability model.
-- [x] `android-project.el` consumes the shared backend asynchronously; the
-  Variant API/KGP collector has a single owner in this CLI distribution.
-- [ ] Replace Variant API/KGP supplemental collection with equivalent AGP V2
-  fields where available; preserve IDs/defaults/components and KMP semantics.
-- [ ] Full AGP V2 dependency models, phased sync and configuration-aware variant
-  propagation (not inferred from variant names).
+- [x] Independent `android-project` Kotlin core/CLI owns Tooling API, GradleBuild,
+  AGP V2 basic models and the single Variant API/KGP project collector.
+- [x] Both CLIs embed the versioned `android-project-core` library; Preview
+  builds use the same JVM, not CLI-to-CLI calls. Project sync has no Preview
+  dependency and the project collector has only one source owner.
+- [x] Publish/pin core 0.1.0 on GitHub Packages; source builds use authenticated
+  registry resolution, with a file repository only as an explicit dev override.
+- [x] Share JSON/atomic writes/traversal/stamps/hashing through core IO APIs,
+  while preserving independent project/Preview scan and cache policies.
+- [x] Publish and verify core 0.1.1 with the shared IO/JSON API.
+- [ ] Verify cross-repository package read access in Preview CI after push.
+- [ ] In `android-project`: replace supplemental collection with equivalent AGP
+  V2 fields without losing IDs/defaults/components or KMP semantics.
+- [ ] In `android-project`: full AGP V2 dependency models, phased sync and
+  configuration-aware variant propagation (not inferred from names).
 - [ ] Watch/daemon transport with cancellation tokens (the first CLI is one-shot).
 - [ ] Cross-project/included-build input tracking beyond the selected project.
 - [ ] Full interactive/animation Preview and live canvas resizing.

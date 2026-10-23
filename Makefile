@@ -5,6 +5,9 @@ PACKAGE_USER_DIR ?= $(abspath $(TEST_DEPS_DIR)/elpa)
 ANDROID_PROJECT_DIR ?= $(abspath $(TEST_DEPS_DIR)/android-project)
 LOAD_PATH = -L lisp -L "$(ANDROID_PROJECT_DIR)"
 PREFIX ?= $(HOME)/.local
+PROJECT_CORE_REPOSITORY ?= https://maven.pkg.github.com/cat-emacs/android-project
+LOCAL_PROJECT_CORE_REPOSITORY ?= $(abspath $(TEST_DEPS_DIR)/project-core-repository)
+PROJECT_CORE_ARGS = -PandroidProjectRepository="$(PROJECT_CORE_REPOSITORY)"
 
 ARCHIVES = --eval "(setq package-user-dir \"$(PACKAGE_USER_DIR)\")" \
            --eval "(require 'package)" \
@@ -12,9 +15,10 @@ ARCHIVES = --eval "(setq package-user-dir \"$(PACKAGE_USER_DIR)\")" \
            --eval "(add-to-list 'package-archives '(\"melpa\" . \"https://melpa.org/packages/\") t)" \
            --eval "(package-initialize)"
 
-.PHONY: help install-deps lint build test cli-build cli-test install-local clean
+.PHONY: help install-deps lint build test project-core cli-build cli-test install-local clean
 help:
 	@echo "lint/build/test: Emacs frontend; cli-build/cli-test: Kotlin backend"
+	@echo "project-core: publish core from ANDROID_PROJECT_DIR to LOCAL_PROJECT_CORE_REPOSITORY"
 	@echo "install-local: install distribution under PREFIX=$(PREFIX)"
 install-deps:
 	mkdir -p "$(TEST_DEPS_DIR)"
@@ -31,12 +35,18 @@ test:
 	test -f "$(ANDROID_PROJECT_DIR)/android-project.el"
 	$(BATCH) $(ARCHIVES) $(LOAD_PATH) -l "$(ANDROID_PROJECT_DIR)/android-project.el" \
 	  -l lisp/compose-preview.el -l lisp/compose-preview-tests.el -f ert-run-tests-batch-and-exit
+project-core:
+	test -f "$(ANDROID_PROJECT_DIR)/core/build.gradle.kts"
+	cd "$(ANDROID_PROJECT_DIR)" && ./gradlew :core:publishCorePublicationToProjectCoreRepository -PandroidProjectRepository="$(LOCAL_PROJECT_CORE_REPOSITORY)"
 cli-build:
-	./gradlew :cli:installDist
+	./gradlew :cli:installDist $(PROJECT_CORE_ARGS)
 cli-test:
-	./gradlew :cli:test
+	./gradlew :cli:test $(PROJECT_CORE_ARGS)
 install-local: cli-build
 	mkdir -p "$(PREFIX)/lib/compose-preview" "$(PREFIX)/bin"
+	test ! -L "$(PREFIX)/lib/compose-preview" && test ! -L "$(PREFIX)/lib/compose-preview/lib" && test ! -L "$(PREFIX)/lib/compose-preview/gradle"
+	rm -rf "$(PREFIX)/lib/compose-preview/lib"
+	rm -f "$(PREFIX)/lib/compose-preview/gradle/project.init.gradle"
 	cp -R cli/build/install/compose-preview/. "$(PREFIX)/lib/compose-preview/"
 	printf '%s\n' '#!/bin/sh' 'exec "$(PREFIX)/lib/compose-preview/bin/compose-preview" "$$@"' > "$(PREFIX)/bin/compose-preview"
 	chmod +x "$(PREFIX)/bin/compose-preview"
