@@ -16,7 +16,36 @@ Requirements:
   [`android-project`](https://github.com/cat-emacs/android-project) **0.1.0+**.
 - Network access to resolve build/render dependencies on first use.
 
-Source builds also need GitHub Packages credentials to download
+### Package managers
+
+macOS / Linux ([Homebrew tap](https://github.com/cat-emacs/homebrew-tap)):
+
+```sh
+brew install cat-emacs/tap/compose-preview
+# Also install for Emacs project sync:
+brew install cat-emacs/tap/android-project
+```
+
+Windows ([Scoop bucket](https://github.com/cat-emacs/scoop-bucket)):
+
+```powershell
+scoop bucket add java
+scoop bucket add cat-emacs https://github.com/cat-emacs/scoop-bucket
+scoop install cat-emacs/compose-preview cat-emacs/android-project
+```
+
+Both install a JDK dependency. Neither requires GitHub Packages credentials.
+These are maintained project repositories, not official Homebrew core or WinGet
+catalog entries. Release tests cover launcher/doctor on all three platforms;
+full Android rendering is not yet verified on every platform.
+
+### Direct download or source build
+
+[Releases](https://github.com/cat-emacs/compose-preview/releases/latest) provide
+versioned ZIP/tar.gz archives and `SHA256SUMS`. Verify, extract and add `bin/` to
+PATH. JDK 17+ must already be installed. CLI versions are independent of core.
+
+Source builds need GitHub Packages credentials to download
 `org.cat-emacs:android-project-core:0.1.1`. Supply `GITHUB_ACTOR` and `GITHUB_TOKEN`
 securely using a classic PAT with `read:packages` or an authorized Actions token.
 GitHub requires authentication even for public Maven packages. Never commit tokens.
