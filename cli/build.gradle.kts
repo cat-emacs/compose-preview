@@ -31,6 +31,8 @@ dependencies {
     testImplementation(kotlin("test-junit5"))
     testRuntimeOnly("org.junit.platform:junit-platform-launcher")
 }
+version = providers.gradleProperty("cliVersion").get()
+
 application {
     mainClass = "cat.preview.MainKt"
     applicationName = "compose-preview"
@@ -39,6 +41,11 @@ tasks.test {
     useJUnitPlatform()
     systemProperty("preview.test.gradle.home", gradle.gradleHomeDir!!.absolutePath)
 }
+tasks.distTar {
+    compression = Compression.GZIP
+    archiveExtension = "tar.gz"
+}
+
 distributions {
     main {
         distributionBaseName = "compose-preview"
@@ -46,7 +53,7 @@ distributions {
             from(rootProject.file("gradle/preview.init.gradle")) { into("gradle") }
             from(rootProject.file("gradle/adapters")) { into("gradle/adapters") }
             from(rootProject.file("renderer")) { into("renderer") }
-            from(rootProject.file("lisp")) { into("lisp"); exclude("*.elc") }
+            from(rootProject.file("lisp")) { into("lisp"); exclude("*.elc", "*-autoloads.el", "*-pkg.el") }
             from(rootProject.file("LICENSE"))
         }
     }
