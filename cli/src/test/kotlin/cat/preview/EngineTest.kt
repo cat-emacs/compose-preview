@@ -19,7 +19,7 @@ class EngineTest {
             "classPath" to listOf(classes.toString()), "projectClassPath" to listOf(classes.toString()), "rendererClassPath" to emptyList<String>(),
             "rClassJars" to emptyList<String>(), "previews" to emptyList<String>())
         val path = root.resolve("build/model.json"); atomicJson(path,model)
-        atomicJson(path.resolveSibling("model.receipt.json"),obj("modelHash" to hash(model),"inputs" to inputSignature(root,assets()),"artifacts" to artifactSignature(model)))
+        atomicJson(path.resolveSibling("model.receipt.json"),obj("environment" to buildEnvironment(),"modelHash" to hash(model),"inputs" to inputSignature(root,assets()),"artifacts" to artifactSignature(model)))
         return path to model
     }
     private fun <T> engine(options: Options, block: (Engine) -> T): T {
@@ -68,6 +68,33 @@ class EngineTest {
         path.resolveSibling("model.receipt.json").deleteExisting()
         engine(args) { assertFailsWith<Failure> { it.prepare() } }
     }
+    @Test fun `build environment mismatch invalidates compiled receipt`() {
+        val (path,_) = fixture()
+        val receipt=path.resolveSibling("model.receipt.json")
+        val saved=readJson(receipt)
+        saved.addProperty("environment","another-java-or-sdk")
+        atomicJson(receipt,saved)
+        engine(options("--model",path.toString(),"--no-build")) {
+            assertFailsWith<Failure> { it.prepare() }
+        }
+    }
+    @Test fun `renderer environment tracks runtime and launcher changes`() {
+        val (_,model)=fixture()
+        val runtime=root.resolve("build/layoutlib")
+        Files.createDirectories(runtime)
+        runtime.resolve("bridge.jar").writeText("runtime")
+        model.addProperty("layoutlibPath",runtime.toString())
+        val home=root.resolve("build/assets")
+        Files.createDirectories(home.resolve("renderer"))
+        val launcher=home.resolve("renderer/ComposePreviewRenderLauncher.java")
+        launcher.writeText("original adapter")
+        val before=rendererEnvironment(model,home)
+        runtime.resolve("bridge.jar").writeText("changed runtime")
+        val changed=rendererEnvironment(model,home)
+        assertNotEquals(before,changed)
+        launcher.writeText("updated adapter")
+        assertNotEquals(changed,rendererEnvironment(model,home))
+    }
     @Test fun `model content tampering invalidates receipt`() {
         val (path, model)=fixture()
         model.addProperty("namespace","tampered")
@@ -99,6 +126,27 @@ class EngineTest {
         engine(options("--model",path.toString(),"--no-build","--reuse","--previous-result",previous.toString())) {
             assertFailsWith<Failure> { it.render() }
         }
+    }
+    @Test fun `recompiled inputs never reuse old images with identical model paths`() {
+        val (path,model)=fixture()
+        val first=engine(options("--model",path.toString(),"--no-build")) { it.render().first }
+        val previous=Path.of(first.text("outputDirectory")!!).resolve("result.json")
+        root.resolve("Changed.kt").writeText("fun Changed() {}")
+        atomicJson(path.resolveSibling("model.receipt.json"),obj("environment" to buildEnvironment(),"modelHash" to hash(model),
+            "inputs" to inputSignature(root,assets()),"artifacts" to artifactSignature(model)))
+        val second=engine(options("--model",path.toString(),"--no-build","--reuse","--previous-result",previous.toString())) { it.render().first }
+        assertFalse(second["reusedImages"].asBoolean)
+        assertNotEquals(first.text("outputDirectory"),second.text("outputDirectory"))
+    }
+    @Test fun `recompiled bytecode never reuses old images with identical model JSON`() {
+        val (path,model)=fixture()
+        val first=engine(options("--model",path.toString(),"--no-build")) { it.render().first }
+        val previous=Path.of(first.text("outputDirectory")!!).resolve("result.json")
+        Path.of(model.strings("classPath")[0]).writeText("changed bytecode")
+        atomicJson(path.resolveSibling("model.receipt.json"),obj("environment" to buildEnvironment(),"modelHash" to hash(model),
+            "inputs" to inputSignature(root,assets()),"artifacts" to artifactSignature(model)))
+        val second=engine(options("--model",path.toString(),"--no-build","--reuse","--previous-result",previous.toString())) { it.render().first }
+        assertFalse(second["reusedImages"].asBoolean)
     }
     @Test fun `source selection uses package filename and method not display name`() {
         val file = root.resolve("A.kt"); file.writeText("package demo\nfun Card() {}")

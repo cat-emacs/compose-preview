@@ -16,6 +16,16 @@
   pixel units and empty image paths before enabling extraction options.
 - [ ] Rebenchmark published per-classloader R-class initialization optimizations
   on our fixtures; never copy Studio internal R-class patches into Elisp.
+- [ ] Gate warm-renderer reuse (`ebdebd5074a`, `86628813a6f`) on a released API:
+  verify project classes reload, library cache invalidates on JAR changes,
+  resources/configuration reset, inactive timeout/exit, and cross-project
+  isolation. Retain cold one-shot mode as the supported fallback.
+- [ ] Gate static layoutlib callbacks (`ae7836bf399`, `b5b22b6cdc7`,
+  `fd7c02b1b53`) on a released renderer. Verify initial focus/LaunchedEffect,
+  animation/Popup settling, exception reporting, and no dispatcher/callback
+  state leaking into the next card. Golden PNGs may legitimately change.
+- [ ] Verify DeviceSpec parent device state (`2d4dccca121`) and diamond
+  MultiPreview wrapper discovery (`9eb8c371bdc`) when the renderer is upgraded.
 - [ ] When all gates pass, switch only the renderer adapter. Retain the stable
   project CLI result/error contract and Gradle model preparation.
 - [ ] Remove `renderer/ComposePreviewRenderLauncher.java` only after Android,

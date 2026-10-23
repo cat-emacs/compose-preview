@@ -77,6 +77,22 @@ internal fun artifactSignature(model: JsonObject): String? {
     })
 }
 
+internal fun buildEnvironment(): String = hash(
+    listOf("JAVA_HOME", "ANDROID_HOME", "ANDROID_SDK_ROOT", "GRADLE_USER_HOME",
+        "JAVA_TOOL_OPTIONS", "JDK_JAVA_OPTIONS", "GRADLE_OPTS").associateWith { System.getenv(it) }
+)
+
+internal fun rendererEnvironment(model: JsonObject, assets: Path): String {
+    val executable = Path.of(model.text("javaExecutable")!!).toRealPath()
+    val layoutlib = Path.of(model.text("layoutlibPath")!!)
+    return hash(listOf(
+        assets.resolve("renderer/ComposePreviewRenderLauncher.java").readText(),
+        executable.toString(), stamp(executable), stamp(executable.parent.parent.resolve("release")),
+        files(layoutlib, false).map { listOf(it.toString(), stamp(it)) },
+        model.text("fontsPath")?.let { fonts -> files(Path.of(fonts), false).map { listOf(it.toString(), stamp(it)) } }
+    ))
+}
+
 internal class Options(arguments: List<String>) {
     private val values = mutableMapOf<String, MutableList<String>>()
     val command: String
@@ -207,7 +223,7 @@ internal class Engine(val options: Options, val assets: Path, val processes: Pro
             val saved = readJson(receipt)
             val signature = inputSignature(Path.of(model.text("projectRoot")!!), assets)
             val artifacts = artifactSignature(model)
-            if (artifacts == null || saved.text("modelHash") != hash(model) || saved.text("inputs") != signature || saved.text("artifacts") != artifacts)
+            if (artifacts == null || saved.text("environment") != buildEnvironment() || saved.text("modelHash") != hash(model) || saved.text("inputs") != signature || saved.text("artifacts") != artifacts)
                 throw Failure("Compiled model is out of date", "stale-model")
             return Compiled(path, model, signature, true)
         }
@@ -225,7 +241,7 @@ internal class Engine(val options: Options, val assets: Path, val processes: Pro
                     val model = validate(readJson(path))
                     val saved = readJson(receipt)
                     val artifact = artifactSignature(model)
-                    if ((options.flag("reuse") || options.flag("no-build")) && artifact != null && saved["identity"] == identity && saved.text("modelHash") == hash(model) && saved.text("inputs") == before && saved.text("artifacts") == artifact)
+                    if ((options.flag("reuse") || options.flag("no-build")) && artifact != null && saved["identity"] == identity && saved.text("environment") == buildEnvironment() && saved.text("modelHash") == hash(model) && saved.text("inputs") == before && saved.text("artifacts") == artifact)
                         return@locked snapshot(path, model, before, true)
                 } catch (_: Exception) { /* Invalid derived cache is never authoritative. */ }
             }
@@ -246,7 +262,7 @@ internal class Engine(val options: Options, val assets: Path, val processes: Pro
             val after = inputSignature(root, assets)
             if (before != after) throw Failure("Inputs changed while building; retry", "stale-model")
             val artifact = artifactSignature(model) ?: throw Failure("Missing compiled artifacts", "model")
-            atomicJson(receipt, obj("identity" to identity, "modelHash" to hash(model), "inputs" to after, "artifacts" to artifact))
+            atomicJson(receipt, obj("identity" to identity, "environment" to buildEnvironment(), "modelHash" to hash(model), "inputs" to after, "artifacts" to artifact))
             snapshot(path, model, after, false)
         }
     }
@@ -267,7 +283,11 @@ internal class Engine(val options: Options, val assets: Path, val processes: Pro
         val model = compiled.model
         val previews = declarations(model, options.path("file"), options.get("method"))
         val overrides = options.path("overrides")?.let { readJson(it) } ?: JsonObject()
-        val requestIdentity = hash(listOf(model, previews, overrides, options.get("preview-id"), options.all("java-option")))
+        val compiledArtifacts = artifactSignature(model)
+            ?: throw Failure("Compiled artifacts disappeared before render", "stale-model")
+        val backend = rendererEnvironment(model, assets)
+        val requestIdentity = hash(listOf(model, compiled.inputs, compiledArtifacts, backend,
+            previews, overrides, options.get("preview-id"), options.all("java-option")))
         if (options.flag("reuse") && !options.flag("clean")) {
             options.path("previous-result")?.let { previous ->
                 try {
@@ -298,7 +318,7 @@ internal class Engine(val options: Options, val assets: Path, val processes: Pro
             val (settings, details) = settings(model, previews, directory, overrides, options.get("preview-id"))
             val settingsPath = directory.resolve("settings.json")
             atomicJson(settingsPath, settings)
-            val beforeArtifacts = artifactSignature(model)
+            val beforeArtifacts = compiledArtifacts
             var status = 0
             var rows = JsonArray()
             var global: String? = null
@@ -312,7 +332,7 @@ internal class Engine(val options: Options, val assets: Path, val processes: Pro
                 rows = rendered.array("screenshotResults")
                 global = rendered.text("globalError")
             }
-            val stale = compiled.inputs != inputSignature(Path.of(model.text("projectRoot")!!), assets) || beforeArtifacts != artifactSignature(model)
+            val stale = compiled.inputs != inputSignature(Path.of(model.text("projectRoot")!!), assets) || beforeArtifacts != artifactSignature(model) || backend != rendererEnvironment(model, assets)
             rows.forEach { element ->
                 val row = element.asJsonObject
                 row.text("imagePath")?.takeIf { it.isNotEmpty() }?.let { image ->
@@ -443,7 +463,8 @@ fun main(arguments: Array<String>) {
                 obj("schemaVersion" to 1,"status" to if(resources) "ready" else "missing-setup","java" to java.toString(),"javaVersion" to System.getProperty("java.version"),
                     "resources" to resources,"sdk" to (System.getenv("ANDROID_SDK_ROOT") ?: System.getenv("ANDROID_HOME")),
                     "versions" to versions,"authRequired" to false,
-                    "capabilities" to obj("componentTree" to false,"inflateOnly" to false,"backend" to "studio-launcher"))
+                    "capabilities" to obj("componentTree" to false,"inflateOnly" to false,
+                        "warmRenderer" to false,"staticCallbacks" to false,"backend" to "studio-launcher"))
             }
             "list" -> {
                 val compiled = engine.prepare()

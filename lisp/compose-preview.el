@@ -1782,10 +1782,16 @@ mode uses one scale shared by every visible Preview, like Studio's surface."
         (car items))))
 
 (defun compose-preview--configuration-item ()
-  "Return the card at point or the focused Preview."
-  (or (compose-preview--current-item)
-      (and (eq compose-preview--view-mode 'focus) (compose-preview--focused-item))
-      (user-error "Select a Preview card first")))
+  "Resolve the selected card against the latest Preview instances by stable ID."
+  (let* ((selected (or (compose-preview--current-item)
+                       (and (eq compose-preview--view-mode 'focus)
+                            (compose-preview--focused-item))))
+         (current (and selected
+                       (seq-find (lambda (item)
+                                   (equal (compose-preview-item-id item)
+                                          (compose-preview-item-id selected)))
+                                 compose-preview--items))))
+    (or current (user-error "Preview selection is no longer available; select a current card"))))
 
 (defun compose-preview--apply-configuration (values)
   "Apply temporary configuration VALUES to the selected annotation instance."

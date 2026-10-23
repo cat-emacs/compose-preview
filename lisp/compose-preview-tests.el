@@ -475,6 +475,25 @@
     (should (= (length compose-preview--source-folds) 1))
     (compose-preview-unfold-source)))
 
+(ert-deftest compose-preview-configuration-resolves-refreshed-item-by-id ()
+  "Actions using stale buffer properties must operate on the current item."
+  (with-temp-buffer
+    (let ((old (make-compose-preview-item :id "same" :preview-id "old"))
+          (fresh (make-compose-preview-item :id "same" :preview-id "fresh")))
+      (insert (propertize "Card" 'compose-preview-item old))
+      (goto-char (point-min))
+      (setq-local compose-preview--items (list fresh))
+      (should (eq (compose-preview--configuration-item) fresh)))))
+
+(ert-deftest compose-preview-configuration-rejects-removed-item ()
+  "An old element removed by refresh must not mutate another Preview."
+  (with-temp-buffer
+    (let ((old (make-compose-preview-item :id "removed")))
+      (insert (propertize "Card" 'compose-preview-item old))
+      (goto-char (point-min))
+      (setq-local compose-preview--items nil)
+      (should-error (compose-preview--configuration-item) :type 'user-error))))
+
 (ert-deftest compose-preview-configuration-command-is-render-only ()
   "Changing dimensions preserves the render-only contract and annotation ID."
   (let ((source (generate-new-buffer " *preview-config-source*"))

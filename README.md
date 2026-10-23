@@ -149,7 +149,14 @@ is not proof that a particular Android project can build.
 - Models are keyed by build root, module, variant and renderer versions. Input
   and classpath/resource signatures plus model-content hashes form a receipt.
 - `--reuse` revalidates a receipt; `--no-build` fails instead of silently
-  rebuilding. Explicit `--model` also requires its matching receipt.
+  rebuilding. Explicit `--model` also requires its matching receipt. Receipts
+  include a hash of the build environment (JDK/SDK/Gradle locations and JVM
+  options); environment values are not stored in the receipt. Older receipts
+  without this field require one rebuild.
+- Image-run identity also binds the validated input/artifact signatures, actual
+  JDK executable/release metadata, layoutlib/fonts metadata and launcher source.
+  Recompilation into unchanged classpath paths cannot reuse older PNGs merely
+  because the model JSON is unchanged.
 - Builds are locked per target; launcher compilation is locked per source/
   classpath hash. Returned compiled snapshots are immutable by content hash.
 - Inputs changing during build invalidate the build receipt; changes during
@@ -225,7 +232,23 @@ Pinned published renderer: `0.0.1-alpha16`; layoutlib: `16.1.0-jdk17`; detector:
 Configuration cache/Isolated Projects remain supported by invocation-local
 Gradle adapters; project build files and test sources are not rewritten.
 
-Audited Studio checkout: `tools/adt/idea` `460aa88f7d95`, `tools/base` `0392b774c200`.
+Audited Studio checkout (2026-10-23): `tools/adt/idea` `001c2a2cb31b`,
+`tools/base` `ae69b3ef270c`.
+
+Recent mainline work adds warm renderer/library caching (`ebdebd5074a`,
+`86628813a6f`), static layoutlib callbacks with dispatcher-state isolation
+(`ae7836bf399`, `b5b22b6cdc7`), correct Focus element resolution (`c8324bfc19e`),
+DeviceSpec parent state (`2d4dccca121`) and diamond MultiPreview wrapper handling
+(`9eb8c371bdc`). The frontend now resolves selected cards against the latest
+items by stable ID; removed cards cannot mutate configuration. The CLI binds
+image caches to validated input/artifact/backend signatures. Warm JVM reuse,
+callback execution and upstream device/wrapper behavior remain unavailable on
+published alpha16 and are explicitly tracked in TODO.md, not emulated through
+private renderer patches.
+
+The Studio toolchain itself moved to Gradle 9.7.1/Kotlin 2.4.0. This CLI does
+not need to match Studio's build tool versions to consume the published renderer;
+its independently pinned build remains unchanged.
 Relevant upstream work includes per-card failures (`19bdf7910b1`), correct Preview
 configuration identity (`8f43e405e88`), unified component JSON (`0eab2119615`),
 R-class work per classloader (`694b3a00813`), and safe cleanup of uninitialized
