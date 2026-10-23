@@ -46,7 +46,8 @@ versioned ZIP/tar.gz archives and `SHA256SUMS`. Verify, extract and add `bin/` t
 PATH. JDK 17+ must already be installed. CLI versions are independent of core.
 
 Source builds need GitHub Packages credentials to download
-`org.cat-emacs:android-project-core:0.1.3`. Supply `GITHUB_ACTOR` and `GITHUB_TOKEN`
+`org.cat-emacs:android-project-core:0.1.4` (development, not yet published).
+Use the explicit local repository below until release. Supply `GITHUB_ACTOR` and `GITHUB_TOKEN`
 securely using a classic PAT with `read:packages` or an authorized Actions token.
 GitHub requires authentication even for public Maven packages. Never commit tokens.
 
