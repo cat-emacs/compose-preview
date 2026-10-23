@@ -43,7 +43,8 @@
 - [x] Share JSON/atomic writes/traversal/stamps/hashing through core IO APIs,
   while preserving independent project/Preview scan and cache policies.
 - [x] Publish and verify core 0.1.1 with the shared IO/JSON API.
-- [ ] Verify cross-repository package read access in Preview CI after push.
+- [x] Verify cross-repository package read access in Preview CI; the consumer
+  builds directly from GitHub Packages with its Actions token.
 - [ ] In `android-project`: replace supplemental collection with equivalent AGP
   V2 fields without losing IDs/defaults/components or KMP semantics.
 - [ ] In `android-project`: full AGP V2 dependency models, phased sync and
