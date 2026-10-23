@@ -21,9 +21,6 @@
 (require 'treesit nil t)
 (require 'android-project)
 
-(defvaralias 'compose-preview-use-android-mode-flavors
-  'compose-preview-use-android-project-flavors)
-
 ;; Source folding is optional on builds without tree-sitter support.
 (declare-function treesit-parser-list "treesit.c")
 (declare-function treesit-buffer-root-node "treesit.c" (&optional language tag))
@@ -176,12 +173,6 @@ owned by the project; Preview never stops shared build daemons."
   "Buffer name used for background compose-preview Gradle output.")
 (defvar compose-preview--last-results-directory nil
   "Directory containing the most recently rendered preview images.")
-
-(defvar compose-preview--last-result-items nil
-  "Items from the most recent preview render.")
-
-(defvar compose-preview--last-source-buffer nil
-  "Source buffer associated with the most recent preview render.")
 
 (defvar compose-preview--process nil
   "Current asynchronous Compose preview process.")
@@ -355,9 +346,6 @@ Each entry is (PROJECT-ROOT . TARGET), where TARGET is a plist containing
 
 (defvar-local compose-preview--status-face nil
   "Face for `compose-preview--status'.")
-
-(defvar-local compose-preview--legacy-images nil
-  "Images supplied without Preview metadata to the current panel.")
 
 (defvar-local compose-preview--view-mode 'grid
   "Current Preview panel view, either `grid' or `focus'.")
@@ -667,13 +655,12 @@ Do not follow symlink directories or traverse build/runtime output trees."
         (compose-preview--hide-panel)
       (if (plist-get session :items)
           (compose-preview--render-results
-           (plist-get session :module-root) (plist-get session :images)
-           (plist-get session :items) buffer)
+           (plist-get session :module-root) (plist-get session :items) buffer)
         (with-current-buffer panel
           (let ((inhibit-read-only t))
             (compose-preview--delete-section-overlays)
             (erase-buffer))
-          (setq compose-preview--items nil compose-preview--legacy-images nil)))
+          (setq compose-preview--items nil)))
       (compose-preview--panel-status
        buffer (or (plist-get session :module-root)
                   (buffer-local-value 'default-directory buffer))
@@ -686,12 +673,10 @@ Do not follow symlink directories or traverse build/runtime output trees."
         (when-let* ((window (get-buffer-window panel t)))
           (set-window-point window (point)))))))
 
-(defun compose-preview--anchor-position (item)
-  "Find a stable Preview card position matching saved ITEM's identity.
-ITEM may be a Preview ID string or a legacy Preview item."
-  (when item
-    (let ((id (if (compose-preview-item-p item) (compose-preview-item-id item) item))
-          (position (point-min)) found)
+(defun compose-preview--anchor-position (id)
+  "Find the stable Preview card position matching ID."
+  (when id
+    (let ((position (point-min)) found)
       (while (and (< position (point-max)) (not found))
         (let ((candidate (get-text-property position 'compose-preview-item)))
           (when (and (compose-preview-item-p candidate)
@@ -989,13 +974,6 @@ Preserve the selected window because this can run from `post-command-hook'."
   "Return android-project module name for MODULE-PATH."
   (string-remove-prefix ":" module-path))
 
-(defun compose-preview--module-root-from-name (project-root module-name)
-  "Return module root under PROJECT-ROOT for android-project MODULE-NAME."
-  (file-name-as-directory
-   (expand-file-name
-    (replace-regexp-in-string ":" "/" module-name)
-    project-root)))
-
 (defun compose-preview--target-from-android-entry (project-root entry)
   "Return a preview target under PROJECT-ROOT from Android target ENTRY."
   (when entry
@@ -1047,10 +1025,6 @@ With REFRESH non-nil, refresh Android project metadata first."
                         (equal (plist-get owned :variant) (plist-get selected :variant)))
                owned))
            selected)))))
-
-(defun compose-preview--sanitize (value)
-  "Return Gradle-side sanitized VALUE."
-  (replace-regexp-in-string "[^A-Za-z0-9_]" "_" value))
 
 (defun compose-preview--cache-key (project-root)
   "Return normalized cache key for PROJECT-ROOT."
@@ -2083,12 +2057,7 @@ When PREVIEW is nil, use the Preview card at point."
         (compose-preview--insert-preview item)))
      (visible
       (dolist (group (compose-preview--group-items visible))
-        (compose-preview--insert-group (car group) (cdr group))))
-     (t
-      (dolist (file compose-preview--legacy-images)
-        (insert (file-relative-name file compose-preview--module-root) "\n")
-        (compose-preview--insert-image file)
-        (insert "\n\n"))))))
+        (compose-preview--insert-group (car group) (cdr group)))))))
 
 (defun compose-preview--group-at-point ()
   "Return the Preview group containing point, like a Magit section."
@@ -2615,15 +2584,14 @@ An empty QUERY clears the current text filter."
       (put-text-property body-start (point) 'compose-preview-section-group name)
       (compose-preview--set-group-collapsed name collapsed))))
 
-(defun compose-preview--render-results (module-root images &optional previews source-buffer)
-  "Render IMAGES and PREVIEWS for MODULE-ROOT in the preview panel."
+(defun compose-preview--render-results (module-root previews source-buffer)
+  "Render structured PREVIEWS for MODULE-ROOT and SOURCE-BUFFER."
   (let ((buffer (get-buffer-create compose-preview-results-buffer-name)))
     (with-current-buffer buffer
       (unless (derived-mode-p 'compose-preview-results-mode)
         (compose-preview-results-mode))
       (setq-local compose-preview--source-buffer source-buffer
                   compose-preview--module-root module-root
-                  compose-preview--legacy-images images
                   compose-preview--items previews
                   default-directory module-root)
       (unless (member compose-preview--group-filter
@@ -2645,28 +2613,20 @@ An empty QUERY clears the current text filter."
       (when-let* ((window (get-buffer-window buffer t)))
         (set-window-point window (point-min))))))
 
-(defun compose-preview-open-results (&optional module-root previews _source-file)
-  "Open the most recently rendered Compose previews.
-MODULE-ROOT and PREVIEWS are accepted for compatibility with older callers."
+(defun compose-preview-open-results ()
+  "Open the current source file's Preview session."
   (interactive)
-  (let ((root (or module-root
-                  (compose-preview--find-module-root)
-                  default-directory))
-        (items (or previews compose-preview--last-result-items))
-        (session (gethash (compose-preview--file-key (current-buffer))
-                          compose-preview--sessions)))
-    (if (and session (plist-get session :items) (not previews))
-        (progn
-          (compose-preview--save-session-view)
-          (setq compose-preview--active-file (compose-preview--file-key (current-buffer)))
-          (compose-preview--start-following (current-buffer))
-          (compose-preview--show-session session (current-buffer)))
-      (if items
-          (compose-preview--render-results
-           root
-           (apply #'append (mapcar #'compose-preview-item-files items))
-           items compose-preview--last-source-buffer)
-	(user-error "No Compose preview results are available")))))
+  (let* ((source (if (derived-mode-p 'compose-preview-results-mode)
+                     compose-preview--source-buffer
+                   (current-buffer)))
+         (key (and (buffer-live-p source) (compose-preview--file-key source)))
+         (session (and key (gethash key compose-preview--sessions))))
+    (unless (and session (plist-get session :items))
+      (user-error "No Compose preview results are available for this file"))
+    (compose-preview--save-session-view)
+    (setq compose-preview--active-file key)
+    (compose-preview--start-following source)
+    (compose-preview--show-session session source)))
 
 (defun compose-preview--active-generation-p (generation)
   "Return non-nil when GENERATION is the current refresh."
@@ -3142,14 +3102,13 @@ running; only the newest waiting file request is retained."
       (maphash (lambda (id override)
                  (unless (equal (gethash id valid :missing) (plist-get override :baseline))
                    (remhash id overrides))) overrides))
-    (setq compose-preview--last-result-items items compose-preview--last-source-buffer source)
     (when (and (buffer-live-p source) (equal key compose-preview--active-file)
                (not (eq (compose-preview--json-get result "reusedImages") t)))
       (if (null items)
           (if (plist-get context :follow-refresh)
               (compose-preview--hide-panel)
             (compose-preview--panel-status source (plist-get target :module-root) "no previews in file" 'warning))
-        (compose-preview--render-results (plist-get target :module-root) (plist-get session :images) items source)
+        (compose-preview--render-results (plist-get target :module-root) items source)
         (compose-preview--panel-status source (plist-get target :module-root)
                                        (compose-preview--session-status session source) (plist-get session :face))
         (when (plist-get context :preserve-view)

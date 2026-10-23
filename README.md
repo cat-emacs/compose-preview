@@ -46,7 +46,7 @@ versioned ZIP/tar.gz archives and `SHA256SUMS`. Verify, extract and add `bin/` t
 PATH. JDK 17+ must already be installed. CLI versions are independent of core.
 
 Source builds need GitHub Packages credentials to download
-`org.cat-emacs:android-project-core:0.1.1`. Supply `GITHUB_ACTOR` and `GITHUB_TOKEN`
+`org.cat-emacs:android-project-core:0.1.2`. Supply `GITHUB_ACTOR` and `GITHUB_TOKEN`
 securely using a classic PAT with `read:packages` or an authorized Actions token.
 GitHub requires authentication even for public Maven packages. Never commit tokens.
 
@@ -168,7 +168,10 @@ Allowed fields: `device` (Studio `id:`/`spec:`), `widthDp`, `heightDp`,
 | `w` | Copy original PNG; Linux needs `wl-copy` or `xclip` |
 | `q` | Close, cancel owned work and stop monitoring |
 
-Per-file sessions preserve images, focus, zoom, folds and filters. Switching
+Per-file sessions preserve images, focus, zoom, folds and filters.
+Opening results restores only the current source session, not another file's
+last images. The old variable alias `compose-preview-use-android-mode-flavors`
+and unstructured image-list APIs have been removed. Switching
 files does not cancel the in-flight request or display its result on another
 file. Fresh cached results avoid rebuilding/rendering. Enable
 `compose-preview-auto-refresh-mode` for debounced save refresh.

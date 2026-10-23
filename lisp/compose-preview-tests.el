@@ -17,9 +17,29 @@
     (should (equal (compose-preview--module-path project-root module-root)
                    ":app:feature"))
     (should (equal (compose-preview--module-name ":app:feature")
-                   "app:feature"))
-    (should (equal (compose-preview--module-root-from-name project-root "app:feature")
-                   "/tmp/project/app/feature/"))))
+                   "app:feature"))))
+
+(ert-deftest compose-preview-open-results-does-not-reuse-another-files-session ()
+  "Opening a panel is file-scoped, never a fallback to global last results."
+  (let ((compose-preview--sessions (make-hash-table :test #'equal))
+        (buffer-file-name "/tmp/B.kt"))
+    (puthash "/tmp/A.kt" '(:items (old-card)) compose-preview--sessions)
+    (should-error (compose-preview-open-results) :type 'user-error)))
+
+(ert-deftest compose-preview-open-results-restores-current-file-session ()
+  "Opening a saved session uses structured items and the owning source buffer."
+  (let* ((compose-preview--sessions (make-hash-table :test #'equal))
+         (buffer-file-name "/tmp/A.kt")
+         (source (current-buffer))
+         (session '(:items (card)))
+         shown followed)
+    (puthash "/tmp/A.kt" session compose-preview--sessions)
+    (cl-letf (((symbol-function 'compose-preview--save-session-view) #'ignore)
+              ((symbol-function 'compose-preview--start-following) (lambda (buffer) (setq followed buffer)))
+              ((symbol-function 'compose-preview--show-session) (lambda (value buffer) (setq shown (list value buffer)))))
+      (compose-preview-open-results)
+      (should (eq followed source))
+      (should (equal shown (list session source))))))
 
 (ert-deftest compose-preview-current-buffer-class-prefix ()
   "Kotlin source buffers map to generated file facade class names."
@@ -94,8 +114,7 @@
                      :module-root "/tmp/project/composeApp"
                      :variant "androidMain"
                      :application-id "com.example"
-                     :source-roots '("src/commonMain/kotlin")
-                     :preview-task "assembleAndroidMain"))))
+                     :source-roots '("src/commonMain/kotlin")))))
     (let ((compose-preview--target-cache nil)
           (buffer-file-name
            "/tmp/project/composeApp/src/commonMain/kotlin/example/Foo.kt"))
@@ -225,12 +244,10 @@
   (let* ((component '(:kind "androidTest" :name "debugAndroidTest"))
          (target (compose-preview--target-from-android-entry
                   "/tmp/entry/" (list :build-root "/tmp/included" :module-root "/tmp/included/app"
-                                      :module-path ":app" :variant "debug" :component component
-                                      :preview-task "desktopTest"))))
+                                      :module-path ":app" :variant "debug" :component component))))
     (should (equal (plist-get target :project-root) "/tmp/entry/"))
     (should (equal (plist-get target :build-root) "/tmp/included/"))
     (should (equal (plist-get target :component) component))
-    (should-not (plist-member target :preview-task))
     (should-error (compose-preview--validate-target target) :type 'user-error)))
 
 (ert-deftest compose-preview-explicit-variant-keeps-component-kind ()
@@ -253,8 +270,7 @@
                      :module-root "/tmp/project/composeApp"
                      :variant "androidMain"
                      :application-id "com.example"
-                     :source-roots '("src/commonMain/kotlin")
-                     :preview-task "assembleAndroidMain"))))
+                     :source-roots '("src/commonMain/kotlin")))))
     (let ((compose-preview--target-cache
            (list (cons "/tmp/project"
                        (list :project-root "/tmp/project/"
@@ -286,8 +302,7 @@
                      :module-root "/tmp/project/composeApp"
                      :variant "androidMain"
                      :application-id "com.example"
-                     :source-roots '("src/commonMain/kotlin")
-                     :preview-task "assembleAndroidMain"))))
+                     :source-roots '("src/commonMain/kotlin")))))
     (let ((compose-preview--target-cache
            (list (cons "/tmp/project"
                        (list :project-root "/tmp/project/"
@@ -320,8 +335,7 @@
                      :module-root "/tmp/project/app/demo-android"
                      :variant "debug"
                      :application-id "com.example.demo"
-                     :source-roots '("src/main/java")
-                     :preview-task "testDebugUnitTest"))))
+                     :source-roots '("src/main/java")))))
     (let ((compose-preview--target-cache nil)
           (buffer-file-name "/tmp/project/composeApp/src/commonMain/kotlin/Foo.kt"))
       (should
@@ -821,7 +835,7 @@
           (with-current-buffer (get-buffer-create compose-preview-results-buffer-name)
             (compose-preview-results-mode)
             (setq compose-preview--group-filter "Previous"))
-          (compose-preview--render-results "/tmp/" nil items nil)
+          (compose-preview--render-results "/tmp/" items nil)
           (with-current-buffer compose-preview-results-buffer-name
             (should-not compose-preview--group-filter)
             (should (= (point) (point-min)))
@@ -840,12 +854,12 @@
         (cl-letf (((symbol-function 'compose-preview--insert-image)
                    (lambda (&rest _args) (insert "[image]")))
                   ((symbol-function 'compose-preview--display-panel) #'ignore))
-          (compose-preview--render-results "/tmp/" nil items nil)
+          (compose-preview--render-results "/tmp/" items nil)
           (with-current-buffer compose-preview-results-buffer-name
             (compose-preview-toggle-group "example.CardPreview")
             (setq compose-preview--view-mode 'focus)
             (should (gethash "example.CardPreview" compose-preview--collapsed-groups)))
-          (compose-preview--render-results "/tmp/" nil items nil)
+          (compose-preview--render-results "/tmp/" items nil)
           (with-current-buffer compose-preview-results-buffer-name
             (should (eq compose-preview--view-mode 'focus))
             (should (gethash "example.CardPreview" compose-preview--collapsed-groups))
@@ -1252,12 +1266,11 @@
 (ert-deftest compose-preview-anchor-follows-item-id-after-layout-change ()
   "Restored navigation uses card identity rather than a stale character offset."
   (with-temp-buffer
-    (let ((old (make-compose-preview-item :id "card"))
-          (new (make-compose-preview-item :id "card")))
+    (let ((new (make-compose-preview-item :id "card")))
       (insert "new layout prefix\n")
       (let ((position (point)))
         (insert (propertize "Card" 'compose-preview-item new))
-        (should (= position (compose-preview--anchor-position old)))))))
+        (should (= position (compose-preview--anchor-position "card")))))))
 
 (ert-deftest compose-preview-inactive-monitor-does-not-scan-projects ()
   "Hidden or closed Preview surfaces must not repeatedly scan the project."

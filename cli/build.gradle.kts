@@ -26,7 +26,7 @@ repositories {
 }
 kotlin { jvmToolchain(17) }
 dependencies {
-    implementation("org.cat-emacs:android-project-core:0.1.1")
+    implementation("org.cat-emacs:android-project-core:0.1.2")
     implementation("com.google.code.gson:gson:2.13.2")
     testImplementation(kotlin("test-junit5"))
     testRuntimeOnly("org.junit.platform:junit-platform-launcher")

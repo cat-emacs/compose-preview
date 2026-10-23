@@ -479,7 +479,7 @@ fun main(arguments: Array<String>) {
                     "versions" to versions,"authRequired" to false,
                     "capabilities" to obj("componentTree" to false,"inflateOnly" to false,
                         "warmRenderer" to false,"staticCallbacks" to false,"projectSync" to false,
-                        "projectBackend" to "android-project-core", "projectCoreVersion" to "0.1.1",
+                        "projectBackend" to "android-project-core", "projectCoreVersion" to "0.1.2",
                         "backend" to "studio-launcher"))
             }
             "list" -> {
