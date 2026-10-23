@@ -77,7 +77,8 @@ def targetVariant = gradle.ext.composePreviewTargetVariant
 def registerKmp = gradle.ext.composePreviewRegisterKmp
 
 gradle.beforeProject { project ->
-    if (project.path != targetModulePath) {
+    if (project.path != targetModulePath || project.rootDir.canonicalFile !=
+            new File(System.getenv("COMPOSE_PREVIEW_BUILD_ROOT")).canonicalFile) {
         return
     }
     project.plugins.withId("com.android.kotlin.multiplatform.library") {

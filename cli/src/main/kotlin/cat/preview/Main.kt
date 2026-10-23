@@ -89,7 +89,7 @@ internal class Options(arguments: List<String>) {
         command = args.firstOrNull() ?: "help"
         action = if (command == "cache") args.getOrNull(1) else null
         val booleans = setOf("no-build", "reuse", "no-daemon", "clean", "dry-run", "apply", "help")
-        val known = booleans + setOf("project", "module", "variant", "model", "file", "method", "preview-id", "out", "overrides", "result-file", "previous-result", "cache-dir", "timeout", "build-timeout", "renderer-version", "layoutlib-version", "detector-version", "java-option", "older-than", "keep")
+        val known = booleans + setOf("project", "module", "variant", "model", "file", "method", "preview-id", "out", "overrides", "result-file", "previous-result", "cache-dir", "build-root", "module-root", "component", "component-name", "timeout", "build-timeout", "renderer-version", "layoutlib-version", "detector-version", "java-option", "older-than", "keep")
         var index = if (command == "cache") 2 else 1
         while (index < args.size) {
             val argument = args[index++]
@@ -170,7 +170,7 @@ internal fun <T> locked(directory: Path, timeout: Long = 60, body: () -> T): T {
 internal class Engine(val options: Options, val assets: Path, val processes: Processes) {
     val cache: Path = (options.path("cache-dir") ?: System.getenv("COMPOSE_PREVIEW_CACHE_DIR")?.let { Path.of(it) }
         ?: Path.of(System.getenv("XDG_CACHE_HOME") ?: Path.of(System.getProperty("user.home"), ".cache").toString(), "compose-preview")).toAbsolutePath().normalize()
-    fun target(): Triple<Path,Path,String> {
+    fun target(): PreviewTarget {
         val root = options.path("project") ?: Path.of("").toAbsolutePath().normalize()
         val wrapper = root.resolve(if (isWindows) "gradlew.bat" else "gradlew")
         if (!Files.isRegularFile(wrapper)) throw Failure("No Gradle wrapper under $root", "input")
@@ -182,14 +182,20 @@ internal class Engine(val options: Options, val assets: Path, val processes: Pro
             while (directory != root && !directory.resolve("build.gradle").exists() && !directory.resolve("build.gradle.kts").exists()) directory = directory.parent
             module = ":" + root.relativize(directory).joinToString(":")
         }
-        if (!Regex(":(?:[\\w.+-]+(?::[\\w.+-]+)*)?").matches(module)) throw Failure("Invalid Gradle module path", "input")
-        return Triple(root, wrapper, module)
+        val buildRoot=options.path("build-root") ?: root
+        if (!Files.isDirectory(buildRoot)) throw Failure("Owning build root does not exist: $buildRoot", "input")
+        if (options.get("module") == null && buildRoot != root)
+            throw Failure("Specify --module when --build-root differs from --project", "input")
+        val variant=options.get("variant", "debug")!!
+        return PreviewTarget(root,buildRoot,module,variant,
+            options.get("component", "main")!!,options.get("component-name",variant)!!,options.path("module-root"))
     }
     fun validate(model: JsonObject): JsonObject {
         for (key in listOf("projectRoot", "moduleRoot", "modulePath", "variant", "namespace", "javaExecutable", "layoutlibPath"))
             if (model.text(key) == null) throw Failure("Model missing $key", "model")
         for (key in listOf("rendererClassPath", "classPath", "projectClassPath", "rClassJars", "previews"))
             if (!model.has(key) || !model[key].isJsonArray) throw Failure("Invalid model $key", "model")
+        PreviewTarget.fromModel(model)
         return model
     }
     data class Compiled(val path: Path, val model: JsonObject, val inputs: String, val reused: Boolean)
@@ -206,24 +212,37 @@ internal class Engine(val options: Options, val assets: Path, val processes: Pro
             val receipt = path.resolveSibling(path.nameWithoutExtension + ".receipt.json")
             if (!receipt.exists()) throw Failure("Model has no CLI validation receipt", "stale-model")
             val saved = readJson(receipt)
-            val signature = inputSignature(Path.of(model.text("projectRoot")!!), assets)
+            val target=PreviewTarget.fromModel(model)
+            val expected=target.copy(projectRoot=options.path("project") ?: target.projectRoot,
+                buildRoot=options.path("build-root") ?: target.buildRoot,
+                modulePath=options.get("module") ?: target.modulePath,
+                variant=options.get("variant") ?: target.variant,
+                component=options.get("component") ?: target.component,
+                componentName=options.get("component-name") ?: target.componentName,
+                moduleRoot=options.path("module-root") ?: target.moduleRoot)
+            expected.verify(model)
+            val signature = targetInputs(target, assets)
             val artifacts = artifactSignature(model)
             if (artifacts == null || saved.text("environment") != buildEnvironment() || saved.text("modelHash") != hash(model) || saved.text("inputs") != signature || saved.text("artifacts") != artifacts)
                 throw Failure("Compiled model is out of date", "stale-model")
             return Compiled(path, model, signature, true)
         }
-        val (root, wrapper, module) = target()
-        val variant = options.get("variant", "debug")!!
-        val identity = obj("project" to root.toString(), "module" to module, "variant" to variant,
+        val target = target()
+        val root=target.projectRoot
+        val wrapper=root.resolve(if (isWindows) "gradlew.bat" else "gradlew")
+        val module=target.modulePath
+        val variant=target.variant
+        val identity = obj("target" to target.json(),
             "renderer" to options.version("renderer"), "layoutlib" to options.version("layoutlib"), "detector" to options.version("detector"))
         val directory = cache.resolve("models").resolve(hash(identity))
         return locked(directory, options.seconds("timeout",300)) {
             val path = directory.resolve("model.json")
             val receipt = directory.resolve("model.receipt.json")
-            val before = inputSignature(root, assets)
+            val before = targetInputs(target, assets)
             if (path.exists() && receipt.exists()) {
                 try {
                     val model = validate(readJson(path))
+                    target.verify(model)
                     val saved = readJson(receipt)
                     val artifact = artifactSignature(model)
                     if ((options.flag("reuse") || options.flag("no-build")) && artifact != null && saved["identity"] == identity && saved.text("environment") == buildEnvironment() && saved.text("modelHash") == hash(model) && saved.text("inputs") == before && saved.text("artifacts") == artifact)
@@ -233,25 +252,26 @@ internal class Engine(val options: Options, val assets: Path, val processes: Pro
             if (options.flag("no-build")) throw Failure("No fresh compiled model; save sources and refresh first", "stale-model")
             Files.deleteIfExists(receipt)
             val env = mapOf("COMPOSE_PREVIEW_MODULE_PATH" to module, "COMPOSE_PREVIEW_VARIANT" to variant,
+                "COMPOSE_PREVIEW_PROJECT_ROOT" to root.toString(), "COMPOSE_PREVIEW_BUILD_ROOT" to target.buildRoot.toString(),
+                "COMPOSE_PREVIEW_COMPONENT" to target.component, "COMPOSE_PREVIEW_COMPONENT_NAME" to target.componentName,
                 "COMPOSE_PREVIEW_MODEL_FILE" to path.toString(), "COMPOSE_PREVIEW_ADAPTER_DIRECTORY" to assets.resolve("gradle/adapters").toString(),
                 "COMPOSE_PREVIEW_RENDERER_VERSION" to options.version("renderer"), "COMPOSE_PREVIEW_LAYOUTLIB_VERSION" to options.version("layoutlib"),
                 "COMPOSE_PREVIEW_DETECTOR_VERSION" to options.version("detector"))
             val task = (if (module == ":") "" else module) + ":composePreviewModel"
-            val command = mutableListOf(wrapper.toString(), task, "--init-script", assets.resolve("gradle/preview.init.gradle").toString(), "--console=plain",
+            val command = mutableListOf(wrapper.toString(), task, "--project-dir", target.buildRoot.toString(), "--init-script", assets.resolve("gradle/preview.init.gradle").toString(), "--console=plain",
                 if (options.flag("no-daemon")) "--no-daemon" else "--daemon")
             if (options.flag("clean")) command.addAll(listOf("--no-build-cache", "--no-parallel"))
             if (options.flag("no-daemon")) {
                 // Tooling API always uses a daemon; preserve the explicit one-shot policy.
                 processes.run(command, root, env, options.seconds("build-timeout",600))
             } else {
-                val arguments = listOf("--init-script", assets.resolve("gradle/preview.init.gradle").toString(), "--console=plain") +
+                val arguments = listOf("--project-dir", target.buildRoot.toString(), "--init-script", assets.resolve("gradle/preview.init.gradle").toString(), "--console=plain") +
                     if (options.flag("clean")) listOf("--no-build-cache", "--no-parallel") else emptyList()
                 buildPreviewModel(root,task,arguments,env,options.seconds("build-timeout",600))
             }
             val model = validate(readJson(path))
-            if (model.text("modulePath") != module || model.text("variant") != variant || Path.of(model.text("projectRoot")!!).normalize() != root)
-                throw Failure("Gradle returned another target's model", "model")
-            val after = inputSignature(root, assets)
+            target.verify(model)
+            val after = targetInputs(target, assets)
             if (before != after) throw Failure("Inputs changed while building; retry", "stale-model")
             val artifact = artifactSignature(model) ?: throw Failure("Missing compiled artifacts", "model")
             atomicJson(receipt, obj("identity" to identity, "environment" to buildEnvironment(), "modelHash" to hash(model), "inputs" to after, "artifacts" to artifact))
@@ -288,6 +308,7 @@ internal class Engine(val options: Options, val assets: Path, val processes: Pro
                     val marker = readJson(oldOutput.resolve(".compose-preview-run.json"))
                     if (oldOutput.startsWith(cache.resolve("runs")) && marker.text("owner") == OWNER &&
                         old.text("status") == "ready" && old.text("requestIdentity") == requestIdentity &&
+                        old.getAsJsonObject("target") == PreviewTarget.fromModel(model).json() &&
                         old.array("results").all { row ->
                             row.asJsonObject.text("imagePath")?.takeIf { it.isNotEmpty() }?.let { image ->
                                 val path=Path.of(image).normalize()
@@ -324,7 +345,7 @@ internal class Engine(val options: Options, val assets: Path, val processes: Pro
                 rows = rendered.array("screenshotResults")
                 global = rendered.text("globalError")
             }
-            val stale = compiled.inputs != inputSignature(Path.of(model.text("projectRoot")!!), assets) || beforeArtifacts != artifactSignature(model) || backend != rendererEnvironment(model, assets)
+            val stale = compiled.inputs != targetInputs(PreviewTarget.fromModel(model), assets) || beforeArtifacts != artifactSignature(model) || backend != rendererEnvironment(model, assets)
             rows.forEach { element ->
                 val row = element.asJsonObject
                 row.text("imagePath")?.takeIf { it.isNotEmpty() }?.let { image ->
@@ -336,7 +357,7 @@ internal class Engine(val options: Options, val assets: Path, val processes: Pro
                 details[row.text("previewId")]?.entrySet()?.forEach { (key,value) -> row.add(key,value) }
             }
             val result = obj("schemaVersion" to 1, "status" to if (global != null) "failed" else if (stale) "stale" else if (status != 0) "partial" else "ready",
-                "target" to obj(*listOf("projectRoot", "moduleRoot", "modulePath", "variant").map { it to model.text(it) }.toTypedArray()),
+                "target" to PreviewTarget.fromModel(model).json(),
                 "modelPath" to compiled.path.toString(), "outputDirectory" to directory.toString(), "reusedModel" to compiled.reused,
                 "requestIdentity" to requestIdentity, "reusedImages" to false,
                 "stale" to stale, "declarations" to previews, "results" to rows, "globalError" to global)
@@ -431,6 +452,7 @@ Usage: compose-preview <command> [options] [--json]
   render --project DIR --module :app --file FILE [--out EMPTY_DIR]
   render --model MODEL --no-build --file FILE
   cache prune [--dry-run | --apply] [--older-than SECONDS] [--keep RUN]
+Target options: --build-root DIR --module-root DIR --component main --component-name VARIANT
 Model options: --reuse --no-build --no-daemon --clean --cache-dir DIR
 Render options: --preview-id ID --overrides JSON --method FQN --result-file FILE
                --timeout SECONDS --build-timeout SECONDS --java-option=-Xmx1536m

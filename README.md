@@ -98,9 +98,17 @@ compose-preview cache prune --dry-run --older-than 86400 --json
 compose-preview cache prune --apply --keep /cache/runs/RUN_ID --json
 ```
 
-Use explicit `--module` for composite builds or relocated module directories.
-Variant defaults to `debug`; Emacs passes the selected target. The CLI renders
-saved files, and the frontend rejects relevant unsaved buffers.
+Variant defaults to `debug`; Emacs passes the selected target. Target identity
+includes sync entry (`--project`), owning `--build-root`, build-local `--module`,
+variant and component. For included builds, pass `--build-root` and explicit
+`--module`; execution uses the entry wrapper distribution with the owning build
+as project directory. Optional `--module-root` cross-checks relocated modules.
+
+Only `--component main` is currently supported (`--component-name` defaults to the
+variant). Test components fail explicitly, not by rendering main instead. Old
+compiled models/results without complete target identity require a rebuild and
+an updated CLI; the frontend rejects incomplete or mismatched responses.
+The CLI renders saved files, and the frontend rejects relevant unsaved buffers.
 
 | Option | Behavior |
 |---|---|

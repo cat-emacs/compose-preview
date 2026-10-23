@@ -253,10 +253,7 @@ owned by the project; Preview never stops shared build daemons."
 (defvar compose-preview--target-cache nil
   "Project-level target cache.
 Each entry is (PROJECT-ROOT . TARGET), where TARGET is a plist containing
-:project-root, :module-root, :module-path and :variant.")
-
-(defvar compose-preview--metadata-refresh-roots nil
-  "Project roots whose stale Android preview metadata was refreshed.")
+:project-root, :build-root, :module-root, :module-path, :variant and :component.")
 
 (defvar compose-preview--model-refresh-timers nil
   "Alist of pending Preview refresh timers keyed by project root.")
@@ -1006,7 +1003,23 @@ Preserve the selected window because this can run from `post-command-hook'."
           :module-root (file-name-as-directory (plist-get entry :module-root))
           :module-path (plist-get entry :module-path)
           :variant (plist-get entry :variant)
-          :preview-task (plist-get entry :preview-task))))
+          :build-root (file-name-as-directory (or (plist-get entry :build-root) project-root))
+          :component (or (plist-get entry :component)
+                         (list :kind "main" :name (plist-get entry :variant))))))
+
+(defun compose-preview--validate-target (target &optional variant)
+  "Return a normalized TARGET for VARIANT, rejecting unsupported components."
+  (let* ((copy (copy-sequence target))
+         (selected (or variant (plist-get copy :variant)))
+         (component (or (plist-get copy :component)
+                        (list :kind "main" :name selected))))
+    (unless (equal (plist-get component :kind) "main")
+      (user-error "Preview component %s (%s) is unsupported; only main is implemented"
+                  (plist-get component :kind) (plist-get component :name)))
+    (setq copy (plist-put copy :build-root
+                          (or (plist-get copy :build-root) (plist-get copy :project-root))))
+    (setq copy (plist-put copy :variant selected))
+    (plist-put copy :component (list :kind "main" :name selected))))
 
 (defun compose-preview--target-from-android-project (project-root &optional refresh)
   "Return current source target from android-project under PROJECT-ROOT.
@@ -1014,33 +1027,26 @@ With REFRESH non-nil, refresh Android project metadata first."
   (when (and compose-preview-use-android-project-flavors
              buffer-file-name
              (fboundp 'android-target-for-source-file))
-    (compose-preview--target-from-android-entry
-     project-root
-     (ignore-errors
-       (android-target-for-source-file
-        buffer-file-name project-root refresh)))))
+    (let ((entry (ignore-errors
+                   (android-target-for-source-file buffer-file-name project-root refresh))))
+      (when (and entry (plist-get entry :components) (not (plist-get entry :component)))
+        (user-error "Source has no owning component in selected variant %s" (plist-get entry :variant)))
+      (compose-preview--target-from-android-entry project-root entry))))
 
 (defun compose-preview--prompt-android-target (project-root)
   "Prompt for an Android target under PROJECT-ROOT through android-project."
   (when (compose-preview--android-flavors-available-p)
     (compose-preview--target-from-android-entry
      project-root
-     (ignore-errors
-       (android-current-target t buffer-file-name project-root)))))
-
-(defun compose-preview--refresh-stale-kmp-target (project-root target)
-  "Refresh stale Android KMP TARGET metadata under PROJECT-ROOT once."
-  (if (and target
-           (string= (plist-get target :variant) "androidMain")
-           (not (string= (plist-get target :preview-task) "desktopTest"))
-           (fboundp 'android-target-for-source-file)
-           (not (member project-root compose-preview--metadata-refresh-roots)))
-      (progn
-        (push project-root compose-preview--metadata-refresh-roots)
-        (compose-preview--log
-         "refreshing stale Android KMP preview metadata for %s" project-root)
-        (or (compose-preview--target-from-android-project project-root t) target))
-    target))
+     (when-let* ((selected (ignore-errors (android-current-target t buffer-file-name project-root))))
+       (or (when-let* ((owned (and buffer-file-name
+                                  (android-target-for-source-file buffer-file-name project-root))))
+             (when (and (equal (plist-get owned :module-id) (plist-get selected :module-id))
+                        (equal (plist-get owned :module-path) (plist-get selected :module-path))
+                        (equal (plist-get owned :build-root) (plist-get selected :build-root))
+                        (equal (plist-get owned :variant) (plist-get selected :variant)))
+               owned))
+           selected)))))
 
 (defun compose-preview--sanitize (value)
   "Return Gradle-side sanitized VALUE."
@@ -1134,10 +1140,7 @@ With REFRESH non-nil, refresh Android project metadata first."
   (compose-preview--invalidate-project-sessions root)
   (let ((key (compose-preview--cache-key root)))
     (setq compose-preview--target-cache
-          (assoc-delete-all key compose-preview--target-cache)
-          compose-preview--metadata-refresh-roots
-          (delete (file-name-as-directory (expand-file-name root))
-                  compose-preview--metadata-refresh-roots))
+          (assoc-delete-all key compose-preview--target-cache))
     (compose-preview--schedule-model-update-refresh root)))
 
 (defun compose-preview--cached-target (project-root)
@@ -1482,9 +1485,7 @@ When FORCE-PROMPT is non-nil, prompt for module and variant via android-project.
                            (user-error "Could not find project root: no gradlew")))
          (metadata-target
           (and (not force-prompt)
-               (compose-preview--refresh-stale-kmp-target
-                project-root
-                (compose-preview--target-from-android-project project-root))))
+               (compose-preview--target-from-android-project project-root)))
          (cached-target (compose-preview--cached-target project-root))
          (source-module-root (compose-preview--find-module-root))
          (cached
@@ -1509,11 +1510,12 @@ When FORCE-PROMPT is non-nil, prompt for module and variant via android-project.
              project-root)
             (compose-preview--cache-target metadata-target))
 	(if (and cached (not force-prompt))
-            (let* ((module-name (compose-preview--module-name
-				 (plist-get cached :module-path)))
-                   (android-target
+            (let* ((android-target
                     (compose-preview--android-target-for-module
-                     project-root module-name (plist-get cached :variant))))
+                     project-root
+                     (cons (directory-file-name (or (plist-get cached :build-root) project-root))
+                           (plist-get cached :module-path))
+                     (plist-get cached :variant))))
               (if android-target
                   (progn
                     (compose-preview--log
@@ -3073,7 +3075,10 @@ running; only the newest waiting file request is retained."
                   (unless (and result (= (or (compose-preview--json-get result "schemaVersion") 0) 1)
                                (memq (process-exit-status process) '(0 1))
                                (member (compose-preview--json-get result "status") '("ready" "partial" "stale")))
-                    (error "CLI failed (exit %s); see file log" (process-exit-status process)))
+                    (error "CLI failed (exit %s): %s" (process-exit-status process)
+                           (or (compose-preview--json-get
+                                (compose-preview--json-get result "error") "message")
+                               "see file log")))
                   (compose-preview--finish-cli-result context result))
               (error (compose-preview--fail context "%s" (error-message-string err)))))
         (when-let* ((request (plist-get context :request-directory)))
@@ -3092,9 +3097,19 @@ running; only the newest waiting file request is retained."
     (unless (and (stringp output) (file-name-absolute-p output) (listp rows)
                  (stringp (compose-preview--json-get result "status")))
       (error "Invalid CLI result envelope"))
-    (when-let* ((reported (compose-preview--json-get result "target")))
+    (let ((reported (compose-preview--json-get result "target")))
       (unless (and (equal (compose-preview--json-get reported "modulePath") (plist-get target :module-path))
-                   (equal (compose-preview--json-get reported "variant") (plist-get target :variant)))
+                   (equal (compose-preview--json-get reported "variant") (plist-get target :variant))
+                   (equal (compose-preview--cache-key (or (compose-preview--json-get reported "projectRoot") ""))
+                          (compose-preview--cache-key (plist-get target :project-root)))
+                   (equal (compose-preview--cache-key (or (compose-preview--json-get reported "buildRoot") ""))
+                          (compose-preview--cache-key (or (plist-get target :build-root) (plist-get target :project-root))))
+                   (equal (compose-preview--cache-key (or (compose-preview--json-get reported "moduleRoot") ""))
+                          (compose-preview--cache-key (plist-get target :module-root)))
+                   (equal (compose-preview--json-get reported "component")
+                          (or (plist-get (plist-get target :component) :kind) "main"))
+                   (equal (compose-preview--json-get reported "componentName")
+                          (or (plist-get (plist-get target :component) :name) (plist-get target :variant))))
         (error "CLI returned a different target")))
     (dolist (row rows)
       (puthash (compose-preview--json-get row "previewId")
@@ -3146,15 +3161,15 @@ running; only the newest waiting file request is retained."
     (compose-preview--complete-work context)))
 
 (defun compose-preview--start-refresh (&optional variant)
-  "Start one CLI-owned build/discovery/render operation for this source file."
+  "Start a CLI build/discovery/render for this file and optional VARIANT."
   (when-let* ((root (compose-preview--find-project-root))
               ((compose-preview--android-project-model-pending-p root)))
     (android-refresh-project-model root)
     (compose-preview--panel-status (current-buffer) root "syncing Android project model…" 'warning)
     (user-error "Android project model is loading; Preview will refresh when ready"))
   (let* ((source (current-buffer))
-         (target (compose-preview--target current-prefix-arg))
-         (variant (or variant (plist-get target :variant)))
+         (target (compose-preview--validate-target (compose-preview--target current-prefix-arg) variant))
+         (variant (plist-get target :variant))
          (key (compose-preview--file-key source))
          (method (unless compose-preview--refresh-all-in-file (compose-preview--current-preview-method-fqn)))
          (generation (cl-incf compose-preview--generation))
@@ -3167,6 +3182,10 @@ running; only the newest waiting file request is retained."
          (command (append (compose-preview--cli-command)
                           (list "render" "--json" "--project" default-directory
                                 "--module" (plist-get target :module-path) "--variant" variant
+                                "--build-root" (or (plist-get target :build-root) default-directory)
+                                "--module-root" (plist-get target :module-root)
+                                "--component" (or (plist-get (plist-get target :component) :kind) "main")
+                                "--component-name" (plist-get (plist-get target :component) :name)
                                 "--file" key "--result-file" result-file "--overrides" override-file
                                 "--cache-dir" compose-preview-cache-directory
                                 "--renderer-version" compose-preview-renderer-version
@@ -3185,7 +3204,8 @@ running; only the newest waiting file request is retained."
          (overrides (make-hash-table :test #'equal))
          context process)
     (setf (plist-get target :variant) variant)
-    (when (compose-preview--project-unsaved-p default-directory)
+    (when (or (compose-preview--project-unsaved-p default-directory)
+              (compose-preview--project-unsaved-p (plist-get target :build-root)))
       (delete-directory request t)
       (kill-buffer log)
       (user-error "Save modified project sources before rendering"))

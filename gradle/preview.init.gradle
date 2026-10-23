@@ -100,6 +100,15 @@ abstract class ComposePreviewModelTask extends DefaultTask {
     abstract Property<String> getProjectRootPath()
 
     @Input
+    abstract Property<String> getBuildRootPath()
+
+    @Input
+    abstract Property<String> getComponentKind()
+
+    @Input
+    abstract Property<String> getComponentName()
+
+    @Input
     abstract Property<String> getModuleRootPath()
 
     @Input
@@ -257,6 +266,9 @@ abstract class ComposePreviewModelTask extends DefaultTask {
 
         def model = [
                 projectRoot     : projectRootPath.get(),
+                buildRoot       : buildRootPath.get(),
+                component       : componentKind.get(),
+                componentName   : componentName.get(),
                 moduleRoot      : moduleRootPath.get(),
                 modulePath      : modulePath.get(),
                 variant         : variantName.get(),
@@ -401,11 +413,21 @@ if (targetModulePath == null || modelFilePath == null) {
     return
 }
 
+def entryRoot = System.getenv("COMPOSE_PREVIEW_PROJECT_ROOT")
+def owningBuildRoot = System.getenv("COMPOSE_PREVIEW_BUILD_ROOT")
+def componentKind = System.getenv("COMPOSE_PREVIEW_COMPONENT") ?: "main"
+def componentName = System.getenv("COMPOSE_PREVIEW_COMPONENT_NAME") ?: targetVariant
+if (entryRoot == null || owningBuildRoot == null || componentKind != "main" || componentName != targetVariant) {
+    throw new GradleException("compose-preview: invalid or unsupported target identity")
+}
+def ownsProject = { project -> project.rootDir.canonicalFile == new File(owningBuildRoot).canonicalFile }
+
 def variantSuffix = targetVariant.substring(0, 1).toUpperCase(Locale.ROOT) + targetVariant.substring(1)
 
 gradle.ext.composePreviewTargetModulePath = targetModulePath
 gradle.ext.composePreviewTargetVariant = targetVariant
 gradle.ext.composePreviewRegisterKmp = { project, variant, resourceApk, runtimeRJar ->
+    if (!ownsProject(project)) return
     def layoutlibRuntime = project.configurations.detachedConfiguration(
             project.dependencies.create("com.android.tools.layoutlib:layoutlib-runtime:${layoutlibVersion}"))
     def layoutlibResources = project.configurations.detachedConfiguration(
@@ -419,7 +441,10 @@ gradle.ext.composePreviewRegisterKmp = { project, variant, resourceApk, runtimeR
         task.description = "Collects Android KMP Compose preview metadata for Emacs"
         task.namespace.set(variant.namespace)
         task.modulePath.set(targetModulePath)
-        task.projectRootPath.set(project.rootDir.absolutePath)
+        task.projectRootPath.set(entryRoot)
+        task.buildRootPath.set(project.rootDir.absolutePath)
+        task.componentKind.set(componentKind)
+        task.componentName.set(componentName)
         task.moduleRootPath.set(project.projectDir.absolutePath)
         task.variantName.set(targetVariant)
         task.modelFile.set(new File(modelFilePath))
@@ -451,7 +476,7 @@ if (adapterDirectory == null) {
 apply from: new File(adapterDirectory, "agp-9.3-kmp.init.gradle")
 
 gradle.beforeProject { project ->
-    if (project.path != targetModulePath) {
+    if (project.path != targetModulePath || !ownsProject(project)) {
         return
     }
     ["com.android.application", "com.android.library", "com.android.dynamic-feature"].each { pluginId ->
@@ -484,7 +509,10 @@ gradle.beforeProject { project ->
                     task.description = "Collects Compose preview metadata for Emacs"
                     task.namespace.set(variant.namespace)
                     task.modulePath.set(targetModulePath)
-                    task.projectRootPath.set(project.rootDir.absolutePath)
+                    task.projectRootPath.set(entryRoot)
+                    task.buildRootPath.set(project.rootDir.absolutePath)
+                    task.componentKind.set(componentKind)
+                    task.componentName.set(componentName)
                     task.moduleRootPath.set(project.projectDir.absolutePath)
                     task.variantName.set(targetVariant)
                     task.modelFile.set(new File(modelFilePath))

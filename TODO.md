@@ -50,7 +50,11 @@
 - [ ] In `android-project`: full AGP V2 dependency models, phased sync and
   configuration-aware variant propagation (not inferred from names).
 - [ ] Watch/daemon transport with cancellation tokens (the first CLI is one-shot).
-- [ ] Cross-project/included-build input tracking beyond the selected project.
+- [x] Preserve sync/build/module/variant/component identity through Preview
+  requests, compiled receipts and results; track the entry and owning build inputs.
+- [ ] Track other dependency builds beyond the entry and selected owning build.
+- [ ] Component-specific rendering for androidTest/unitTest/screenshotTest and
+  other tests; currently reject these instead of silently using main artifacts.
 - [ ] Full interactive/animation Preview and live canvas resizing.
 - [ ] Bound model/launcher cache disk usage. `cache prune` currently handles
   marked run artifacts only; model snapshots are intentionally not auto-deleted.

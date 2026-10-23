@@ -21,12 +21,12 @@ class EngineTest {
     private fun options(vararg extra: String) = Options(listOf("render", "--cache-dir", root.resolve("build/cache").toString()) + extra)
     private fun fixture(): Pair<Path,JsonObject> {
         val classes = root.resolve("build/A.class"); Files.createDirectories(classes.parent); classes.writeText("bytecode")
-        val model = obj("projectRoot" to root.toString(), "moduleRoot" to root.toString(), "modulePath" to ":app", "variant" to "debug",
+        val model = obj("projectRoot" to root.toString(), "buildRoot" to root.toString(), "component" to "main", "componentName" to "debug", "moduleRoot" to root.toString(), "modulePath" to ":app", "variant" to "debug",
             "namespace" to "demo", "javaExecutable" to Path.of(System.getProperty("java.home"),"bin/java").toString(), "layoutlibPath" to "/layoutlib",
             "classPath" to listOf(classes.toString()), "projectClassPath" to listOf(classes.toString()), "rendererClassPath" to emptyList<String>(),
             "rClassJars" to emptyList<String>(), "previews" to emptyList<String>())
         val path = root.resolve("build/model.json"); atomicJson(path,model)
-        atomicJson(path.resolveSibling("model.receipt.json"),obj("environment" to buildEnvironment(),"modelHash" to hash(model),"inputs" to inputSignature(root,assets()),"artifacts" to artifactSignature(model)))
+        atomicJson(path.resolveSibling("model.receipt.json"),obj("environment" to buildEnvironment(),"modelHash" to hash(model),"inputs" to targetInputs(PreviewTarget.fromModel(model),assets()),"artifacts" to artifactSignature(model)))
         return path to model
     }
     private fun <T> engine(options: Options, block: (Engine) -> T): T {
@@ -55,6 +55,47 @@ class EngineTest {
         assertEquals("timeout",timeout.kind)
         buildPreviewModel(root,":probe",emptyList(),mapOf("COMPOSE_PREVIEW_CORE_TEST" to "after-cancel"),120,home)
         assertEquals("after-cancel",root.resolve("build/probe.txt").readText())
+    }
+    @Test fun `tooling keeps entry distribution and selects included build project directory`() {
+        val home=Path.of(System.getProperty("preview.test.gradle.home"))
+        root.resolve("settings.gradle").writeText("rootProject.name='entry'\nincludeBuild('included')\n")
+        val included=root.resolve("included").createDirectories()
+        included.resolve("settings.gradle").writeText("rootProject.name='included'\n")
+        included.resolve("build.gradle").writeText("tasks.register('probe') { doLast { file('build/selected').parentFile.mkdirs(); file('build/selected').text = rootDir.canonicalPath } }\n")
+        buildPreviewModel(root,":probe",listOf("--project-dir",included.toString()),emptyMap(),120,home)
+        assertEquals(included.toRealPath().toString(),included.resolve("build/selected").readText())
+        assertFalse(root.resolve("build/selected").exists())
+    }
+    @Test fun `target identity rejects non main components before any build`() {
+        for(component in listOf("androidTest","unitTest","screenshotTest","testFixtures","hostTest")) {
+            val error=assertFailsWith<Failure> { PreviewTarget(root,root,":app","debug",component,"debugTest") }
+            assertEquals("unsupported",error.kind)
+        }
+        assertFailsWith<Failure> { PreviewTarget(root,root,":app","release","main","debug") }
+    }
+    @Test fun `exact model cannot bypass owning build component or module root checks`() {
+        val (path,model)=fixture()
+        for(extra in listOf(listOf("--build-root",root.resolve("other").toString()),
+            listOf("--module-root",root.resolve("other").toString()),listOf("--variant","release"),
+            listOf("--component","androidTest","--component-name","debugAndroidTest"))) {
+            engine(options("--model",path.toString(),"--no-build",*extra.toTypedArray())) { assertFailsWith<Failure> { it.prepare() } }
+        }
+        model.remove("buildRoot")
+        atomicJson(path,model)
+        engine(options("--model",path.toString())) { assertEquals("stale-model",assertFailsWith<Failure> { it.prepare() }.kind) }
+    }
+    @Test fun `owning build identity separates cache inputs and reports`() {
+        val first=PreviewTarget(root,root.resolve("included-a"),":app","debug","main","debug")
+        val second=first.copy(buildRoot=root.resolve("included-b"))
+        assertNotEquals(hash(first.json()),hash(second.json()))
+        val external=Files.createTempDirectory("preview-external-build")
+        try {
+            val target=first.copy(buildRoot=external)
+            external.resolve("build.gradle").writeText("// first")
+            val before=targetInputs(target,assets())
+            external.resolve("build.gradle").writeText("// changed")
+            assertNotEquals(before,targetInputs(target,assets()))
+        } finally { external.resolve("build.gradle").deleteExisting(); external.deleteExisting() }
     }
     @Test fun `obsolete project CLI selection is not accepted`() {
         assertFailsWith<Failure> { Options(listOf("render","--project-cli","unused")) }
@@ -185,7 +226,7 @@ class EngineTest {
         val previous=Path.of(first.text("outputDirectory")!!).resolve("result.json")
         root.resolve("Changed.kt").writeText("fun Changed() {}")
         atomicJson(path.resolveSibling("model.receipt.json"),obj("environment" to buildEnvironment(),"modelHash" to hash(model),
-            "inputs" to inputSignature(root,assets()),"artifacts" to artifactSignature(model)))
+            "inputs" to targetInputs(PreviewTarget.fromModel(model),assets()),"artifacts" to artifactSignature(model)))
         val second=engine(options("--model",path.toString(),"--no-build","--reuse","--previous-result",previous.toString())) { it.render().first }
         assertFalse(second["reusedImages"].asBoolean)
         assertNotEquals(first.text("outputDirectory"),second.text("outputDirectory"))
@@ -196,7 +237,7 @@ class EngineTest {
         val previous=Path.of(first.text("outputDirectory")!!).resolve("result.json")
         Path.of(model.strings("classPath")[0]).writeText("changed bytecode")
         atomicJson(path.resolveSibling("model.receipt.json"),obj("environment" to buildEnvironment(),"modelHash" to hash(model),
-            "inputs" to inputSignature(root,assets()),"artifacts" to artifactSignature(model)))
+            "inputs" to targetInputs(PreviewTarget.fromModel(model),assets()),"artifacts" to artifactSignature(model)))
         val second=engine(options("--model",path.toString(),"--no-build","--reuse","--previous-result",previous.toString())) { it.render().first }
         assertFalse(second["reusedImages"].asBoolean)
     }

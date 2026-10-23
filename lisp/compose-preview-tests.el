@@ -106,7 +106,8 @@
               :module-root "/tmp/project/composeApp/"
               :module-path ":composeApp"
               :variant "androidMain"
-              :preview-task "assembleAndroidMain"))))))
+              :build-root "/tmp/project/"
+              :component (list :kind "main" :name "androidMain")))))))
 
 (ert-deftest compose-preview-refresh-starts-missing-project-model ()
   "A first Preview request actively starts Android project-model sync."
@@ -214,41 +215,32 @@
   "A refreshed Android model invalidates project target metadata caches."
   (let ((compose-preview--target-cache
          '(("/tmp/project" . (:variant "androidMain"))
-           ("/tmp/other" . (:variant "debug"))))
-        (compose-preview--metadata-refresh-roots
-         '("/tmp/project/" "/tmp/other/")))
+           ("/tmp/other" . (:variant "debug")))))
     (compose-preview--android-project-model-updated "/tmp/project/" nil)
     (should-not (assoc "/tmp/project" compose-preview--target-cache))
-    (should (assoc "/tmp/other" compose-preview--target-cache))
-    (should-not (member "/tmp/project/"
-                        compose-preview--metadata-refresh-roots))
-    (should (member "/tmp/other/"
-                    compose-preview--metadata-refresh-roots))))
+    (should (assoc "/tmp/other" compose-preview--target-cache))))
 
-(ert-deftest compose-preview-target-refreshes-non-rendering-kmp-metadata ()
-  "Stale Android KMP metadata is refreshed before selecting a preview task."
-  (let ((refreshed nil))
-    (cl-letf (((symbol-function 'compose-preview--find-project-root)
-               (lambda () "/tmp/project/"))
-              ((symbol-function 'android-target-for-source-file)
-               (lambda (_file _project-root &optional refresh)
-                 (setq refreshed (or refreshed refresh))
-                 (list :module-path ":composeApp"
-                       :module-name "composeApp"
-                       :module-root "/tmp/project/composeApp"
-                       :variant "androidMain"
-                       :application-id "com.example"
-                       :source-roots '("src/commonMain/kotlin")
-                       :preview-task (if refreshed
-                                         "desktopTest"
-                                       "assembleAndroidMain")))))
-      (let ((compose-preview--target-cache nil)
-            (compose-preview--metadata-refresh-roots nil)
-            (buffer-file-name
-             "/tmp/project/composeApp/src/commonMain/kotlin/example/Foo.kt"))
-        (should (equal (plist-get (compose-preview--target) :preview-task)
-                       "desktopTest"))
-        (should refreshed)))))
+(ert-deftest compose-preview-target-preserves-build-and-component-identity ()
+  "Targets retain owning build and component without legacy task heuristics."
+  (let* ((component '(:kind "androidTest" :name "debugAndroidTest"))
+         (target (compose-preview--target-from-android-entry
+                  "/tmp/entry/" (list :build-root "/tmp/included" :module-root "/tmp/included/app"
+                                      :module-path ":app" :variant "debug" :component component
+                                      :preview-task "desktopTest"))))
+    (should (equal (plist-get target :project-root) "/tmp/entry/"))
+    (should (equal (plist-get target :build-root) "/tmp/included/"))
+    (should (equal (plist-get target :component) component))
+    (should-not (plist-member target :preview-task))
+    (should-error (compose-preview--validate-target target) :type 'user-error)))
+
+(ert-deftest compose-preview-explicit-variant-keeps-component-kind ()
+  "Changing variant cannot silently convert a test source into a main source."
+  (should-error (compose-preview--validate-target
+                 '(:variant "debug" :component (:kind "unitTest" :name "debugUnitTest")) "release")
+                :type 'user-error)
+  (let ((target (compose-preview--validate-target
+                 '(:project-root "/tmp/entry/" :variant "debug" :component (:kind "main" :name "debug")) "release")))
+    (should (equal (plist-get target :component) '(:kind "main" :name "release")))))
 
 (ert-deftest compose-preview-target-refreshes-stale-cache-from-android-project ()
   "Android-mode source metadata should replace stale in-memory targets."
@@ -278,7 +270,8 @@
               :module-root "/tmp/project/composeApp/"
               :module-path ":composeApp"
               :variant "androidMain"
-              :preview-task "assembleAndroidMain"))))))
+              :build-root "/tmp/project/"
+              :component (list :kind "main" :name "androidMain")))))))
 
 (ert-deftest compose-preview-cached-target-upgrades-to-android-project-variant ()
   "Cached module targets should use android-project's real variant metadata."
@@ -309,7 +302,8 @@
               :module-root "/tmp/project/composeApp/"
               :module-path ":composeApp"
               :variant "androidMain"
-              :preview-task "assembleAndroidMain"))))))
+              :build-root "/tmp/project/"
+              :component (list :kind "main" :name "androidMain")))))))
 
 (ert-deftest compose-preview-force-prompt-uses-android-project-module-root ()
   "Prompted android-project modules keep their Gradle metadata module root."
@@ -337,7 +331,54 @@
               :module-root "/tmp/project/app/demo-android/"
               :module-path ":demo-android"
               :variant "debug"
-              :preview-task "testDebugUnitTest"))))))
+              :build-root "/tmp/project/"
+              :component (list :kind "main" :name "debug")))))))
+
+(ert-deftest compose-preview-cached-composite-target-uses-stable-module-id ()
+  "Duplicate module paths are resolved by owning build, not display name."
+  (let ((compose-preview--target-cache
+         '(("/tmp/entry" . (:project-root "/tmp/entry/" :build-root "/tmp/included/"
+                            :module-root "/tmp/included/app/" :module-path ":app" :variant "debug"))))
+        (buffer-file-name nil)
+        seen)
+    (cl-letf (((symbol-function 'compose-preview--find-project-root) (lambda () "/tmp/entry/"))
+              ((symbol-function 'compose-preview--find-module-root) #'ignore)
+              ((symbol-function 'compose-preview--android-flavors-available-p) (lambda () t))
+              ((symbol-function 'android-project-target)
+               (lambda (module &rest _)
+                 (setq seen module)
+                 '(:build-root "/tmp/included" :module-root "/tmp/included/app"
+                   :module-path ":app" :variant "debug"))))
+      (should (equal (plist-get (compose-preview--target) :build-root) "/tmp/included/"))
+      (should (equal seen '("/tmp/included" . ":app"))))))
+
+(ert-deftest compose-preview-result-rejects-incomplete-or-different-target ()
+  "Results must bind sync root, owning build, module, variant and component."
+  (let* ((context '(:source-file "/tmp/Source.kt"
+                   :target (:project-root "/tmp/entry/" :build-root "/tmp/build/"
+                            :module-root "/tmp/build/app/" :module-path ":app" :variant "debug"
+                            :component (:kind "main" :name "debug"))))
+         (reported '(("projectRoot" . "/tmp/entry") ("buildRoot" . "/tmp/build")
+                     ("moduleRoot" . "/tmp/build/app") ("modulePath" . ":app")
+                     ("variant" . "debug") ("component" . "main") ("componentName" . "debug")))
+         (compose-preview--sessions (make-hash-table :test #'equal)))
+    (dolist (key '("projectRoot" "buildRoot" "moduleRoot" "modulePath" "variant" "component" "componentName"))
+      (let ((wrong (copy-tree reported)))
+        (setcdr (assoc key wrong) "different")
+        (should-error (compose-preview--finish-cli-result
+                       context `(("status" . "ready") ("outputDirectory" . "/tmp/out")
+                                 ("results" . nil) ("target" . ,wrong))))))
+    (should-error (compose-preview--finish-cli-result
+                   context '(("status" . "ready") ("outputDirectory" . "/tmp/out") ("results" . nil))))))
+
+(ert-deftest compose-preview-unsupported-component-never-launches-cli ()
+  "Unsupported source components fail before request files or processes exist."
+  (cl-letf (((symbol-function 'compose-preview--find-project-root) #'ignore)
+            ((symbol-function 'compose-preview--target)
+             (lambda (&rest _) '(:project-root "/tmp/" :variant "debug"
+                                 :component (:kind "screenshotTest" :name "debugScreenshotTest"))))
+            ((symbol-function 'make-process) (lambda (&rest _) (ert-fail "Launched unsupported target"))))
+    (should-error (compose-preview--start-refresh) :type 'user-error)))
 
 (ert-deftest compose-preview-size-command-rejects-invalid-dimensions ()
   "Invalid resize values cannot start rendering or mutate source."
@@ -1057,8 +1098,10 @@
             (compose-preview--finish-cli-result
              (list :generation 1 :source-buffer source :source-file "/tmp/A.kt"
                    :stamp (compose-preview--source-stamp source)
-                   :target '(:module-root "/tmp/" :project-root "/tmp/"))
-             '(("outputDirectory" . "/tmp/") ("results" . nil) ("status" . "ready"))))
+                   :target '(:module-root "/tmp/" :project-root "/tmp/" :module-path ":app" :variant "debug"))
+             '(("outputDirectory" . "/tmp/") ("results" . nil) ("status" . "ready")
+               ("target" . (("projectRoot" . "/tmp") ("buildRoot" . "/tmp") ("moduleRoot" . "/tmp") ("modulePath" . ":app")
+                            ("variant" . "debug") ("component" . "main") ("componentName" . "debug"))))))
           (should-not painted)
           (should (equal (plist-get (gethash "/tmp/A.kt" compose-preview--sessions)
                                     :items)
@@ -1476,8 +1519,10 @@
       (let ((compose-preview--active-file "/tmp/Plain.kt"))
         (compose-preview--finish-cli-result
          (list :source-buffer (current-buffer) :source-file "/tmp/Plain.kt"
-               :follow-refresh t :target '(:module-path ":app"))
-         '(("outputDirectory" . "/tmp/") ("results" . nil) ("status" . "ready"))))
+               :follow-refresh t :target '(:project-root "/tmp/" :module-root "/tmp/" :module-path ":app" :variant "debug"))
+         '(("outputDirectory" . "/tmp/") ("results" . nil) ("status" . "ready")
+               ("target" . (("projectRoot" . "/tmp") ("buildRoot" . "/tmp") ("moduleRoot" . "/tmp") ("modulePath" . ":app")
+                            ("variant" . "debug") ("component" . "main") ("componentName" . "debug"))))))
       (should hidden)
       (should-not failed))))
 
