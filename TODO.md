@@ -33,7 +33,14 @@
 
 ## Deliberately not part of the initial CLI extraction
 
-- [ ] Gradle Tooling API + AGP V2 project/variant dependency model.
+- [x] Tooling API wrapper connection, cancellable Preview task execution, and
+  shared `project sync` GradleBuild/AGP V2 basic capability model.
+- [x] `android-project.el` consumes the shared backend asynchronously; the
+  Variant API/KGP collector has a single owner in this CLI distribution.
+- [ ] Replace Variant API/KGP supplemental collection with equivalent AGP V2
+  fields where available; preserve IDs/defaults/components and KMP semantics.
+- [ ] Full AGP V2 dependency models, phased sync and configuration-aware variant
+  propagation (not inferred from variant names).
 - [ ] Watch/daemon transport with cancellation tokens (the first CLI is one-shot).
 - [ ] Cross-project/included-build input tracking beyond the selected project.
 - [ ] Full interactive/animation Preview and live canvas resizing.

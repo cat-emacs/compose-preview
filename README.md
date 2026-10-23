@@ -56,6 +56,9 @@ No Python runtime is used.
 # Environment/resource checks; no project build.
 compose-preview doctor --json
 
+# Shared Gradle/AGP project synchronization; no image rendering.
+compose-preview project sync --project /work/app --json
+
 # Build and discover annotations/providers; no image rendering.
 compose-preview list --project /work/app --module :app --variant debug --json
 
@@ -85,7 +88,42 @@ Prefer explicit `--module` for composite builds or relocated module directories.
 Without it, `--file` infers only the ordinary nearest Gradle build directory;
 it does not evaluate settings DSL or guess which of several modules is selected.
 The CLI currently defaults to variant `debug`; Emacs passes the user's actual
-selected target. `list` may compile the module to discover complete MultiPreview
+selected target.
+
+### Shared Tooling API project backend
+
+There is **one CLI**, not a second executable maintained by `android-project`.
+`project sync` uses the project's wrapper distribution through Gradle Tooling
+API 9.6.1 and reads Gradle build/module structure plus AGP V2 `Versions` and
+`BasicAndroidProject`. BuildAction results are our serializable DTOs, not raw
+Gradle/AGP proxies. Module identity includes the owning build root, and included
+builds are traversed independently. AGP model versions and module-specific basic
+model issues are reported, not hidden; modules without an AGP V2 basic model
+(including some KMP libraries) retain targets through the supplement.
+
+The result is schemaVersion=1/kind=android-project with `modules`, `buildRoots`,
+`targets`, and capabilities. Targets also carry `modelBuildRoots` so the editor
+can persist and watch included/plugin build inputs. Public Variant API/KGP data from the bundled
+`gradle/project.init.gradle` supplements application/test IDs, default variant
+preferences, components and KMP source roots. It executes a lightweight `help`
+build and a separate model action on the same connection: full AGP V2 parity,
+dependency resolution and phased variant propagation are not yet claimed.
+Project sync uses `--no-configuration-cache --no-configure-on-demand`; those
+flags are **not** copied into Preview build invocations.
+
+`android-project.el` asynchronously invokes this command, validates the JSON,
+and owns Emacs last-known metadata, file invalidation and persisted selected
+module/variant. Preview and Logcat continue using its public APIs. It no longer
+ships or runs a competing Gradle collector/CLI. Install the shared executable
+on PATH, or set `android-project-cli-program` to the same command configured in
+`compose-preview-cli-program` when using a checkout.
+
+Preview builds now run `composePreviewModel` via Tooling API `BuildLauncher`,
+with project wrapper/JDK/environment, progress diagnostics on stderr,
+CancellationToken and bounded timeouts. Connections close after an operation;
+shared Gradle daemons are never stopped. Tooling API always uses a daemon, so
+explicit `--no-daemon` uses the existing Gradle-client subprocess path instead
+of pretending it can disable Tooling API daemon usage. `list` may compile the module to discover complete MultiPreview
 and PreviewParameter metadata; it is not a source-only scan.
 
 Temporary override input, keyed by the annotation ID returned by `list`:

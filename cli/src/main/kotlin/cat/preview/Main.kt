@@ -102,10 +102,10 @@ internal class Options(arguments: List<String>) {
         val args = arguments.filter { it != "--json" }
         json = "--json" in arguments
         command = args.firstOrNull() ?: "help"
-        action = if (command == "cache") args.getOrNull(1) else null
+        action = if (command in setOf("cache", "project")) args.getOrNull(1) else null
         val booleans = setOf("no-build", "reuse", "no-daemon", "clean", "dry-run", "apply", "help")
         val known = booleans + setOf("project", "module", "variant", "model", "file", "method", "preview-id", "out", "overrides", "result-file", "previous-result", "cache-dir", "timeout", "build-timeout", "renderer-version", "layoutlib-version", "detector-version", "java-option", "older-than", "keep")
-        var index = if (command == "cache") 2 else 1
+        var index = if (command in setOf("cache", "project")) 2 else 1
         while (index < args.size) {
             val argument = args[index++]
             if (!argument.startsWith("--")) throw Failure("Unexpected argument: $argument", "input")
@@ -255,7 +255,14 @@ internal class Engine(val options: Options, val assets: Path, val processes: Pro
             val command = mutableListOf(wrapper.toString(), task, "--init-script", assets.resolve("gradle/preview.init.gradle").toString(), "--console=plain",
                 if (options.flag("no-daemon")) "--no-daemon" else "--daemon")
             if (options.flag("clean")) command.addAll(listOf("--no-build-cache", "--no-parallel"))
-            processes.run(command, root, env, options.seconds("build-timeout",600))
+            if (options.flag("no-daemon")) {
+                // Tooling API always uses a daemon; preserve the explicit one-shot policy.
+                processes.run(command, root, env, options.seconds("build-timeout",600))
+            } else {
+                val arguments = listOf("--init-script", assets.resolve("gradle/preview.init.gradle").toString(), "--console=plain") +
+                    if (options.flag("clean")) listOf("--no-build-cache", "--no-parallel") else emptyList()
+                GradleTooling().use { tooling -> tooling.build(root, task, arguments, env, options.seconds("build-timeout",600)) }
+            }
             val model = validate(readJson(path))
             if (model.text("modulePath") != module || model.text("variant") != variant || Path.of(model.text("projectRoot")!!).normalize() != root)
                 throw Failure("Gradle returned another target's model", "model")
@@ -435,6 +442,7 @@ private fun assets(): Path {
 private val help = """compose-preview — Android Studio project-level Preview CLI (JDK 17+)
 Usage: compose-preview <command> [options] [--json]
   doctor                      Check runtime and installed resources (no auth)
+  project sync --project DIR    Shared Gradle/AGP V2 project model
   list --project DIR --module :app [--variant debug] [--file FILE]
   render --project DIR --module :app --file FILE [--out EMPTY_DIR]
   render --model MODEL --no-build --file FILE
@@ -464,7 +472,12 @@ fun main(arguments: Array<String>) {
                     "resources" to resources,"sdk" to (System.getenv("ANDROID_SDK_ROOT") ?: System.getenv("ANDROID_HOME")),
                     "versions" to versions,"authRequired" to false,
                     "capabilities" to obj("componentTree" to false,"inflateOnly" to false,
-                        "warmRenderer" to false,"staticCallbacks" to false,"backend" to "studio-launcher"))
+                        "warmRenderer" to false,"staticCallbacks" to false,"projectSync" to true,
+                        "gradleToolingApi" to "9.6.1","agpModelConsumer" to "9.3.0","backend" to "studio-launcher"))
+            }
+            "project" -> {
+                if (options.action != "sync") throw Failure("Use project sync", "input")
+                projectSync(options,home)
             }
             "list" -> {
                 val compiled = engine.prepare()
