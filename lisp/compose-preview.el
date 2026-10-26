@@ -52,7 +52,7 @@
                   (&optional project-root refresh))
 (declare-function android-project-variants "android-project"
                   (&optional project-root refresh))
-(defvar android-project-model-updated-hook)
+(defvar android-project-model-changed-hook)
 (defvar android-project-model-state-changed-hook)
 (declare-function android-target-for-source-file "android-project"
                   (file &optional project-root refresh))
@@ -760,15 +760,16 @@ Do not follow symlink directories or traverse build/runtime output trees."
      (when (member (file-name-as-directory root)
                    (mapcar #'file-name-as-directory (compose-preview--session-input-roots session)))
        (setf (plist-get session :stale) t
+             (plist-get session :invalidation-reason) "project-metadata"
              (plist-get session :revision)
              (1+ (or (plist-get session :revision) 0)))))
    compose-preview--sessions))
 
-(defun compose-preview--dependency-input-roots (target)
-  "Return roots affecting TARGET, requesting its dependency model asynchronously."
+(defun compose-preview--dependency-input-roots (target &optional no-request)
+  "Return roots affecting TARGET, unless NO-REQUEST requesting its graph."
   (let* ((root (plist-get target :project-root))
          (build (or (plist-get target :build-root) root))
-         (snapshot (and compose-preview-use-android-project-flavors
+         (snapshot (and (not no-request) compose-preview-use-android-project-flavors
                         (fboundp 'android-project-dependencies)
                         (android-project-dependencies
                          (cons (directory-file-name build) (plist-get target :module-path))
@@ -777,6 +778,13 @@ Do not follow symlink directories or traverse build/runtime output trees."
                        (fboundp 'android-project-variants) (android-project-variants root)))
          ;; Keep entry/owning-build protection even with a ready graph.
          (roots (list root build)))
+    (when (and no-request entries)
+      (setq snapshot (plist-get
+                      (seq-find (lambda (entry)
+                                  (and (equal (plist-get entry :build-root) (directory-file-name build))
+                                       (equal (plist-get entry :module-path) (plist-get target :module-path))
+                                       (equal (plist-get entry :variant) (plist-get target :variant)))) entries)
+                      :dependencies)))
     (dolist (edge (plist-get snapshot :edges))
       (when (plist-get edge :build-root)
         (push (plist-get edge :build-root) roots)))
@@ -830,6 +838,7 @@ Do not follow symlink directories or traverse build/runtime output trees."
      (when (and (plist-get session :target)
                 (seq-some (lambda (file) (compose-preview--session-affected-by-file-p session file)) files))
        (setf (plist-get session :stale) t
+             (plist-get session :invalidation-reason) "source-or-resource-input"
              (plist-get session :revision) (1+ (or (plist-get session :revision) 0)))))
    compose-preview--sessions))
 
@@ -1199,13 +1208,55 @@ With REFRESH non-nil, refresh Android project metadata first."
                             #'compose-preview--refresh-after-model-update
                             root source)))))
 
-(defun compose-preview--android-project-model-updated (root _data)
-  "Invalidate preview target state after Android model ROOT is updated."
-  (compose-preview--invalidate-project-sessions root)
-  (let ((key (compose-preview--cache-key root)))
-    (setq compose-preview--target-cache
-          (assoc-delete-all key compose-preview--target-cache))
-    (compose-preview--schedule-model-update-refresh root)))
+(defun compose-preview--android-project-model-changed (root change)
+  "Apply scoped Android CHANGE for ROOT without redundant renders."
+  (let ((kind (plist-get change :kind)) active-affected)
+    (if (eq kind 'metadata)
+        (progn
+          (compose-preview--invalidate-project-sessions root)
+          (setq compose-preview--target-cache
+                (assoc-delete-all (compose-preview--cache-key root) compose-preview--target-cache)
+                active-affected t))
+      (maphash
+       (lambda (key session)
+         (let* ((target (plist-get session :target))
+                (identity (list (directory-file-name (or (plist-get target :build-root) root))
+                                (plist-get target :module-path) (plist-get target :variant)))
+                (matches (and target
+                              (equal (compose-preview--cache-key root)
+                                     (compose-preview--cache-key (plist-get target :project-root)))
+                              (seq-some (lambda (changed)
+                                          (if (eq kind 'selection) (equal (butlast identity) (butlast changed))
+                                            (equal identity changed)))
+                                        (plist-get change :targets)))))
+           (when matches
+             (let* ((old (sort (mapcar #'compose-preview--cache-key (compose-preview--session-input-roots session)) #'string<))
+                    (new (and (eq kind 'dependencies)
+                              (sort (mapcar #'compose-preview--cache-key
+                                            (compose-preview--dependency-input-roots target t)) #'string<))))
+               ;; A compiled request already protects all discovered build roots.
+               ;; A more precise graph alone does not change those artifacts.
+               (if (and (eq kind 'dependencies) (equal old new))
+                   (compose-preview--log "project-update: dependencies unchanged input coverage; keep %s" key)
+                 (setf (plist-get session :stale) t
+                       (plist-get session :invalidation-reason) (if (eq kind 'selection) "variant-selection" "dependency-input-roots")
+                       (plist-get session :revision) (1+ (or (plist-get session :revision) 0)))
+                 (puthash key session compose-preview--sessions)
+                 (when (equal key compose-preview--active-file) (setq active-affected t)))))))
+       compose-preview--sessions)
+      (when (eq kind 'selection)
+        (setq compose-preview--target-cache
+              (assoc-delete-all (compose-preview--cache-key root) compose-preview--target-cache))))
+    (if active-affected
+        (compose-preview--schedule-model-update-refresh root)
+      (when (compose-preview--panel-visible-for-project-p root)
+        (let* ((session (gethash compose-preview--active-file compose-preview--sessions))
+               (source (buffer-local-value 'compose-preview--source-buffer
+                                           (get-buffer compose-preview-results-buffer-name))))
+          (when session
+            (compose-preview--panel-status source (plist-get session :module-root)
+                                           (compose-preview--session-status session source)
+                                           (plist-get session :face))))))))
 
 (defun compose-preview--cached-target (project-root)
   "Return cached preview target for PROJECT-ROOT."
@@ -3201,7 +3252,9 @@ running; only the newest waiting file request is retained."
           (if (plist-get context :follow-refresh)
               (compose-preview--hide-panel)
             (compose-preview--panel-status source (plist-get target :module-root) "no previews in file" 'warning))
-        (compose-preview--render-results (plist-get target :module-root) items source)
+        (let ((started (float-time)))
+          (compose-preview--render-results (plist-get target :module-root) items source)
+          (compose-preview--log "preview-timing: phase=display elapsed=%.3fs" (- (float-time) started)))
         (compose-preview--panel-status source (plist-get target :module-root)
                                        (compose-preview--session-status session source) (plist-get session :face))
         (when (plist-get context :preserve-view)
@@ -3210,12 +3263,24 @@ running; only the newest waiting file request is retained."
                            (min (or (plist-get session :point) (point-min)) (point-max))))
             (when-let* ((window (get-buffer-window (current-buffer) t)))
               (set-window-point window (point)))))))
+    (when (plist-get context :started-at)
+      (compose-preview--log "preview-timing: total=%.3fs reused-model=%s reused-images=%s stale=%s reason=%s"
+                            (- (float-time) (plist-get context :started-at))
+                            (compose-preview--json-get result "reusedModel")
+                            (compose-preview--json-get result "reusedImages")
+                            (plist-get session :stale) (plist-get context :reason)))
+    (unless (plist-get session :stale) (setf (plist-get session :invalidation-reason) nil))
     (compose-preview--complete-work context)))
+
+(defvar-local compose-preview--model-wait-started-at nil
+  "Time this source first waited for project metadata.")
 
 (defun compose-preview--start-refresh (&optional variant)
   "Start a CLI build/discovery/render for this file and optional VARIANT."
   (when-let* ((root (compose-preview--find-project-root))
               ((compose-preview--android-project-model-pending-p root)))
+    (unless compose-preview--model-wait-started-at
+      (setq compose-preview--model-wait-started-at (float-time)))
     (android-refresh-project-model root)
     (compose-preview--panel-status (current-buffer) root "syncing Android project model…" 'warning)
     (user-error "Android project model is loading; Preview will refresh when ready"))
@@ -3232,6 +3297,9 @@ running; only the newest waiting file request is retained."
          (override-file (expand-file-name "overrides.json" request))
          (log (generate-new-buffer (format "*Compose Preview Log: %s*" (file-name-nondirectory key))))
          (default-directory (plist-get target :project-root))
+         (reason (if compose-preview--render-only "render-only-override"
+                   (or (plist-get session :invalidation-reason)
+                       (if (plist-get session :items) "explicit-or-follow-refresh" "first-render"))))
          (command (append (compose-preview--cli-command)
                           (list "render" "--json" "--project" default-directory
                                 "--module" (plist-get target :module-path) "--variant" variant
@@ -3274,11 +3342,17 @@ running; only the newest waiting file request is retained."
           (plist-get session :stale) t
           (plist-get session :log) log)
     (setq context (list :generation generation :target target :input-roots input-roots :source-buffer source :source-file key
+                        :started-at (float-time) :reason reason
                         :stamp (compose-preview--source-stamp source) :revision (plist-get session :revision)
                         :preview-method method :follow-refresh compose-preview--follow-refresh
                         :preserve-view compose-preview--render-only
                         :request-directory request :result-file result-file :log-buffer log)
           compose-preview--work-context context)
+    (compose-preview--log "preview-request: reason=%s file=%s roots=%d model-wait=%.3fs"
+                          reason key (length input-roots)
+                          (if compose-preview--model-wait-started-at
+                              (- (float-time) compose-preview--model-wait-started-at) 0))
+    (setq compose-preview--model-wait-started-at nil)
     (condition-case err
         (progn
           (setq process (make-process :name "compose-preview-cli" :buffer nil :stderr log
@@ -3296,8 +3370,8 @@ running; only the newest waiting file request is retained."
 
 (add-hook 'kill-emacs-hook #'compose-preview--panel-disposed)
 (add-hook 'after-save-hook #'compose-preview--source-saved)
-(add-hook 'android-project-model-updated-hook
-          #'compose-preview--android-project-model-updated)
+(add-hook 'android-project-model-changed-hook
+          #'compose-preview--android-project-model-changed)
 (add-hook 'android-project-model-state-changed-hook
           #'compose-preview--android-project-model-state-changed)
 

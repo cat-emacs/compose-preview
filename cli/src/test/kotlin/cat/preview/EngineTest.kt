@@ -113,6 +113,20 @@ class EngineTest {
             assertNotEquals(hash(target.json()),hash(target.copy(inputRoots=emptyList()).json()))
         } finally { external.resolve("Source.kt").deleteExisting(); external.deleteExisting() }
     }
+    @Test fun `explicit model cache diagnostics distinguish hit from stale without changing stdout`() {
+        val (path,_)=fixture()
+        val old=System.err
+        val bytes=java.io.ByteArrayOutputStream()
+        try {
+            System.setErr(java.io.PrintStream(bytes))
+            engine(options("--model",path.toString(),"--no-build")) { assertTrue(it.prepare().reused) }
+            root.resolve("Changed.kt").writeText("changed")
+            engine(options("--model",path.toString(),"--no-build")) { assertFailsWith<Failure> { it.prepare() } }
+        } finally { System.setErr(old) }
+        val log=bytes.toString(Charsets.UTF_8)
+        assertTrue(log.contains("stage=model reason=explicit-model-fresh"))
+        assertTrue(log.contains("stage=model reason=explicit-model-stale"))
+    }
     @Test fun `obsolete project CLI selection is not accepted`() {
         assertFailsWith<Failure> { Options(listOf("render","--project-cli","unused")) }
     }

@@ -168,6 +168,14 @@ internal fun <T> locked(directory: Path, timeout: Long = 60, body: () -> T): T {
 }
 
 internal class Engine(val options: Options, val assets: Path, val processes: Processes) {
+    private fun <T> timed(phase: String, body: () -> T): T {
+        val start = System.nanoTime()
+        try { return body() }
+        finally { System.err.println("preview-timing: phase=$phase elapsed-ms=${(System.nanoTime()-start)/1_000_000}") }
+    }
+    private fun decision(stage: String, reason: String) {
+        System.err.println("preview-cache: stage=$stage reason=$reason")
+    }
     val cache: Path = (options.path("cache-dir") ?: System.getenv("COMPOSE_PREVIEW_CACHE_DIR")?.let { Path.of(it) }
         ?: Path.of(System.getenv("XDG_CACHE_HOME") ?: Path.of(System.getProperty("user.home"), ".cache").toString(), "compose-preview")).toAbsolutePath().normalize()
     fun target(): PreviewTarget {
@@ -226,8 +234,11 @@ internal class Engine(val options: Options, val assets: Path, val processes: Pro
             expected.verify(model)
             val signature = targetInputs(target, assets)
             val artifacts = artifactSignature(model)
-            if (artifacts == null || saved.text("environment") != buildEnvironment() || saved.text("modelHash") != hash(model) || saved.text("inputs") != signature || saved.text("artifacts") != artifacts)
+            if (artifacts == null || saved.text("environment") != buildEnvironment() || saved.text("modelHash") != hash(model) || saved.text("inputs") != signature || saved.text("artifacts") != artifacts) {
+                decision("model","explicit-model-stale")
                 throw Failure("Compiled model is out of date", "stale-model")
+            }
+            decision("model","explicit-model-fresh")
             return Compiled(path, model, signature, true)
         }
         val target = target()
@@ -242,16 +253,29 @@ internal class Engine(val options: Options, val assets: Path, val processes: Pro
             val path = directory.resolve("model.json")
             val receipt = directory.resolve("model.receipt.json")
             val before = targetInputs(target, assets)
+            var reason = if (path.exists() && receipt.exists()) "refresh-requested" else "model-or-receipt-missing"
             if (path.exists() && receipt.exists()) {
                 try {
                     val model = validate(readJson(path))
                     target.verify(model)
                     val saved = readJson(receipt)
                     val artifact = artifactSignature(model)
-                    if ((options.flag("reuse") || options.flag("no-build")) && artifact != null && saved["identity"] == identity && saved.text("environment") == buildEnvironment() && saved.text("modelHash") == hash(model) && saved.text("inputs") == before && saved.text("artifacts") == artifact)
+                    val mismatches = listOfNotNull(
+                        if (artifact == null) "artifacts-missing" else null,
+                        if (saved["identity"] != identity) "target-or-tool-versions" else null,
+                        if (saved.text("environment") != buildEnvironment()) "build-environment" else null,
+                        if (saved.text("modelHash") != hash(model)) "model-content" else null,
+                        if (saved.text("inputs") != before) "source-or-build-inputs" else null,
+                        if (artifact != null && saved.text("artifacts") != artifact) "compiled-artifacts" else null)
+                    if (mismatches.isNotEmpty()) reason = mismatches.joinToString(",")
+                    else if ((options.flag("reuse") || options.flag("no-build")) && !options.flag("clean")) {
+                        decision("model","fresh-model-hit")
                         return@locked snapshot(path, model, before, true)
-                } catch (_: Exception) { /* Invalid derived cache is never authoritative. */ }
+                    }
+                } catch (_: Exception) { reason = "invalid-model-or-target" }
             }
+            if (options.flag("clean")) reason = "clean-requested"
+            decision("model",reason)
             if (options.flag("no-build")) throw Failure("No fresh compiled model; save sources and refresh first", "stale-model")
             Files.deleteIfExists(receipt)
             val env = mapOf("COMPOSE_PREVIEW_MODULE_PATH" to module, "COMPOSE_PREVIEW_VARIANT" to variant,
@@ -264,13 +288,15 @@ internal class Engine(val options: Options, val assets: Path, val processes: Pro
             val command = mutableListOf(wrapper.toString(), task, "--project-dir", target.buildRoot.toString(), "--init-script", assets.resolve("gradle/preview.init.gradle").toString(), "--console=plain",
                 if (options.flag("no-daemon")) "--no-daemon" else "--daemon")
             if (options.flag("clean")) command.addAll(listOf("--no-build-cache", "--no-parallel"))
-            if (options.flag("no-daemon")) {
-                // Tooling API always uses a daemon; preserve the explicit one-shot policy.
-                processes.run(command, root, env, options.seconds("build-timeout",600))
-            } else {
-                val arguments = listOf("--project-dir", target.buildRoot.toString(), "--init-script", assets.resolve("gradle/preview.init.gradle").toString(), "--console=plain") +
-                    if (options.flag("clean")) listOf("--no-build-cache", "--no-parallel") else emptyList()
-                buildPreviewModel(root,task,arguments,env,options.seconds("build-timeout",600))
+            timed("gradle-build") {
+                if (options.flag("no-daemon")) {
+                    // Tooling API always uses a daemon; preserve the explicit one-shot policy.
+                    processes.run(command, root, env, options.seconds("build-timeout",600))
+                } else {
+                    val arguments = listOf("--project-dir", target.buildRoot.toString(), "--init-script", assets.resolve("gradle/preview.init.gradle").toString(), "--console=plain") +
+                        if (options.flag("clean")) listOf("--no-build-cache", "--no-parallel") else emptyList()
+                    buildPreviewModel(root,task,arguments,env,options.seconds("build-timeout",600))
+                }
             }
             val model = validate(readJson(path))
             model.add("inputRoots",gson.toJsonTree(target.inputRoots.map { it.toString() }))
@@ -296,9 +322,9 @@ internal class Engine(val options: Options, val assets: Path, val processes: Pro
         return directory
     }
     fun render(): Pair<JsonObject,Int> {
-        val compiled = prepare()
+        val compiled = timed("prepare-model") { prepare() }
         val model = compiled.model
-        val previews = declarations(model, options.path("file"), options.get("method"))
+        val previews = timed("declaration-selection") { declarations(model, options.path("file"), options.get("method")) }
         val overrides = options.path("overrides")?.let { readJson(it) } ?: JsonObject()
         val compiledArtifacts = artifactSignature(model)
             ?: throw Failure("Compiled artifacts disappeared before render", "stale-model")
@@ -320,6 +346,7 @@ internal class Engine(val options: Options, val assets: Path, val processes: Pro
                                 path.startsWith(oldOutput) && path.isRegularFile()
                             } ?: true
                         }) {
+                        decision("images","fresh-image-hit")
                         old.addProperty("reusedImages",true)
                         old.addProperty("reusedModel",compiled.reused)
                         return old to 0
@@ -327,6 +354,12 @@ internal class Engine(val options: Options, val assets: Path, val processes: Pro
                 } catch (_: Exception) { /* A bad UI image reference is never authoritative. */ }
             }
         }
+        decision("images",when {
+            options.flag("clean") -> "clean-requested"
+            !options.flag("reuse") -> "refresh-requested"
+            options.path("previous-result") == null -> "previous-result-missing"
+            else -> "request-backend-or-image-mismatch"
+        })
         val directory = options.path("out") ?: cache.resolve("runs").resolve(UUID.randomUUID().toString())
         Files.createDirectories(directory)
         return locked(directory) {
@@ -341,16 +374,19 @@ internal class Engine(val options: Options, val assets: Path, val processes: Pro
             var rows = JsonArray()
             var global: String? = null
             if (settings.array("screenshots").size() > 0) {
-                val launcher = compileLauncher(model)
+                val launcher = timed("launcher-prepare") { compileLauncher(model) }
                 val javaOptions = options.all("java-option").ifEmpty { listOf("-Xmx1536m") }
-                status = processes.run(listOf(model.text("javaExecutable")!!) + javaOptions + listOf("-Dlayoutlib.thread.profile.timeoutms=10000", "-cp",
+                status = timed("renderer-process") { processes.run(listOf(model.text("javaExecutable")!!) + javaOptions + listOf("-Dlayoutlib.thread.profile.timeoutms=10000", "-cp",
                     (listOf(launcher.toString()) + model.strings("rendererClassPath")).joinToString(File.pathSeparator), "ComposePreviewRenderLauncher", settingsPath.toString()),
-                    Path.of(model.text("projectRoot")!!), timeout=options.seconds("timeout",300), allowed=setOf(0,1))
+                    Path.of(model.text("projectRoot")!!), timeout=options.seconds("timeout",300), allowed=setOf(0,1)) }
                 val rendered = readJson(directory.resolve("renderer-results.json"))
                 rows = rendered.array("screenshotResults")
                 global = rendered.text("globalError")
             }
-            val stale = compiled.inputs != targetInputs(PreviewTarget.fromModel(model), assets) || beforeArtifacts != artifactSignature(model) || backend != rendererEnvironment(model, assets)
+            val stale = timed("final-freshness") {
+                compiled.inputs != targetInputs(PreviewTarget.fromModel(model), assets) ||
+                    beforeArtifacts != artifactSignature(model) || backend != rendererEnvironment(model, assets)
+            }
             rows.forEach { element ->
                 val row = element.asJsonObject
                 row.text("imagePath")?.takeIf { it.isNotEmpty() }?.let { image ->

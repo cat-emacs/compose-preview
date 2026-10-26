@@ -188,6 +188,17 @@ without building when the compiled model is fresh.
   invalidation over discovered builds. Only the visible session is monitored.
   CLI baseline signatures remain conservative across the entry/owning build;
   this does not claim fully incremental compilation or eliminate every rebuild.
+- Scoped project notifications separate metadata, variant selection and exact
+  dependency updates. Graph completion does not discard images or restart an
+  in-flight render when its input roots were already protected. Expanded root
+  coverage invalidates the matching target; variant selection affects only its
+  module. Metadata refresh remains conservatively project-wide.
+- stderr `preview-cache` explains model/image reuse or rebuild reasons;
+  `preview-timing` reports model preparation, Gradle build, declaration selection,
+  launcher preparation, renderer process and final freshness checks. The frontend
+  log adds project-model wait, display and total request time. Renderer process
+  time includes JVM startup/render/cleanup, not separately measurable phases.
+  `prepare-model` includes `gradle-build`; timings are nested, not additive.
 - `--input-root DIR` adds dependency-build inputs to CLI identity, receipts and
   render-time revalidation; it never removes entry/owning-build baseline roots.
   The frontend forwards graph roots plus all discovered builds, including
