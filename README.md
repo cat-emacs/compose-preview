@@ -87,6 +87,24 @@ Set `compose-preview-cli-program` if the executable is not discoverable through
 PATH or the checkout's `bin/` entry point. Kotlin tree-sitter is needed only for
 optional source folding.
 
+## Agent skill
+
+The model-invoked [compose-preview skill](skills/compose-preview/SKILL.md) teaches agents
+to use the installed CLI with exact target identity, JVM diagnostics and result
+validation. Keep the whole skill directory, including any references. From this
+repository checkout, choose your agent's skill root and copy into a new directory:
+
+```sh
+SKILL_ROOT=/path/to/your/agent/skills
+mkdir -p "$SKILL_ROOT"
+# Stop if installed; review/update the existing skill separately.
+test ! -e "$SKILL_ROOT/compose-preview" && cp -R skills/compose-preview "$SKILL_ROOT/"
+```
+
+Reload skill discovery, then ask the agent to use `compose-preview` for the task.
+This installs instructions only; install the CLI separately. A skill installed
+from this branch expects the CLI 0.1.5 interface.
+
 ## CLI
 
 ```sh
