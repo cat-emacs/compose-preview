@@ -33,6 +33,23 @@ dependencies {
 }
 version = providers.gradleProperty("cliVersion").get()
 
+val resolvedProjectCoreVersion = providers.provider {
+    configurations.runtimeClasspath.get().incoming.artifacts.artifacts.mapNotNull {
+        it.id.componentIdentifier as? org.gradle.api.artifacts.component.ModuleComponentIdentifier
+    }.single { it.group == "org.cat-emacs" && it.module == "android-project-core" }.version
+}
+val buildInfoDirectory = layout.buildDirectory.dir("generated/build-info")
+val generateBuildInfo by tasks.registering {
+    inputs.property("projectCoreVersion", resolvedProjectCoreVersion)
+    outputs.dir(buildInfoDirectory)
+    doLast {
+        val file = buildInfoDirectory.get().file("cat/preview/build-info.properties").asFile
+        file.parentFile.mkdirs()
+        file.writeText("projectCoreVersion=${resolvedProjectCoreVersion.get()}\n")
+    }
+}
+tasks.processResources { from(generateBuildInfo) }
+
 application {
     mainClass = "cat.preview.MainKt"
     applicationName = "compose-preview"
@@ -40,6 +57,11 @@ application {
 tasks.test {
     useJUnitPlatform()
     systemProperty("preview.test.gradle.home", gradle.gradleHomeDir!!.absolutePath)
+    inputs.property("projectCoreVersion", resolvedProjectCoreVersion)
+    doFirst {
+        systemProperty("preview.test.core.version", resolvedProjectCoreVersion.get())
+        systemProperty("preview.test.classpath", sourceSets.main.get().runtimeClasspath.asPath)
+    }
 }
 tasks.distTar {
     compression = Compression.GZIP

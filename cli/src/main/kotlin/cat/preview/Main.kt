@@ -25,6 +25,15 @@ import java.util.concurrent.TimeUnit
 import kotlin.io.path.*
 import kotlin.system.exitProcess
 
+internal val projectCoreVersion: String by lazy {
+    val stream = Engine::class.java.getResourceAsStream("/cat/preview/build-info.properties")
+        ?: throw Failure("Missing CLI build information", "setup")
+    val properties = java.util.Properties()
+    stream.use { properties.load(it) }
+    properties.getProperty("projectCoreVersion")?.takeIf { it.isNotBlank() }
+        ?: throw Failure("Missing project core version in build information", "setup")
+}
+
 internal const val OWNER = "cat-emacs-compose-preview-v1"
 internal val versions = mapOf("renderer" to "0.0.1-alpha16", "layoutlib" to "16.1.0-jdk17", "detector" to "32.5.0-alpha05")
 internal val skipped = setOf(".git", ".gradle", ".idea", "build", "node_modules", "__pycache__")
@@ -521,7 +530,7 @@ fun main(arguments: Array<String>) {
                     "versions" to versions,"authRequired" to false,
                     "capabilities" to obj("componentTree" to false,"inflateOnly" to false,
                         "warmRenderer" to false,"staticCallbacks" to false,"projectSync" to false,
-                        "projectBackend" to "android-project-core", "projectCoreVersion" to "0.1.5",
+                        "projectBackend" to "android-project-core", "projectCoreVersion" to projectCoreVersion,
                         "backend" to "studio-launcher"))
             }
             "list" -> {

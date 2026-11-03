@@ -33,6 +33,17 @@ class EngineTest {
         val processes = Processes()
         try { return block(Engine(options,assets(),processes)) } finally { processes.close() }
     }
+    @Test fun `doctor reports resolved core version from bundled build information`() {
+        val java=Path.of(System.getProperty("java.home"),"bin",if(isWindows) "java.exe" else "java")
+        val process=ProcessBuilder(java.toString(),"-Dcompose.preview.home=${assets()}","-cp",System.getProperty("preview.test.classpath"),
+            "cat.preview.MainKt","doctor","--json").redirectError(root.resolve("doctor.log").toFile()).start()
+        val output=process.inputStream.bufferedReader().use { it.readText() }
+        assertEquals(0,process.waitFor(),output)
+        val result=com.google.gson.JsonParser.parseString(output).asJsonObject
+        assertEquals(System.getProperty("preview.test.core.version"),
+            result.getAsJsonObject("capabilities").text("projectCoreVersion"))
+        assertEquals(projectCoreVersion,System.getProperty("preview.test.core.version"))
+    }
     @Test fun `Preview embeds project core and preserves build environment and configuration cache`() {
         val home=Path.of(System.getProperty("preview.test.gradle.home"))
         root.resolve("settings.gradle").writeText("rootProject.name='preview-core-fixture'\n")
