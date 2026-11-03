@@ -10,8 +10,9 @@ It does not generate screenshot tests or rewrite project build files.
 
 Requirements:
 
-- **JDK 17+**, the project's Gradle wrapper and Android SDK. Use the JDK required
-  by the project via `JAVA_HOME`; no Kotlin compiler is needed.
+- **JDK 21+**, the project's Gradle wrapper and Android SDK. Set `JAVA_HOME`
+  for the CLI/renderer; use `--gradle-java-home` if the project needs another
+  JDK. No Kotlin compiler is needed.
 - For Emacs: **29.1+**, Transient **0.3.0+** and
   [`android-project`](https://github.com/cat-emacs/android-project) **0.1.0+**.
 - Network access to resolve build/render dependencies on first use.
@@ -43,10 +44,13 @@ full Android rendering is not yet verified on every platform.
 
 [Releases](https://github.com/cat-emacs/compose-preview/releases/latest) provide
 versioned ZIP/tar.gz archives and `SHA256SUMS`. Verify, extract and add `bin/` to
-PATH. JDK 17+ must already be installed. CLI versions are independent of core.
+PATH. JDK 21+ must already be installed. CLI versions are independent of core.
 
-Source builds need GitHub Packages credentials to download
-`org.cat-emacs:android-project-core:0.1.6` (published).
+Source builds target published **`org.cat-emacs:android-project-core:0.1.7`**.
+An explicit local Maven repository is optional for development via
+`-PandroidProjectRepository=/absolute/repository`.
+
+Registry source builds need GitHub Packages credentials to download core.
 Supply `GITHUB_ACTOR` and `GITHUB_TOKEN`
 securely using a classic PAT with `read:packages` or an authorized Actions token.
 GitHub requires authentication even for public Maven packages. Never commit tokens.
@@ -212,11 +216,33 @@ without building when the compiled model is fresh.
   Models/launchers are not auto-pruned yet.
 - Cancellation affects owned operations/processes, never shared Gradle/Kotlin
   daemons. Renderer defaults: `-Xmx1536m`, 300-second timeout and bounded cleanup.
-- Renderer **0.0.1-alpha16**, layoutlib **16.1.0-jdk17**, detector
-  **32.5.0-alpha05**. The internal KMP adapter is gated to **AGP 9.3.x**.
-- Warm renderer reuse, static callbacks, inflate-only and Interactive/Animation
-  Preview are not available. Alpha16 emits no component trees; inspection is
-  unsupported without compatible metadata.
+- Renderer **0.0.1-alpha17**, layoutlib **17.0.4**, detector
+  **32.5.0-alpha05**. The CLI and renderer require **JDK 21+**. The internal
+  KMP adapter is gated to **AGP 9.3.x**. Android resource/parameter previews and
+  an independent AGP 9.3 KMP resource fixture were rendered on Java 21.
+- Gradle JVM policy: supported Daemon JVM criteria, explicit
+  `--gradle-java-home DIR` (Emacs `compose-preview-gradle-java-home`), user/project
+  `org.gradle.java.home`, linked IDE Gradle JDK, then `JAVA_HOME`/CLI runtime.
+  Criteria retains Gradle's precedence even over an explicit home. IDE
+  `#JAVA_HOME` and `#GRADLE_LOCAL_JAVA_HOME` are supported; the latter reads
+  `.gradle/config.properties` only when selected in `.idea/gradle.xml`. Named
+  IDE SDKs require an explicit home; no guessing or SDK-table lookup occurs.
+  Tooling API and `--no-daemon` builds use this policy; the renderer still uses
+  the CLI JDK. No project toolchain/target/configuration is rewritten.
+  `doctor --project DIR` reports requested policy without starting Gradle
+  (`gradleJvmActual: not-probed`); build/render JSON reports actual `gradleJvm`.
+  Policy files, user properties and JDK identities participate in freshness.
+  This code does not provision JDKs; Gradle may provision if the project
+  already enables it. The independent Project CLI/core retain Java 17 support.
+- Static callbacks run through alpha17's renderer. The adapter refreshes project
+  classes before each top-level screenshot using the public API: otherwise a
+  failed composition can contaminate the next card or hide a missing-class
+  error. A LaunchedEffect probe matched the settled reference image; this does
+  not guarantee arbitrary animations or asynchronous network data settle.
+- Warm renderer reuse, component-tree extraction, inflate-only and
+  Interactive/Animation Preview are not enabled. Each invocation remains a cold
+  owned process. Inspection requires compatible metadata; merely finding tree
+  classes in alpha17 is not an extraction guarantee.
 
 See [TODO.md](TODO.md) for official renderer CLI replacement gates and deferred
 features. The current Java adapter uses the published renderer, not private

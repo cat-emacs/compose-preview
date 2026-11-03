@@ -6,7 +6,7 @@ on:
       version:
         description: CLI version declared in gradle.properties
         required: true
-        default: '0.1.4'
+        default: '0.1.5'
         type: string
 
 permissions:
@@ -27,7 +27,7 @@ jobs:
       - uses: actions/setup-java@v4
         with:
           distribution: temurin
-          java-version: '17'
+          java-version: '21'
       - uses: gradle/actions/setup-gradle@v4
       - name: Verify release version
         env:
@@ -60,7 +60,7 @@ jobs:
       - uses: actions/setup-java@v4
         with:
           distribution: temurin
-          java-version: '17'
+          java-version: '21'
       - uses: actions/download-artifact@v4
         with:
           name: cli-distribution
@@ -119,6 +119,6 @@ jobs:
           git tag -a "v$VERSION" -m "compose-preview CLI $VERSION" "$GITHUB_SHA"
           git push origin "v$VERSION"
           gh release create "v$VERSION" --verify-tag --draft --title "compose-preview $VERSION" \
-            --notes "Portable JVM CLI for macOS, Linux and Windows. Requires JDK 17+. Runtime dependencies are bundled; no Kotlin compiler or GitHub Packages credentials are needed. Platform smoke tests cover launchers and doctor, not full Android rendering. Verify downloads against SHA256SUMS." \
+            --notes "Portable JVM CLI for macOS, Linux and Windows. Requires JDK 21+. Runtime dependencies are bundled; no Kotlin compiler or GitHub Packages credentials are needed. Platform smoke tests cover launchers and doctor, not full Android rendering. Verify downloads against SHA256SUMS." \
             artifacts/*.zip artifacts/*.tar.gz artifacts/SHA256SUMS
           gh release edit "v$VERSION" --draft=false

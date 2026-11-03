@@ -72,12 +72,17 @@
   :type 'string
   :group 'compose-preview)
 
-(defcustom compose-preview-layoutlib-version "16.1.0-jdk17"
+(defcustom compose-preview-gradle-java-home nil
+  "Optional JDK home for Gradle, independent of the CLI/renderer JDK 21+."
+  :type '(choice (const nil) directory)
+  :group 'compose-preview)
+
+(defcustom compose-preview-layoutlib-version "17.0.4"
   "Version of the Android Studio layoutlib artifacts."
   :type 'string
   :group 'compose-preview)
 
-(defcustom compose-preview-renderer-version "0.0.1-alpha16"
+(defcustom compose-preview-renderer-version "0.0.1-alpha17"
   "Version of Android Studio's standalone Compose preview renderer."
   :type 'string
   :group 'compose-preview)
@@ -3314,6 +3319,8 @@ running; only the newest waiting file request is retained."
                                 "--detector-version" compose-preview-detector-version
                                 "--timeout" (number-to-string compose-preview-render-timeout))
                           (apply #'append (mapcar (lambda (dir) (list "--input-root" dir)) input-roots))
+                          (when compose-preview-gradle-java-home
+                            (list "--gradle-java-home" (expand-file-name compose-preview-gradle-java-home)))
                           (when method (list "--method" method))
                           (when compose-preview--render-only '("--no-build"))
                           (when compose-preview--follow-refresh '("--reuse"))

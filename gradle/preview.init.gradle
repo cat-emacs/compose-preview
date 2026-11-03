@@ -36,8 +36,8 @@ import java.nio.file.StandardCopyOption
 import java.util.zip.ZipFile
 import java.util.zip.ZipInputStream
 
-def layoutlibVersion = System.getenv("COMPOSE_PREVIEW_LAYOUTLIB_VERSION") ?: "16.1.0-jdk17"
-def rendererVersion = System.getenv("COMPOSE_PREVIEW_RENDERER_VERSION") ?: "0.0.1-alpha16"
+def layoutlibVersion = System.getenv("COMPOSE_PREVIEW_LAYOUTLIB_VERSION") ?: "17.0.4"
+def rendererVersion = System.getenv("COMPOSE_PREVIEW_RENDERER_VERSION") ?: "0.0.1-alpha17"
 def targetModulePath = System.getenv("COMPOSE_PREVIEW_MODULE_PATH")
 def targetVariant = System.getenv("COMPOSE_PREVIEW_VARIANT") ?: "debug"
 def modelFilePath = System.getenv("COMPOSE_PREVIEW_MODEL_FILE")
@@ -113,6 +113,15 @@ abstract class ComposePreviewModelTask extends DefaultTask {
 
     @Input
     abstract Property<String> getVariantName()
+
+    @Input
+    abstract Property<String> getRenderJavaHome()
+
+    @Input
+    abstract Property<String> getBuildJavaHome()
+
+    @Input
+    abstract Property<String> getBuildJavaVersion()
 
     @Internal
     abstract DirectoryProperty getLayoutlibDataDir()
@@ -273,7 +282,10 @@ abstract class ComposePreviewModelTask extends DefaultTask {
                 modulePath      : modulePath.get(),
                 variant         : variantName.get(),
                 namespace       : namespace.get(),
-                javaExecutable  : new File(System.getProperty("java.home"), "bin/java").absolutePath,
+                javaExecutable  : new File(renderJavaHome.get(), "bin/java").absolutePath,
+                gradleJvm       : [javaHome: buildJavaHome.get(),
+                                   javaVersion: buildJavaVersion.get(),
+                                   gradleVersion: org.gradle.util.GradleVersion.current().version],
                 layoutlibPath   : layoutlibDir.absolutePath,
                 fontsPath       : fontsDir.isDirectory() ? fontsDir.absolutePath : null,
                 resourceApkPath : resourceApk?.absolutePath,
@@ -447,6 +459,10 @@ gradle.ext.composePreviewRegisterKmp = { project, variant, resourceApk, runtimeR
         task.componentName.set(componentName)
         task.moduleRootPath.set(project.projectDir.absolutePath)
         task.variantName.set(targetVariant)
+        task.buildJavaHome.set(project.providers.systemProperty("java.home"))
+        task.buildJavaVersion.set(project.providers.systemProperty("java.version"))
+        task.renderJavaHome.set(project.providers.environmentVariable("COMPOSE_PREVIEW_RENDER_JAVA_HOME")
+                .orElse(project.providers.systemProperty("java.home")))
         task.modelFile.set(new File(modelFilePath))
         task.layoutlibDataDir.set(
                 project.layout.buildDirectory.dir("compose-preview/layoutlib-${layoutlibVersion}"))
@@ -515,6 +531,10 @@ gradle.beforeProject { project ->
                     task.componentName.set(componentName)
                     task.moduleRootPath.set(project.projectDir.absolutePath)
                     task.variantName.set(targetVariant)
+                    task.buildJavaHome.set(project.providers.systemProperty("java.home"))
+                    task.buildJavaVersion.set(project.providers.systemProperty("java.version"))
+                    task.renderJavaHome.set(project.providers.environmentVariable("COMPOSE_PREVIEW_RENDER_JAVA_HOME")
+                            .orElse(project.providers.systemProperty("java.home")))
                     task.modelFile.set(new File(modelFilePath))
                     task.layoutlibDataDir.set(
                             project.layout.buildDirectory.dir("compose-preview/layoutlib-${layoutlibVersion}"))

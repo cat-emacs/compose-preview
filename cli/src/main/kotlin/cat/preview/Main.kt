@@ -1,6 +1,8 @@
 package cat.preview
 
 import cat.android.project.GradleTooling
+import cat.android.project.selectGradleJvm
+import cat.android.project.gradleJvmSignature
 import cat.android.project.ProjectFailure
 import cat.android.project.io.atomicJson
 import cat.android.project.io.canonicalJson as canonical
@@ -35,7 +37,7 @@ internal val projectCoreVersion: String by lazy {
 }
 
 internal const val OWNER = "cat-emacs-compose-preview-v1"
-internal val versions = mapOf("renderer" to "0.0.1-alpha16", "layoutlib" to "16.1.0-jdk17", "detector" to "32.5.0-alpha05")
+internal val versions = mapOf("renderer" to "0.0.1-alpha17", "layoutlib" to "17.0.4", "detector" to "32.5.0-alpha05")
 internal val skipped = setOf(".git", ".gradle", ".idea", "build", "node_modules", "__pycache__")
 internal val suffixes = setOf("kt", "kts", "java", "groovy", "xml", "properties", "toml", "gradle", "jar", "aar", "png", "webp", "jpg", "jpeg", "svg", "ttf", "otf", "json")
 internal class Failure(message: String, val kind: String = "error") : RuntimeException(message)
@@ -50,7 +52,10 @@ internal fun inputSignature(root: Path, assets: Path): String {
     return hash((relevant + files(assets.resolve("gradle"), false).filter { it.extension == "gradle" }).map { listOf(it.toString(), stamp(it), symbolicLinkTarget(it)) })
 }
 internal fun artifactSignature(model: JsonObject): String? {
-    val paths = (model.strings("classPath") + model.strings("projectClassPath") + model.strings("rendererClassPath") + model.strings("rClassJars") + listOfNotNull(model.text("resourceApkPath"))).distinct().sorted()
+    val buildHome = model.getAsJsonObject("gradleJvm")?.text("javaHome")?.let { Path.of(it) }
+    val paths = (model.strings("classPath") + model.strings("projectClassPath") + model.strings("rendererClassPath") + model.strings("rClassJars") +
+        listOfNotNull(model.text("resourceApkPath"),buildHome?.resolve("release")?.toString(),
+            buildHome?.resolve("bin")?.resolve(if(isWindows) "java.exe" else "java")?.toString())).distinct().sorted()
     if (paths.any { !Files.exists(Path.of(it)) }) return null
     return hash(paths.flatMap { value ->
         val path = Path.of(value)
@@ -70,8 +75,14 @@ private val projectCoreIdentity: String by lazy {
     val location=Path.of(GradleTooling::class.java.protectionDomain.codeSource.location.toURI())
     contentHash(location)
 }
-internal fun buildEnvironment(): String = hash(listOf(
-    projectCoreIdentity,
+internal fun javaHomeIdentity(home: Path): List<Any?> {
+    val directory = home.toRealPath()
+    return listOf(directory.toString(),stamp(directory.resolve("release")),
+        stamp(directory.resolve("bin").resolve(if(isWindows) "java.exe" else "java")))
+}
+internal fun buildEnvironment(gradleJavaHome: Path? = null): String = hash(listOf(
+    projectCoreIdentity, javaHomeIdentity(Path.of(System.getProperty("java.home"))),
+    javaHomeIdentity(gradleJavaHome ?: Path.of(System.getenv("JAVA_HOME") ?: System.getProperty("java.home"))),
     listOf("JAVA_HOME", "ANDROID_HOME", "ANDROID_SDK_ROOT", "GRADLE_USER_HOME",
         "JAVA_TOOL_OPTIONS", "JDK_JAVA_OPTIONS", "GRADLE_OPTS").associateWith { System.getenv(it) }
 ))
@@ -98,7 +109,7 @@ internal class Options(arguments: List<String>) {
         command = args.firstOrNull() ?: "help"
         action = if (command == "cache") args.getOrNull(1) else null
         val booleans = setOf("no-build", "reuse", "no-daemon", "clean", "dry-run", "apply", "help")
-        val known = booleans + setOf("project", "module", "variant", "model", "file", "method", "preview-id", "out", "overrides", "result-file", "previous-result", "cache-dir", "input-root", "build-root", "module-root", "component", "component-name", "timeout", "build-timeout", "renderer-version", "layoutlib-version", "detector-version", "java-option", "older-than", "keep")
+        val known = booleans + setOf("project", "module", "variant", "gradle-java-home", "model", "file", "method", "preview-id", "out", "overrides", "result-file", "previous-result", "cache-dir", "input-root", "build-root", "module-root", "component", "component-name", "timeout", "build-timeout", "renderer-version", "layoutlib-version", "detector-version", "java-option", "older-than", "keep")
         var index = if (command == "cache") 2 else 1
         while (index < args.size) {
             val argument = args[index++]
@@ -208,6 +219,14 @@ internal class Engine(val options: Options, val assets: Path, val processes: Pro
             options.get("component", "main")!!,options.get("component-name",variant)!!,options.path("module-root"),
             options.all("input-root").map { Path.of(it).toAbsolutePath().normalize() }.distinct().sorted())
     }
+    fun gradleJavaHome(): Path? = options.path("gradle-java-home")?.let { home ->
+        if (!home.resolve("bin").resolve(if(isWindows) "java.exe" else "java").isRegularFile() || !home.resolve("release").isRegularFile())
+            throw Failure("--gradle-java-home must name a JDK home: $home", "input")
+        home.toRealPath()
+    }
+    fun jvmSelection() = selectGradleJvm(options.path("project") ?: Path.of(".").toAbsolutePath(),gradleJavaHome())
+    private fun environment(root: Path): String = hash(listOf(buildEnvironment(gradleJavaHome()),
+        gradleJvmSignature(root,gradleJavaHome())))
     fun validate(model: JsonObject): JsonObject {
         for (key in listOf("projectRoot", "moduleRoot", "modulePath", "variant", "namespace", "javaExecutable", "layoutlibPath"))
             if (model.text(key) == null) throw Failure("Model missing $key", "model")
@@ -243,7 +262,7 @@ internal class Engine(val options: Options, val assets: Path, val processes: Pro
             expected.verify(model)
             val signature = targetInputs(target, assets)
             val artifacts = artifactSignature(model)
-            if (artifacts == null || saved.text("environment") != buildEnvironment() || saved.text("modelHash") != hash(model) || saved.text("inputs") != signature || saved.text("artifacts") != artifacts) {
+            if (artifacts == null || saved.text("environment") != environment(target.buildRoot) || saved.text("modelHash") != hash(model) || saved.text("inputs") != signature || saved.text("artifacts") != artifacts) {
                 decision("model","explicit-model-stale")
                 throw Failure("Compiled model is out of date", "stale-model")
             }
@@ -262,6 +281,7 @@ internal class Engine(val options: Options, val assets: Path, val processes: Pro
             val path = directory.resolve("model.json")
             val receipt = directory.resolve("model.receipt.json")
             val before = targetInputs(target, assets)
+            val environmentBefore = environment(target.buildRoot)
             var reason = if (path.exists() && receipt.exists()) "refresh-requested" else "model-or-receipt-missing"
             if (path.exists() && receipt.exists()) {
                 try {
@@ -272,7 +292,7 @@ internal class Engine(val options: Options, val assets: Path, val processes: Pro
                     val mismatches = listOfNotNull(
                         if (artifact == null) "artifacts-missing" else null,
                         if (saved["identity"] != identity) "target-or-tool-versions" else null,
-                        if (saved.text("environment") != buildEnvironment()) "build-environment" else null,
+                        if (saved.text("environment") != environment(target.buildRoot)) "build-environment" else null,
                         if (saved.text("modelHash") != hash(model)) "model-content" else null,
                         if (saved.text("inputs") != before) "source-or-build-inputs" else null,
                         if (artifact != null && saved.text("artifacts") != artifact) "compiled-artifacts" else null)
@@ -287,7 +307,11 @@ internal class Engine(val options: Options, val assets: Path, val processes: Pro
             decision("model",reason)
             if (options.flag("no-build")) throw Failure("No fresh compiled model; save sources and refresh first", "stale-model")
             Files.deleteIfExists(receipt)
-            val env = mapOf("COMPOSE_PREVIEW_MODULE_PATH" to module, "COMPOSE_PREVIEW_VARIANT" to variant,
+            val buildJava = gradleJavaHome()
+            val jvm = selectGradleJvm(target.buildRoot,buildJava)
+            val env = (jvm.javaHome?.let { mapOf("JAVA_HOME" to it) } ?: emptyMap()) +
+                mapOf("COMPOSE_PREVIEW_RENDER_JAVA_HOME" to System.getProperty("java.home"),
+                "COMPOSE_PREVIEW_MODULE_PATH" to module, "COMPOSE_PREVIEW_VARIANT" to variant,
                 "COMPOSE_PREVIEW_PROJECT_ROOT" to root.toString(), "COMPOSE_PREVIEW_BUILD_ROOT" to target.buildRoot.toString(),
                 "COMPOSE_PREVIEW_COMPONENT" to target.component, "COMPOSE_PREVIEW_COMPONENT_NAME" to target.componentName,
                 "COMPOSE_PREVIEW_MODEL_FILE" to path.toString(), "COMPOSE_PREVIEW_ADAPTER_DIRECTORY" to assets.resolve("gradle/adapters").toString(),
@@ -296,6 +320,7 @@ internal class Engine(val options: Options, val assets: Path, val processes: Pro
             val task = (if (module == ":") "" else module) + ":composePreviewModel"
             val command = mutableListOf(wrapper.toString(), task, "--project-dir", target.buildRoot.toString(), "--init-script", assets.resolve("gradle/preview.init.gradle").toString(), "--console=plain",
                 if (options.flag("no-daemon")) "--no-daemon" else "--daemon")
+            command.addAll(jvm.arguments())
             if (options.flag("clean")) command.addAll(listOf("--no-build-cache", "--no-parallel"))
             timed("gradle-build") {
                 if (options.flag("no-daemon")) {
@@ -304,7 +329,8 @@ internal class Engine(val options: Options, val assets: Path, val processes: Pro
                 } else {
                     val arguments = listOf("--project-dir", target.buildRoot.toString(), "--init-script", assets.resolve("gradle/preview.init.gradle").toString(), "--console=plain") +
                         if (options.flag("clean")) listOf("--no-build-cache", "--no-parallel") else emptyList()
-                    buildPreviewModel(root,task,arguments,env,options.seconds("build-timeout",600))
+                    buildPreviewModel(root,task,arguments + jvm.arguments(),env - "JAVA_HOME" +
+                        (buildJava?.let { mapOf("JAVA_HOME" to it.toString()) } ?: emptyMap()),options.seconds("build-timeout",600))
                 }
             }
             val model = validate(readJson(path))
@@ -312,20 +338,20 @@ internal class Engine(val options: Options, val assets: Path, val processes: Pro
             target.verify(model)
             atomicJson(path,model)
             val after = targetInputs(target, assets)
-            if (before != after) throw Failure("Inputs changed while building; retry", "stale-model")
+            if (before != after || environmentBefore != environment(target.buildRoot)) throw Failure("Inputs or JVM policy changed while building; retry", "stale-model")
             val artifact = artifactSignature(model) ?: throw Failure("Missing compiled artifacts", "model")
-            atomicJson(receipt, obj("identity" to identity, "environment" to buildEnvironment(), "modelHash" to hash(model), "inputs" to after, "artifacts" to artifact))
+            atomicJson(receipt, obj("identity" to identity, "environment" to environmentBefore, "modelHash" to hash(model), "inputs" to after, "artifacts" to artifact))
             snapshot(path, model, after, false)
         }
     }
     fun compileLauncher(model: JsonObject): Path {
         val source = assets.resolve("renderer/ComposePreviewRenderLauncher.java")
-        val key = hash(listOf(source.readText(), model.text("javaExecutable"), model.strings("rendererClassPath").map { listOf(it, stamp(Path.of(it))) }))
+        val key = hash(listOf(source.readText(), 21, javaHomeIdentity(Path.of(model.text("javaExecutable")!!).parent.parent), model.strings("rendererClassPath").map { listOf(it, stamp(Path.of(it))) }))
         val directory = cache.resolve("launchers").resolve(key)
         locked(directory) {
             if (!directory.resolve("ComposePreviewRenderLauncher.class").exists()) {
                 val javac = Path.of(model.text("javaExecutable")!!).parent.resolve(if (isWindows) "javac.exe" else "javac")
-                processes.run(listOf(javac.toString(), "-nowarn", "--release", "17", "-cp", model.strings("rendererClassPath").joinToString(File.pathSeparator), "-d", directory.toString(), source.toString()), timeout=options.seconds("build-timeout",600))
+                processes.run(listOf(javac.toString(), "-nowarn", "--release", "21", "-cp", model.strings("rendererClassPath").joinToString(File.pathSeparator), "-d", directory.toString(), source.toString()), timeout=options.seconds("build-timeout",600))
             }
         }
         return directory
@@ -333,6 +359,7 @@ internal class Engine(val options: Options, val assets: Path, val processes: Pro
     fun render(): Pair<JsonObject,Int> {
         val compiled = timed("prepare-model") { prepare() }
         val model = compiled.model
+        val environmentBefore = environment(PreviewTarget.fromModel(model).buildRoot)
         val previews = timed("declaration-selection") { declarations(model, options.path("file"), options.get("method")) }
         val overrides = options.path("overrides")?.let { readJson(it) } ?: JsonObject()
         val compiledArtifacts = artifactSignature(model)
@@ -394,6 +421,7 @@ internal class Engine(val options: Options, val assets: Path, val processes: Pro
             }
             val stale = timed("final-freshness") {
                 compiled.inputs != targetInputs(PreviewTarget.fromModel(model), assets) ||
+                environmentBefore != environment(PreviewTarget.fromModel(model).buildRoot) ||
                     beforeArtifacts != artifactSignature(model) || backend != rendererEnvironment(model, assets)
             }
             rows.forEach { element ->
@@ -407,7 +435,8 @@ internal class Engine(val options: Options, val assets: Path, val processes: Pro
                 details[row.text("previewId")]?.entrySet()?.forEach { (key,value) -> row.add(key,value) }
             }
             val result = obj("schemaVersion" to 1, "status" to if (global != null) "failed" else if (stale) "stale" else if (status != 0) "partial" else "ready",
-                "target" to PreviewTarget.fromModel(model).json(),
+                "target" to PreviewTarget.fromModel(model).json(), "gradleJvm" to model.get("gradleJvm"),
+                "gradleJvmSelection" to selectGradleJvm(PreviewTarget.fromModel(model).buildRoot,gradleJavaHome()),
                 "modelPath" to compiled.path.toString(), "outputDirectory" to directory.toString(), "reusedModel" to compiled.reused,
                 "requestIdentity" to requestIdentity, "reusedImages" to false,
                 "stale" to stale, "declarations" to previews, "results" to rows, "globalError" to global)
@@ -495,13 +524,14 @@ private fun assets(): Path {
     if (home != null && home.resolve("gradle/preview.init.gradle").exists()) return home
     throw Failure("Cannot locate bundled Gradle/renderer assets", "setup")
 }
-private val help = """compose-preview — Android Studio project-level Preview CLI (JDK 17+)
+private val help = """compose-preview — Android Studio project-level Preview CLI (JDK 21+)
 Usage: compose-preview <command> [options] [--json]
   doctor                      Check runtime and installed resources (no auth)
   list --project DIR --module :app [--variant debug] [--file FILE]
   render --project DIR --module :app --file FILE [--out EMPTY_DIR]
   render --model MODEL --no-build --file FILE
   cache prune [--dry-run | --apply] [--older-than SECONDS] [--keep RUN]
+Build JDK: --gradle-java-home DIR (optional; renderer uses the CLI JDK 21+)
 Target options: --build-root DIR --module-root DIR --component main --component-name VARIANT
 Input options: --input-root DIR (repeat for dependency builds; always extends baseline roots)
 Model options: --reuse --no-build --no-daemon --clean --cache-dir DIR
@@ -526,10 +556,15 @@ fun main(arguments: Array<String>) {
                 val resources = home.resolve("gradle/preview.init.gradle").exists() && home.resolve("renderer/ComposePreviewRenderLauncher.java").exists()
                 if (!resources) code=2
                 obj("schemaVersion" to 1,"status" to if(resources) "ready" else "missing-setup","java" to java.toString(),"javaVersion" to System.getProperty("java.version"),
-                    "resources" to resources,"sdk" to (System.getenv("ANDROID_SDK_ROOT") ?: System.getenv("ANDROID_HOME")),
+                    "resources" to resources,"minimumJavaVersion" to 21,
+                    "rendererJavaHome" to System.getProperty("java.home"),
+                    "gradleJvmSelection" to engine.jvmSelection(), "gradleJvmActual" to "not-probed",
+                    "gradleJavaHome" to engine.jvmSelection().javaHome,
+                    "gradleJavaSource" to engine.jvmSelection().source,
+                    "sdk" to (System.getenv("ANDROID_SDK_ROOT") ?: System.getenv("ANDROID_HOME")),
                     "versions" to versions,"authRequired" to false,
                     "capabilities" to obj("componentTree" to false,"inflateOnly" to false,
-                        "warmRenderer" to false,"staticCallbacks" to false,"projectSync" to false,
+                        "warmRenderer" to false,"staticCallbacks" to (options.version("renderer") == "0.0.1-alpha17"),"projectSync" to false,
                         "projectBackend" to "android-project-core", "projectCoreVersion" to projectCoreVersion,
                         "backend" to "studio-launcher"))
             }
@@ -540,7 +575,9 @@ fun main(arguments: Array<String>) {
                     val annotation = if(a.isJsonNull) JsonObject() else a.asJsonObject
                     obj("previewId" to previewId(p,annotation,i),"methodFQN" to p.text("methodFQN"),"annotation" to annotation,"configuration" to baseline(annotation))
                 } }
-                obj("schemaVersion" to 1,"status" to "ready","modelPath" to compiled.path.toString(),"reusedModel" to compiled.reused,"declarations" to rows,"previews" to previews)
+                obj("schemaVersion" to 1,"status" to "ready","modelPath" to compiled.path.toString(),"reusedModel" to compiled.reused,"gradleJvm" to compiled.model.get("gradleJvm"),
+                    "gradleJvmSelection" to selectGradleJvm(PreviewTarget.fromModel(compiled.model).buildRoot,engine.gradleJavaHome()),
+                    "declarations" to rows,"previews" to previews)
             }
             "render" -> engine.render().let { code=it.second; it.first }
             "cache" -> engine.prune()

@@ -15,7 +15,7 @@ jobs:
       - uses: actions/setup-java@v4
         with:
           distribution: temurin
-          java-version: '17'
+          java-version: '21'
       - uses: gradle/actions/setup-gradle@v4
       - run: ./gradlew :cli:test :cli:installDist
         env:
@@ -28,7 +28,7 @@ jobs:
           "$CLI" --help
           "$CLI" doctor --json
           test ! -e "$(dirname "$CLI")/../gradle/project.init.gradle"
-          test -f "$(dirname "$CLI")/../lib/android-project-core-0.1.6.jar"
+          test -f "$(dirname "$CLI")/../lib/android-project-core-0.1.7.jar"
           ! command -v android-project
   emacs:
     uses: cat-emacs/.github/.github/workflows/emacs-package.yml@v1

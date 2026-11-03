@@ -26,12 +26,31 @@ class EngineTest {
             "classPath" to listOf(classes.toString()), "projectClassPath" to listOf(classes.toString()), "rendererClassPath" to emptyList<String>(),
             "rClassJars" to emptyList<String>(), "previews" to emptyList<String>())
         val path = root.resolve("build/model.json"); atomicJson(path,model)
-        atomicJson(path.resolveSibling("model.receipt.json"),obj("environment" to buildEnvironment(),"modelHash" to hash(model),"inputs" to targetInputs(PreviewTarget.fromModel(model),assets()),"artifacts" to artifactSignature(model)))
+        atomicJson(path.resolveSibling("model.receipt.json"),obj("environment" to hash(listOf(buildEnvironment(),cat.android.project.gradleJvmSignature(root))),"modelHash" to hash(model),"inputs" to targetInputs(PreviewTarget.fromModel(model),assets()),"artifacts" to artifactSignature(model)))
         return path to model
     }
     private fun <T> engine(options: Options, block: (Engine) -> T): T {
         val processes = Processes()
         try { return block(Engine(options,assets(),processes)) } finally { processes.close() }
+    }
+    @Test fun `build Java selection is validated and bound to receipt freshness`() {
+        val (path,_)=fixture()
+        val home=Path.of(System.getProperty("java.home"))
+        engine(options("--gradle-java-home",home.toString())) { assertEquals(home.toRealPath(),it.gradleJavaHome()) }
+        engine(options("--gradle-java-home",root.resolve("missing").toString())) {
+            assertEquals("input",assertFailsWith<Failure> { it.gradleJavaHome() }.kind)
+        }
+        val other=root.resolve("other-jdk").createDirectories()
+        other.resolve("bin").createDirectories()
+        other.resolve("bin").resolve(if(isWindows) "java.exe" else "java").writeText("other-jdk")
+        other.resolve("release").writeText("JAVA_VERSION=17")
+        assertNotEquals(buildEnvironment(),buildEnvironment(other))
+        engine(options("--gradle-java-home",other.toString(),"--model",path.toString())) {
+            assertEquals("stale-model",assertFailsWith<Failure> { it.prepare() }.kind)
+        }
+        val before=buildEnvironment(other)
+        other.resolve("release").writeText("JAVA_VERSION=21.0.13")
+        assertNotEquals(before,buildEnvironment(other))
     }
     @Test fun `doctor reports resolved core version from bundled build information`() {
         val java=Path.of(System.getProperty("java.home"),"bin",if(isWindows) "java.exe" else "java")
@@ -43,6 +62,10 @@ class EngineTest {
         assertEquals(System.getProperty("preview.test.core.version"),
             result.getAsJsonObject("capabilities").text("projectCoreVersion"))
         assertEquals(projectCoreVersion,System.getProperty("preview.test.core.version"))
+        assertEquals(21,result["minimumJavaVersion"].asInt)
+        assertTrue(Runtime.version().feature() >= 21)
+        assertTrue(result.getAsJsonObject("capabilities")["staticCallbacks"].asBoolean)
+        assertFalse(result.getAsJsonObject("capabilities")["warmRenderer"].asBoolean)
     }
     @Test fun `Preview embeds project core and preserves build environment and configuration cache`() {
         val home=Path.of(System.getProperty("preview.test.gradle.home"))
@@ -115,7 +138,7 @@ class EngineTest {
             external.resolve("Source.kt").writeText("initial")
             model.add("inputRoots",cat.android.project.io.jsonCodec.toJsonTree(listOf(external.toString())))
             atomicJson(path,model)
-            atomicJson(path.resolveSibling("model.receipt.json"),obj("environment" to buildEnvironment(),"modelHash" to hash(model),
+            atomicJson(path.resolveSibling("model.receipt.json"),obj("environment" to hash(listOf(buildEnvironment(),cat.android.project.gradleJvmSignature(root))),"modelHash" to hash(model),
                 "inputs" to targetInputs(PreviewTarget.fromModel(model),assets()),"artifacts" to artifactSignature(model)))
             engine(options("--model",path.toString(),"--no-build")) { assertTrue(it.prepare().reused) }
             external.resolve("Source.kt").writeText("changed without rebuilding the dependency")
@@ -212,6 +235,89 @@ class EngineTest {
             assertFailsWith<Failure> { it.prepare() }
         }
     }
+    @Test fun `launcher failure results support both renderer ABIs and nonnull empty image paths`() {
+        val source=assets().resolve("renderer/ComposePreviewRenderLauncher.java").readText()
+        val method=source.substring(source.indexOf("    private static PreviewScreenshotResult failureResult("),
+            source.indexOf("    private static Integer resolveDensityDpi("))
+        val java=Path.of(System.getProperty("java.home"),"bin",if(isWindows) "java.exe" else "java")
+        val javac=java.resolveSibling(if(isWindows) "javac.exe" else "javac")
+        for (modern in listOf(false,true)) {
+            val directory=root.resolve(if(modern) "modern" else "legacy").createDirectories()
+            val extra=if(modern) ", String display, List<Object> views, String tree" else ""
+            directory.resolve("FailureProbe.java").writeText("""
+                import java.util.*;
+                public class FailureProbe {
+                    public static class ScreenshotError { public ScreenshotError(Throwable failure) {} }
+                    public static class PreviewScreenshot {
+                        public String getPreviewId() { return "bad-card"; }
+                        public String getMethodFQN() { return "demo.card"; }
+                    }
+                    public static class PreviewScreenshotResult {
+                        public final String image;
+                        public final ScreenshotError error;
+                        public PreviewScreenshotResult(String id, String method, String image, ScreenshotError error$extra) {
+                            this.image=Objects.requireNonNull(image); this.error=error;
+                        }
+                    }
+                    $method
+                    public static void main(String[] args) throws Exception {
+                        PreviewScreenshotResult result=failureResult(new PreviewScreenshot(),new IllegalStateException("expected"));
+                        if (!result.image.isEmpty() || result.error == null) throw new AssertionError();
+                    }
+                }
+            """.trimIndent())
+            val compile=ProcessBuilder(javac.toString(),"-d",directory.toString(),directory.resolve("FailureProbe.java").toString())
+                .redirectErrorStream(true).start()
+            val diagnostics=compile.inputStream.bufferedReader().readText()
+            assertEquals(0,compile.waitFor(),diagnostics)
+            val run=ProcessBuilder(java.toString(),"-cp",directory.toString(),"FailureProbe").redirectErrorStream(true).start()
+            val output=run.inputStream.bufferedReader().readText()
+            assertEquals(0,run.waitFor(),output)
+        }
+    }
+    @Test fun `launcher refreshes project classes per card using only the public renderer API`() {
+        val source=assets().resolve("renderer/ComposePreviewRenderLauncher.java").readText()
+        val method=source.substring(source.indexOf("    private static void refreshProjectClasses("),
+            source.indexOf("    private static PreviewScreenshotResult failureResult("))
+        assertTrue(source.indexOf("refreshProjectClasses(renderer, settings);") < source.indexOf("renderer.render(screenshot, outputFolder)"))
+        val java=Path.of(System.getProperty("java.home"),"bin",if(isWindows) "java.exe" else "java")
+        val javac=java.resolveSibling(if(isWindows) "javac.exe" else "javac")
+        for (modern in listOf(false,true)) {
+            val directory=root.resolve(if(modern) "refresh-modern" else "refresh-legacy").createDirectories()
+            val api=if(modern) "public void refreshClassPath(List<String> all, List<String> project) { calls++; if (!all.equals(List.of(\"all.jar\")) || !project.equals(List.of(\"project.jar\"))) throw new AssertionError(); }" else ""
+            directory.resolve("RefreshProbe.java").writeText("""
+                import java.util.*;
+                public class RefreshProbe {
+                    public static class JsonObject {}
+                    public static class Renderer { public int calls; $api }
+                    static List<String> readStrings(JsonObject settings, String name) {
+                        return List.of(name.equals("classPath") ? "all.jar" : "project.jar");
+                    }
+                    $method
+                    public static void main(String[] args) throws Exception {
+                        Renderer renderer=new Renderer();
+                        refreshProjectClasses(renderer,new JsonObject());
+                        refreshProjectClasses(renderer,new JsonObject());
+                        if (renderer.calls != ${if(modern) 2 else 0}) throw new AssertionError();
+                    }
+                }
+            """.trimIndent())
+            val compile=ProcessBuilder(javac.toString(),"-d",directory.toString(),directory.resolve("RefreshProbe.java").toString()).redirectErrorStream(true).start()
+            val diagnostics=compile.inputStream.bufferedReader().readText()
+            assertEquals(0,compile.waitFor(),diagnostics)
+            val run=ProcessBuilder(java.toString(),"-cp",directory.toString(),"RefreshProbe").redirectErrorStream(true).start()
+            val output=run.inputStream.bufferedReader().readText()
+            assertEquals(0,run.waitFor(),output)
+        }
+    }
+    @Test fun `default renderer pins agree across CLI frontend and Gradle`() {
+        assertEquals("0.0.1-alpha17",versions["renderer"])
+        assertTrue(assets().resolve("lisp/compose-preview.el").readText().contains("compose-preview-renderer-version \"${versions["renderer"]}\""))
+        assertTrue(assets().resolve("gradle/preview.init.gradle").readText().contains("?: \"${versions["renderer"]}\""))
+        assertEquals("17.0.4",versions["layoutlib"])
+        assertTrue(assets().resolve("lisp/compose-preview.el").readText().contains("compose-preview-layoutlib-version \"${versions["layoutlib"]}\""))
+        assertTrue(assets().resolve("gradle/preview.init.gradle").readText().contains("?: \"${versions["layoutlib"]}\""))
+    }
     @Test fun `renderer environment tracks runtime and launcher changes`() {
         val (_,model)=fixture()
         val runtime=root.resolve("build/layoutlib")
@@ -266,7 +372,7 @@ class EngineTest {
         val first=engine(options("--model",path.toString(),"--no-build")) { it.render().first }
         val previous=Path.of(first.text("outputDirectory")!!).resolve("result.json")
         root.resolve("Changed.kt").writeText("fun Changed() {}")
-        atomicJson(path.resolveSibling("model.receipt.json"),obj("environment" to buildEnvironment(),"modelHash" to hash(model),
+        atomicJson(path.resolveSibling("model.receipt.json"),obj("environment" to hash(listOf(buildEnvironment(),cat.android.project.gradleJvmSignature(root))),"modelHash" to hash(model),
             "inputs" to targetInputs(PreviewTarget.fromModel(model),assets()),"artifacts" to artifactSignature(model)))
         val second=engine(options("--model",path.toString(),"--no-build","--reuse","--previous-result",previous.toString())) { it.render().first }
         assertFalse(second["reusedImages"].asBoolean)
@@ -277,7 +383,7 @@ class EngineTest {
         val first=engine(options("--model",path.toString(),"--no-build")) { it.render().first }
         val previous=Path.of(first.text("outputDirectory")!!).resolve("result.json")
         Path.of(model.strings("classPath")[0]).writeText("changed bytecode")
-        atomicJson(path.resolveSibling("model.receipt.json"),obj("environment" to buildEnvironment(),"modelHash" to hash(model),
+        atomicJson(path.resolveSibling("model.receipt.json"),obj("environment" to hash(listOf(buildEnvironment(),cat.android.project.gradleJvmSignature(root))),"modelHash" to hash(model),
             "inputs" to targetInputs(PreviewTarget.fromModel(model),assets()),"artifacts" to artifactSignature(model)))
         val second=engine(options("--model",path.toString(),"--no-build","--reuse","--previous-result",previous.toString())) { it.render().first }
         assertFalse(second["reusedImages"].asBoolean)

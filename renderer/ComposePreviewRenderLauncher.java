@@ -1,15 +1,10 @@
 // Renders Compose previews through Android Studio's own standalone renderer.
 //
-// This exists because the renderer's bundled CLI entry point constructs
-// RenderEnvironmentBootstrapper without rClassJars, which leaves
-// StandaloneModuleDependencies.getResourcePackageNames() empty. ViewLoader then
-// never parses any R class, and because finalIdsUsed is true every library
-// resource id a dependency reads through its own R class resolves to 0. Any
-// project whose libraries touch their own R class renders as a blank image.
-//
-// The launcher passes rClassJars (and resourceDirs) to the 8-argument
-// bootstrapper, which is the same entry point Studio's screenshot test engine
-// uses. Everything else reuses the renderer's own model and serialization.
+// The adapter explicitly forwards rClassJars/resourceDirs, isolates top-level
+// screenshots and preserves parameter metadata with bounded owned cleanup.
+// Alpha16's bundled entry point omitted R jars; newer official entry points
+// require separate resource/identity/failure/cleanup validation before adoption.
+// Rendering and serialization use the published renderer, not private patches.
 
 import com.android.tools.render.RenderEnvironmentBootstrapper;
 import com.android.tools.render.Renderer;
@@ -96,6 +91,8 @@ public final class ComposePreviewRenderLauncher {
             rendererToClose = renderer;
             {
                 for (PreviewScreenshot screenshot : screenshots) {
+                    // Keep failed compositions/dispatcher state out of the next card.
+                    refreshProjectClasses(renderer, settings);
                     ScreenshotPreviewElement previewElement = null;
                     try {
                         previewElement = screenshot.toPreviewElement(renderer.getModule());
@@ -114,8 +111,7 @@ public final class ComposePreviewRenderLauncher {
                     } catch (Throwable failure) {
                         // Class loading/element failures belong to this card, not the batch.
                         screenshotResults = java.util.Collections.singletonList(
-                                new PreviewScreenshotResult(screenshot.getPreviewId(),
-                                        screenshot.getMethodFQN(), null, new ScreenshotError(failure)));
+                                failureResult(screenshot, failure));
                     }
                     results.addAll(screenshotResults);
                     boolean parameterized = screenshot instanceof ComposeScreenshot
@@ -168,7 +164,7 @@ public final class ComposePreviewRenderLauncher {
             failures++;
         }
         for (PreviewScreenshotResult single : result.getScreenshotResults()) {
-            if (single.getImagePath() != null) {
+            if (single.getImagePath() != null && !single.getImagePath().isEmpty()) {
                 System.out.println(new File(outputFolder, single.getImagePath()).getAbsolutePath());
             }
             if (single.getError() != null) {
@@ -176,6 +172,34 @@ public final class ComposePreviewRenderLauncher {
             }
         }
         return failures == 0 ? 0 : 1;
+    }
+
+    private static void refreshProjectClasses(Renderer renderer, JsonObject settings)
+            throws ReflectiveOperationException {
+        try {
+            Renderer.class.getMethod("refreshClassPath", List.class, List.class)
+                    .invoke(renderer, readStrings(settings, "classPath"),
+                            readStrings(settings, "projectClassPath"));
+        } catch (NoSuchMethodException olderRenderer) {
+            // Alpha16 has no public classpath refresh API.
+        }
+    }
+
+    private static PreviewScreenshotResult failureResult(PreviewScreenshot screenshot, Throwable failure)
+            throws ReflectiveOperationException {
+        ScreenshotError error = new ScreenshotError(failure);
+        try {
+            // Alpha17 adds display/tree fields and requires a non-null image path.
+            return PreviewScreenshotResult.class
+                    .getConstructor(String.class, String.class, String.class, ScreenshotError.class,
+                            String.class, List.class, String.class)
+                    .newInstance(screenshot.getPreviewId(), screenshot.getMethodFQN(), "", error,
+                            null, java.util.Collections.emptyList(), null);
+        } catch (NoSuchMethodException olderRenderer) {
+            return PreviewScreenshotResult.class
+                    .getConstructor(String.class, String.class, String.class, ScreenshotError.class)
+                    .newInstance(screenshot.getPreviewId(), screenshot.getMethodFQN(), "", error);
+        }
     }
 
     private static Integer resolveDensityDpi(

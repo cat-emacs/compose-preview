@@ -24,9 +24,9 @@ repositories {
     mavenCentral()
     maven("https://repo.gradle.org/gradle/libs-releases")
 }
-kotlin { jvmToolchain(17) }
+kotlin { jvmToolchain(21) }
 dependencies {
-    implementation("org.cat-emacs:android-project-core:0.1.6")
+    implementation("org.cat-emacs:android-project-core:0.1.7")
     implementation("com.google.code.gson:gson:2.13.2")
     testImplementation(kotlin("test-junit5"))
     testRuntimeOnly("org.junit.platform:junit-platform-launcher")
