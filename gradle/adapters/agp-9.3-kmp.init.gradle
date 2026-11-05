@@ -57,6 +57,37 @@ static Object previewPlaceholderDefaults(Object project, Object variant) {
     }
 }
 
+static Object configurePreviewPlaceholders(Object project, Object variant, Object host) {
+    def mainValues = variant.manifestPlaceholders
+    def defaults = previewPlaceholderDefaults(project, variant)
+    def fallbackKeys = project.objects.listProperty(String).convention([])
+    // Gradle's replacement API detaches the previous supplier without an unsafe read.
+    // Keep this internal compatibility seam explicit rather than create a provider cycle.
+    if (!host.manifestPlaceholders.metaClass.respondsTo(host.manifestPlaceholders,
+            "replace", org.gradle.api.Transformer)) {
+        throw new GradleException("compose-preview: Gradle MapProperty replacement API unavailable for KMP Manifest defaults")
+    }
+    host.manifestPlaceholders.replace({ previous ->
+        def base = defaults.zip(mainValues) { fallback, main ->
+            def values = new LinkedHashMap(fallback)
+            values.putAll(main)
+            return values
+        }
+        fallbackKeys.set(defaults.zip(mainValues) { fallback, main ->
+            fallback.keySet() - main.keySet()
+        }.zip(previous) { keys, explicit -> (keys - explicit.keySet()).toList().sort() })
+        base.zip(previous) { values, explicit ->
+            def merged = new LinkedHashMap(values)
+            merged.putAll(explicit)
+            return merged
+        }
+    } as org.gradle.api.Transformer)
+    // Later onVariants callbacks may still provide explicit host values.
+    return fallbackKeys.zip(host.manifestPlaceholders) { keys, values ->
+        keys.findAll { values[it] == "compose-preview" }
+    }
+}
+
 static Object requiredHostTest(Object variant) {
     // AGP permits one KMP host-test component; its name may be customized.
     def hosts = variant.hostTests.values().toList()
@@ -91,8 +122,6 @@ gradle.beforeProject { project ->
             throw new GradleException(
                     "compose-preview: Android KMP supports AGP 9.3.x; found ${version}")
         }
-        def automaticHostTest = "composePreviewAutomaticHostTest"
-        project.extensions.extraProperties.set(automaticHostTest, false)
         androidComponents.finalizeDsl {
             def android = project.extensions.findByName("kotlin")
                     ?.targets?.findByName("android")
@@ -107,7 +136,6 @@ gradle.beforeProject { project ->
                 android.withHostTest {
                     setIncludeAndroidResources(true)
                 }
-                project.extensions.extraProperties.set(automaticHostTest, true)
             } else {
                 // Configure only this Preview invocation, without replacing user compilations.
                 hosts.each { it.setIncludeAndroidResources(true) }
@@ -115,15 +143,11 @@ gradle.beforeProject { project ->
         }
         androidComponents.onVariants(androidComponents.selector().withName(targetVariant)) { variant ->
             def host = requiredHostTest(variant)
-            if (project.extensions.extraProperties.get(automaticHostTest)) {
-                host.manifestPlaceholders.putAll(
-                        previewPlaceholderDefaults(project, variant))
-                host.manifestPlaceholders.putAll(variant.manifestPlaceholders)
-            }
+            def fallbackKeys = configurePreviewPlaceholders(project, variant, host)
             def resourceApk = host.artifacts.get(internalArtifact(host, "APK_FOR_LOCAL_TEST"))
             def runtimeRJar = host.artifacts.get(
                     internalArtifact(host, "COMPILE_AND_RUNTIME_R_CLASS_JAR"))
-            registerKmp(project, variant, resourceApk, runtimeRJar)
+            registerKmp(project, variant, resourceApk, runtimeRJar, fallbackKeys)
         }
     }
 }

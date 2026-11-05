@@ -48,6 +48,12 @@
 
 ## KMP resource preparation
 
+- [x] Fill missing dependency-AAR Manifest placeholders for both existing and
+  temporary host tests during Preview only. Preserve host > main > fallback
+  priority with lazy provider replacement; report fallback keys without values.
+  Independent qqappid fixture verified merging, rendering, configuration-cache
+  reuse and unchanged ordinary builds. Gradle replacement capability is guarded.
+
 - [x] Enable Android resources on an existing host compilation only during the
   Preview invocation, retaining user source sets and other host-test options.
   A real AGP 9.3 fixture with resources explicitly false rendered a resource PNG;

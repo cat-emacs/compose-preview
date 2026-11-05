@@ -436,6 +436,7 @@ internal class Engine(val options: Options, val assets: Path, val processes: Pro
             }
             val result = obj("schemaVersion" to 1, "status" to if (global != null) "failed" else if (stale) "stale" else if (status != 0) "partial" else "ready",
                 "target" to PreviewTarget.fromModel(model).json(), "gradleJvm" to model.get("gradleJvm"),
+                "previewManifestPlaceholders" to model.get("previewManifestPlaceholders"),
                 "gradleJvmSelection" to selectGradleJvm(PreviewTarget.fromModel(model).buildRoot,gradleJavaHome()),
                 "modelPath" to compiled.path.toString(), "outputDirectory" to directory.toString(), "reusedModel" to compiled.reused,
                 "requestIdentity" to requestIdentity, "reusedImages" to false,
@@ -576,6 +577,7 @@ fun main(arguments: Array<String>) {
                     obj("previewId" to previewId(p,annotation,i),"methodFQN" to p.text("methodFQN"),"annotation" to annotation,"configuration" to baseline(annotation))
                 } }
                 obj("schemaVersion" to 1,"status" to "ready","modelPath" to compiled.path.toString(),"reusedModel" to compiled.reused,"gradleJvm" to compiled.model.get("gradleJvm"),
+                    "previewManifestPlaceholders" to compiled.model.get("previewManifestPlaceholders"),
                     "gradleJvmSelection" to selectGradleJvm(PreviewTarget.fromModel(compiled.model).buildRoot,engine.gradleJavaHome()),
                     "declarations" to rows,"previews" to previews)
             }

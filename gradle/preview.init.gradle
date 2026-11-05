@@ -123,6 +123,9 @@ abstract class ComposePreviewModelTask extends DefaultTask {
     @Input
     abstract Property<String> getBuildJavaVersion()
 
+    @Input
+    abstract ListProperty<String> getPreviewManifestPlaceholderKeys()
+
     @Internal
     abstract DirectoryProperty getLayoutlibDataDir()
 
@@ -131,6 +134,10 @@ abstract class ComposePreviewModelTask extends DefaultTask {
 
     @TaskAction
     void writeModel() {
+        def fallbackKeys = previewManifestPlaceholderKeys.getOrElse([])
+        if (!fallbackKeys.isEmpty()) {
+            logger.warn("compose-preview: Preview-only Manifest placeholder defaults used for keys: ${fallbackKeys.join(', ')}; not production runtime configuration")
+        }
         def layoutlibDir = prepareLayoutlibData()
         def projectDirFiles = projectDirs.get().collect { it.asFile }
         def projectJarFiles = projectJars.get().collect { it.asFile }
@@ -282,6 +289,7 @@ abstract class ComposePreviewModelTask extends DefaultTask {
                 modulePath      : modulePath.get(),
                 variant         : variantName.get(),
                 namespace       : namespace.get(),
+                previewManifestPlaceholders: [source: "preview-fallback", keys: fallbackKeys],
                 javaExecutable  : new File(renderJavaHome.get(), "bin/java").absolutePath,
                 gradleJvm       : [javaHome: buildJavaHome.get(),
                                    javaVersion: buildJavaVersion.get(),
@@ -438,7 +446,7 @@ def variantSuffix = targetVariant.substring(0, 1).toUpperCase(Locale.ROOT) + tar
 
 gradle.ext.composePreviewTargetModulePath = targetModulePath
 gradle.ext.composePreviewTargetVariant = targetVariant
-gradle.ext.composePreviewRegisterKmp = { project, variant, resourceApk, runtimeRJar ->
+gradle.ext.composePreviewRegisterKmp = { project, variant, resourceApk, runtimeRJar, fallbackKeys ->
     if (!ownsProject(project)) return
     def layoutlibRuntime = project.configurations.detachedConfiguration(
             project.dependencies.create("com.android.tools.layoutlib:layoutlib-runtime:${layoutlibVersion}"))
@@ -452,6 +460,7 @@ gradle.ext.composePreviewRegisterKmp = { project, variant, resourceApk, runtimeR
         task.group = "compose preview"
         task.description = "Collects Android KMP Compose preview metadata for Emacs"
         task.namespace.set(variant.namespace)
+        task.previewManifestPlaceholderKeys.set(fallbackKeys)
         task.modulePath.set(targetModulePath)
         task.projectRootPath.set(entryRoot)
         task.buildRootPath.set(project.rootDir.absolutePath)
@@ -524,6 +533,7 @@ gradle.beforeProject { project ->
                     task.group = "compose preview"
                     task.description = "Collects Compose preview metadata for Emacs"
                     task.namespace.set(variant.namespace)
+                    task.previewManifestPlaceholderKeys.set([])
                     task.modulePath.set(targetModulePath)
                     task.projectRootPath.set(entryRoot)
                     task.buildRootPath.set(project.rootDir.absolutePath)

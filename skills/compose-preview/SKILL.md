@@ -36,9 +36,13 @@ owning `--build-root` in composites. Pass explicit `--module`, `--build-root`,
 variant when consuming metadata. KMP's internal artifact adapter is AGP 9.3.x
 only. CLI 0.1.6 enables resources on an existing KMP host test for this Preview
 invocation; older releases reject a disabled existing host test. Confirm the
-installed version before diagnosing that error. Resource
-artifact failures remain blockers, not permission to edit user Gradle files or
-render main in place of a test component.
+installed version before diagnosing that error. CLI 0.1.7 also fills missing
+dependency-AAR Manifest placeholders for existing hosts; 0.1.6 only does so for
+automatically created hosts. Inspect `previewManifestPlaceholders`
+when present: fallback keys describe resource-packaging stand-ins, not validated
+production login/deeplink configuration. Resource artifact failures remain
+blockers, not permission to edit user Gradle files or render main in place of a
+test component.
 
 CLI reads disk, not unsaved editor buffers; confirm intended edits are saved.
 Discovery may compile; rendering configures/builds trusted project code, resolves

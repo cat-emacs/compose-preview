@@ -137,7 +137,6 @@ class EngineTest {
                         assert host.returnDefaultValues && host.sourceSet == 'customSources' && host.name == 'localChecks'
                         assert creations == (state == 'missing' ? 1 : 0)
                         assert compilations.size() == 1 && compilations[0].is(host)
-                        assert extras.composePreviewAutomaticHostTest == (state == 'missing')
                     }
                     file('build/passed').parentFile.mkdirs(); file('build/passed').text = 'all-host-states'
                 }
@@ -146,6 +145,51 @@ class EngineTest {
         buildPreviewModel(root,":probe",emptyList(),mapOf("COMPOSE_PREVIEW_BUILD_ROOT" to root.toString()),120,
             Path.of(System.getProperty("preview.test.gradle.home")))
         assertEquals("all-host-states",root.resolve("build/passed").readText())
+    }
+    @Test fun `KMP Manifest fallback is lazy and preserves explicit host and main placeholders`() {
+        val adapter=assets().resolve("gradle/adapters/agp-9.3-kmp.init.gradle")
+        root.resolve("settings.gradle").writeText("rootProject.name='placeholder-adapter'\n")
+        root.resolve("build.gradle").writeText("""
+            def loader = new GroovyClassLoader(getClass().classLoader)
+            def script = new GroovyShell(loader,new Binding([gradle:new Expando(
+                ext:new Expando(composePreviewTargetModulePath:':app',composePreviewTargetVariant:'androidMain',composePreviewRegisterKmp:{}),
+                beforeProject:{ c -> })])).parse('import org.gradle.api.GradleException\n' + file('${adapter.toString().replace("\\","/")}').text)
+            script.run()
+            def archive = file('dependency.aar')
+            new java.util.zip.ZipOutputStream(new FileOutputStream(archive)).withCloseable { zip ->
+                zip.putNextEntry(new java.util.zip.ZipEntry('AndroidManifest.xml'))
+                zip.write('<manifest value="\${'$'}{qqappid}" main="\${'$'}{mainKey}" host="\${'$'}{hostKey}" app="\${'$'}{applicationId}"/>'.bytes)
+                zip.closeEntry()
+            }
+            def resolved = false
+            def fileType = loader.parseClass('class LazyFiles { def resolve; def getFiles() { resolve() } }')
+            def incoming = new Expando(artifactView:{ c ->
+                new Expando(files:fileType.newInstance(resolve:{ resolved = true; [archive] }))
+            })
+            def projectStub = new Expando(providers:providers,objects:objects)
+            def variant = new Expando(runtimeConfiguration:new Expando(incoming:incoming))
+            variant.manifestPlaceholders = objects.mapProperty(String,String).value([mainKey:'main-value',hostKey:'main-host'])
+            def host = objects.mapProperty(String,String).value([hostKey:'host-value'])
+            def keys = script.configurePreviewPlaceholders(projectStub,variant,new Expando(manifestPlaceholders:host))
+            assert !resolved
+            assert host.get() == [qqappid:'compose-preview',mainKey:'main-value',hostKey:'host-value']
+            assert keys.get() == ['qqappid']
+            host.put('qqappid','later-host')
+            assert host.get().qqappid == 'later-host' && keys.get().isEmpty()
+            assert resolved
+            assert !host.get().containsKey('applicationId')
+            def explicitHost = objects.mapProperty(String,String).value([qqappid:'explicit-host'])
+            def explicitKeys = script.configurePreviewPlaceholders(projectStub,variant,new Expando(manifestPlaceholders:explicitHost))
+            assert explicitHost.get().qqappid == 'explicit-host'
+            assert explicitKeys.get().isEmpty()
+            variant.manifestPlaceholders.put('qqappid','explicit-main')
+            def mainHost = objects.mapProperty(String,String).value([:])
+            def mainKeys = script.configurePreviewPlaceholders(projectStub,variant,new Expando(manifestPlaceholders:mainHost))
+            assert mainHost.get().qqappid == 'explicit-main'
+            assert mainKeys.get().isEmpty()
+            tasks.register('probe') { doLast {} }
+        """.trimIndent())
+        buildPreviewModel(root,":probe",emptyList(),emptyMap(),120,Path.of(System.getProperty("preview.test.gradle.home")))
     }
     @Test fun `target identity rejects non main components before any build`() {
         for(component in listOf("androidTest","unitTest","screenshotTest","testFixtures","hostTest")) {

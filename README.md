@@ -244,6 +244,14 @@ without building when the compiled model is fresh.
   it creates a temporary host test. User build files and ordinary invocations
   are unchanged. Resource artifact validation and the AGP 9.3.x gate remain.
   Preview still borrows host-test resource packaging, but does not execute tests.
+- KMP Manifest packaging uses host placeholders first, then main-variant values,
+  then `compose-preview` defaults for missing dependency-AAR placeholders (except
+  AGP's `applicationId`). This applies to existing and temporary host tests only
+  during Preview builds. Logs and `previewManifestPlaceholders` in model/list/render
+  JSON identify fallback keys without exposing configured values. These stand-ins
+  are not production configuration or proof of login/deeplink behavior. Invalid
+  values still fail Manifest/resource validation. The lazy merge requires Gradle's
+  MapProperty replacement capability and fails explicitly if unavailable.
 - Gradle JVM policy: supported Daemon JVM criteria, explicit
   `--gradle-java-home DIR` (Emacs `compose-preview-gradle-java-home`), user/project
   `org.gradle.java.home`, linked IDE Gradle JDK, then `JAVA_HOME`/CLI runtime.
