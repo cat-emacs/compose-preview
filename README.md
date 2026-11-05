@@ -238,6 +238,12 @@ without building when the compiled model is fresh.
   **32.5.0-alpha05**. The CLI and renderer require **JDK 21+**. The internal
   KMP adapter is gated to **AGP 9.3.x**. Android resource/parameter previews and
   an independent AGP 9.3 KMP resource fixture were rendered on Java 21.
+- The KMP adapter enables host-test Android resources during this Preview
+  invocation, including an existing host compilation with resources disabled.
+  It preserves that compilation's other options and source sets; if absent,
+  it creates a temporary host test. User build files and ordinary invocations
+  are unchanged. Resource artifact validation and the AGP 9.3.x gate remain.
+  Preview still borrows host-test resource packaging, but does not execute tests.
 - Gradle JVM policy: supported Daemon JVM criteria, explicit
   `--gradle-java-home DIR` (Emacs `compose-preview-gradle-java-home`), user/project
   `org.gradle.java.home`, linked IDE Gradle JDK, then `JAVA_HOME`/CLI runtime.

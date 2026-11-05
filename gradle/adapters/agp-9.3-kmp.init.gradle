@@ -58,16 +58,16 @@ static Object previewPlaceholderDefaults(Object project, Object variant) {
 }
 
 static Object requiredHostTest(Object variant) {
-    def host = variant.hostTests.values().find {
-        it.name == "androidHostTest" || it.name.toLowerCase(Locale.ROOT).contains("host")
-    }
+    // AGP permits one KMP host-test component; its name may be customized.
+    def hosts = variant.hostTests.values().toList()
+    def host = hosts.size() == 1 ? hosts[0] : null
     if (host == null) {
         throw new GradleException(
                 "compose-preview: could not create the temporary Android KMP host test")
     }
     if (!host.androidResourcesIncluded) {
         throw new GradleException(
-                "compose-preview: Android KMP host test must set isIncludeAndroidResources = true")
+                "compose-preview: Android KMP host-test resources remained disabled after Preview DSL configuration")
     }
     return host
 }
@@ -100,11 +100,17 @@ gradle.beforeProject { project ->
                 throw new GradleException(
                         "compose-preview: could not find the Android KMP target")
             }
-            if (android.compilations.findByName("hostTest") == null) {
+            def hostType = androidComponents.getClass().getClassLoader().loadClass(
+                    "com.android.build.api.dsl.KotlinMultiplatformAndroidHostTestCompilation")
+            def hosts = android.compilations.findAll { hostType.isInstance(it) }
+            if (hosts.isEmpty()) {
                 android.withHostTest {
                     setIncludeAndroidResources(true)
                 }
                 project.extensions.extraProperties.set(automaticHostTest, true)
+            } else {
+                // Configure only this Preview invocation, without replacing user compilations.
+                hosts.each { it.setIncludeAndroidResources(true) }
             }
         }
         androidComponents.onVariants(androidComponents.selector().withName(targetVariant)) { variant ->

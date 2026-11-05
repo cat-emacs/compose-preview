@@ -46,6 +46,17 @@
 - [ ] Remove `renderer/ComposePreviewRenderLauncher.java` only after Android,
   KMP, resources, PreviewParameter and partial-failure smoke tests pass.
 
+## KMP resource preparation
+
+- [x] Enable Android resources on an existing host compilation only during the
+  Preview invocation, retaining user source sets and other host-test options.
+  A real AGP 9.3 fixture with resources explicitly false rendered a resource PNG;
+  configuration cache was reused and a subsequent ordinary build still saw false.
+- [ ] Replace host-test resource artifact collection only after a released
+  alternative covers KMP resources/R classes. Studio editor resource repositories
+  and standalone runfiles are distinct paths; current upstream runfiles also
+  borrows unit-test resource packaging.
+
 ## Deliberately not part of the initial CLI extraction
 
 - [x] Independent `android-project` Kotlin core/CLI owns Tooling API, GradleBuild,

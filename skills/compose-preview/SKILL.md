@@ -34,8 +34,11 @@ Only the **main** component is supported. Keep entry `--project` separate from
 owning `--build-root` in composites. Pass explicit `--module`, `--build-root`,
 `--module-root`, `--variant`, `--component main`, and `--component-name` equal to
 variant when consuming metadata. KMP's internal artifact adapter is AGP 9.3.x
-only. An unsupported host-resource configuration is a blocker, not permission to
-edit user Gradle files or render main in place of a test component.
+only. CLI 0.1.6 enables resources on an existing KMP host test for this Preview
+invocation; older releases reject a disabled existing host test. Confirm the
+installed version before diagnosing that error. Resource
+artifact failures remain blockers, not permission to edit user Gradle files or
+render main in place of a test component.
 
 CLI reads disk, not unsaved editor buffers; confirm intended edits are saved.
 Discovery may compile; rendering configures/builds trusted project code, resolves

@@ -100,6 +100,53 @@ class EngineTest {
         assertEquals(included.toRealPath().toString(),included.resolve("build/selected").readText())
         assertFalse(root.resolve("build/selected").exists())
     }
+    @Test fun `KMP adapter configures existing host resources without replacing user compilations`() {
+        val adapter=assets().resolve("gradle/adapters/agp-9.3-kmp.init.gradle")
+        val buildRoot=System.getenv("COMPOSE_PREVIEW_BUILD_ROOT") ?: root.toString()
+        root.resolve("settings.gradle").writeText("rootProject.name='host-adapter'\n")
+        root.resolve("build.gradle").writeText("""
+            tasks.register('probe') {
+                def adapterFile = file('${adapter.toString().replace("\\","/")}')
+                def owningRoot = new File('${buildRoot.replace("\\","/")}')
+                doLast {
+                    def loader = new GroovyClassLoader(getClass().classLoader)
+                    loader.parseClass('package com.android; class Version { public static final String ANDROID_GRADLE_PLUGIN_VERSION = "9.3.0" }')
+                    def hostType = loader.parseClass('package com.android.build.api.dsl; class KotlinMultiplatformAndroidHostTestCompilation { String name; boolean includeAndroidResources; boolean returnDefaultValues = true; String sourceSet = "customSources" }')
+                    def componentType = loader.parseClass('class Components { def callback; def finalizeDsl(c) { callback = c }; def selector() { this }; def withName(n) { this }; def onVariants(s,c) {} }')
+                    for (state in ['missing','disabled','enabled']) {
+                        def host = hostType.newInstance(name:'localChecks',includeAndroidResources:state == 'enabled')
+                        def compilations = state == 'missing' ? [] : [host]
+                        def creations = 0
+                        def android = new Expando(compilations:compilations)
+                        android.withHostTest = { c ->
+                            creations++
+                            c.delegate = host; c.resolveStrategy = Closure.DELEGATE_FIRST; c.call()
+                            compilations.add(host)
+                        }
+                        def components = componentType.newInstance()
+                        def extras = [:]
+                        def project = new Expando(path:':shared',rootDir:owningRoot)
+                        project.extensions = new Expando(extraProperties:new Expando(set:{ k,v -> extras[k]=v }))
+                        project.extensions.findByName = { n -> n == 'androidComponents' ? components : new Expando(targets:new Expando(findByName:{ android })) }
+                        project.plugins = new Expando(withId:{ id,c -> c.call() })
+                        def gradle = new Expando(ext:new Expando(composePreviewTargetModulePath:':shared',composePreviewTargetVariant:'androidMain',composePreviewRegisterKmp:{ a,b,c,d -> }))
+                        gradle.beforeProject = { c -> c.call(project) }
+                        new GroovyShell(loader,new Binding([gradle:gradle])).evaluate('import org.gradle.api.GradleException\n' + adapterFile.text)
+                        components.callback.call()
+                        assert host.includeAndroidResources
+                        assert host.returnDefaultValues && host.sourceSet == 'customSources' && host.name == 'localChecks'
+                        assert creations == (state == 'missing' ? 1 : 0)
+                        assert compilations.size() == 1 && compilations[0].is(host)
+                        assert extras.composePreviewAutomaticHostTest == (state == 'missing')
+                    }
+                    file('build/passed').parentFile.mkdirs(); file('build/passed').text = 'all-host-states'
+                }
+            }
+        """.trimIndent())
+        buildPreviewModel(root,":probe",emptyList(),mapOf("COMPOSE_PREVIEW_BUILD_ROOT" to root.toString()),120,
+            Path.of(System.getProperty("preview.test.gradle.home")))
+        assertEquals("all-host-states",root.resolve("build/passed").readText())
+    }
     @Test fun `target identity rejects non main components before any build`() {
         for(component in listOf("androidTest","unitTest","screenshotTest","testFixtures","hostTest")) {
             val error=assertFailsWith<Failure> { PreviewTarget(root,root,":app","debug",component,"debugTest") }

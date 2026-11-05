@@ -56,6 +56,10 @@ application {
 }
 tasks.test {
     useJUnitPlatform()
+    inputs.files(rootProject.fileTree("gradle"), rootProject.fileTree("renderer"), rootProject.fileTree("lisp") {
+        include("*.el")
+        exclude("*-autoloads.el", "*-pkg.el")
+    })
     systemProperty("preview.test.gradle.home", gradle.gradleHomeDir!!.absolutePath)
     inputs.property("projectCoreVersion", resolvedProjectCoreVersion)
     doFirst {

@@ -668,7 +668,8 @@
       (should (string-match-p "manifestPlaceholders.putAll" adapter))
       (should (string-match-p "finalizeDsl" adapter))
       (should (string-match-p "setIncludeAndroidResources" adapter))
-      (should (string-match-p "isIncludeAndroidResources" adapter))
+      (should (string-search "KotlinMultiplatformAndroidHostTestCompilation" adapter))
+      (should (string-search "host.androidResourcesIncluded" adapter))
       (should-not (string-match-p "requires withHostTestBuilder" adapter)))))
 
 (ert-deftest compose-preview-launcher-passes-r-class-jars ()
