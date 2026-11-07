@@ -1,77 +1,177 @@
 # Compose Preview
 
-A Kotlin/JVM CLI and Emacs frontend for rendering Compose `@Preview` functions
-with Google's standalone layoutlib renderer. Supports Android and KMP projects,
-resources, MultiPreview and PreviewParameter.
+Render Compose `@Preview` functions to PNG with Google's standalone layoutlib
+renderer. Use the **Kotlin/JVM CLI** on its own, or add the **Emacs frontend**
+for a Preview panel with per-file sessions, navigation and zoom.
 
-It does not generate screenshot tests or rewrite project build files.
+Supports Android and Android-targeted KMP, resources, MultiPreview and
+PreviewParameter. It does not generate screenshot tests or rewrite project build
+files. Discovery and rendering do execute the project's Gradle build.
+
+[Quick start](#quick-start) · [Install](#install) · [Java selection](#java-selection) ·
+[CLI](#cli) · [Emacs](#emacs) · [Agent skill](#agent-skill) ·
+[Compatibility and internals](docs/compatibility.md) · [Development](#development)
+
+## Quick start
+
+With the CLI installed and a compatible JDK selected:
+
+```sh
+# Check the installation; this does not build the project.
+compose-preview doctor --project /work/app --json
+
+# Discover previews. This may compile the selected module.
+compose-preview list --project /work/app --module :app --variant debug \
+  --file /work/app/app/src/main/kotlin/example/Home.kt --json
+
+# Render all previews in the saved source file.
+compose-preview render --project /work/app --module :app --variant debug \
+  --file /work/app/app/src/main/kotlin/example/Home.kt --json
+```
+
+The render response contains absolute PNG paths in `results[].imagePath`.
+Check the overall status and each card's error: a successful build alone is not
+proof of a successful render. An empty result can mean no matching declarations.
 
 ## Install
 
-Requirements:
+| Use | Requirements |
+| --- | --- |
+| CLI / renderer | **JDK 21+**, project Gradle wrapper, Android SDK and the project's build dependencies |
+| Optional Emacs frontend | **Emacs 29.1+**, Transient 0.3.0+, `android-project` Elisp frontend and both CLIs |
 
-- **JDK 21+**, the project's Gradle wrapper and Android SDK. Set `JAVA_HOME`
-  for the CLI/renderer; use `--gradle-java-home` if the project needs another
-  JDK. No Kotlin compiler is needed.
-- For Emacs: **29.1+**, Transient **0.3.0+** and
-  [`android-project`](https://github.com/cat-emacs/android-project) **0.1.0+**.
-- Network access to resolve build/render dependencies on first use.
+The installed CLI bundles core/runtime JARs. It needs no Kotlin compiler,
+GitHub Packages credentials, Emacs session or device connection. Standalone
+rendering does **not** require the `android-project` executable.
 
-### Package managers
-
-macOS / Linux ([Homebrew tap](https://github.com/cat-emacs/homebrew-tap)):
+### Homebrew — macOS / Linux
 
 ```sh
 brew install cat-emacs/tap/compose-preview
-# Also install for Emacs project sync:
+# Also needed for Emacs project sync:
 brew install cat-emacs/tap/android-project
 ```
 
-Windows ([Scoop bucket](https://github.com/cat-emacs/scoop-bucket)):
+The [tap](https://github.com/cat-emacs/homebrew-tap) uses unversioned `openjdk`
+and respects an explicit `JAVA_HOME`.
+
+### Scoop — Windows
 
 ```powershell
 scoop bucket add java
 scoop bucket add cat-emacs https://github.com/cat-emacs/scoop-bucket
-scoop install cat-emacs/compose-preview cat-emacs/android-project
+scoop install cat-emacs/compose-preview
+# Also needed for Emacs project sync:
+scoop install cat-emacs/android-project
 ```
 
-Both install a JDK dependency. Neither requires GitHub Packages credentials.
-These are maintained project repositories, not official Homebrew core or WinGet
-catalog entries. Release tests cover launcher/doctor on all three platforms;
-full Android rendering is not yet verified on every platform.
+The [bucket](https://github.com/cat-emacs/scoop-bucket) declares a Java 21 JDK
+for Preview. These are project-maintained tap/bucket repositories, not Homebrew
+core or WinGet catalog entries.
 
-### Direct download or source build
+### Release archives
 
-[Releases](https://github.com/cat-emacs/compose-preview/releases/latest) provide
-versioned ZIP/tar.gz archives and `SHA256SUMS`. Verify, extract and add `bin/` to
-PATH. JDK 21+ must already be installed. CLI versions are independent of core.
+Download ZIP or tar.gz from [Releases](https://github.com/cat-emacs/compose-preview/releases/latest),
+verify it against `SHA256SUMS`, extract it and add its `bin/` directory to PATH.
+A JDK is not bundled. First use may download Gradle/build/render dependencies.
 
-Source builds target published **`org.cat-emacs:android-project-core:0.1.7`**.
-An explicit local Maven repository is optional for development via
-`-PandroidProjectRepository=/absolute/repository`.
+Platform CI verifies installation, launchers and `doctor` on macOS, Linux and
+Windows; it does not establish full rendering support on every platform.
+For source builds, see [Development](#development).
 
-Registry source builds need GitHub Packages credentials to download core.
-Supply `GITHUB_ACTOR` and `GITHUB_TOKEN`
-securely using a classic PAT with `read:packages` or an authorized Actions token.
-GitHub requires authentication even for public Maven packages. Never commit tokens.
+## Java selection
 
-From this checkout, with credentials available:
+**CLI/renderer Java and project build Java are independent.** Set `JAVA_HOME`
+to a JDK 21+ for Preview. If the project needs another build JDK, keep its existing
+Gradle JVM policy or supply an explicit home:
 
 ```sh
-make install-local                 # installs under ~/.local; override PREFIX if needed
-compose-preview doctor --json
+JAVA_HOME=/path/to/jdk21 compose-preview render \
+  --project /work/app --module :app --variant debug \
+  --file /work/app/app/src/main/kotlin/example/Home.kt \
+  --gradle-java-home /path/to/jdk17 --json
 ```
 
-Add `~/.local/bin` to PATH. Installed distributions include core and runtime jars;
-they need neither registry credentials nor the `android-project` executable for
-command-line rendering. To use the checkout without installing, run
-`./gradlew :cli:installDist`, then `./bin/compose-preview`.
+Do not change project Java/Kotlin compilation targets just to run the renderer.
+Supported Daemon JVM criteria takes precedence even over `--gradle-java-home`.
+Otherwise selection considers the explicit home, user/project
+`org.gradle.java.home`, linked IDE Gradle JDK, then `JAVA_HOME`/CLI runtime.
 
-### Emacs
+- `doctor --project DIR` reports **requested policy**, with actual JVM `not-probed`.
+- `list` / `render` report `gradleJvm`: the **actual runtime that built the model**,
+  which may be reused from validated compiled state.
+- Emacs uses `compose-preview-gradle-java-home` for the optional build-JDK override.
 
-Install both CLIs for Emacs integration: `compose-preview` renders images, while
-`android-project.el` uses its own CLI for project sync and target selection.
-The two CLIs share a library; neither starts the other.
+See [JVM policy](docs/compatibility.md#jvm-policy) for IDE macros and limitations.
+
+## CLI
+
+### Select the right target
+
+Use explicit module and variant values; variant defaults to `debug`, which is
+not necessarily appropriate for KMP. Obtain uncertain identities from
+[Android Project](https://github.com/cat-emacs/android-project).
+
+| Option | Identifies |
+| --- | --- |
+| `--project DIR` | Entry build; supplies the Gradle wrapper distribution |
+| `--build-root DIR` | Owning build; defaults to the entry build |
+| `--module :path` | Module path local to the owning build |
+| `--module-root DIR` | Optional check against the module's actual directory |
+| `--variant NAME` | Variant, for example `debug` or a discovered KMP `androidMain` |
+| `--component main` | Only main is supported; test components fail explicitly |
+| `--component-name NAME` | Must match the variant; defaults to it |
+
+For included builds, pass `--build-root` and explicit `--module`; the entry
+wrapper executes with the owning build as project directory. Use canonical
+absolute paths. Rendering consumes saved source, not unsaved editor buffers.
+
+### Render and reuse
+
+| Option | Behavior |
+| --- | --- |
+| `--out DIR` | Write to a new or empty directory; otherwise use a new cached run |
+| `--method FQN` / `--preview-id ID` | Select a method/card returned by discovery |
+| `--reuse` | Reuse a validated compiled model; build if stale |
+| `--previous-result FILE` | With `--reuse`, also permit validated image reuse |
+| `--no-build` | Require fresh compiled state; fail instead of building |
+| `--model FILE` | Use a CLI-produced model with its validation receipt, not project-sync metadata |
+| `--input-root DIR` | Repeat for external dependency/build inputs that need freshness protection |
+| `--overrides FILE` | Temporary device/size overrides; [format and example](skills/compose-preview/references/overrides.md) |
+| `--timeout SECONDS` / `--build-timeout SECONDS` | Renderer / build deadlines |
+| `--no-daemon` | Use the wrapper subprocess; default builds use Tooling API |
+| `--result-file FILE` | Atomically write the same result JSON to a file |
+
+`--json` writes one `schemaVersion: 1` object to stdout. Progress, diagnostics
+and timings go to stderr. Keep the streams separate when collecting evidence.
+
+| Exit | Meaning | What to check |
+| --- | --- | --- |
+| **0** | Operation succeeded, possibly with zero declarations | Expected cards and PNGs exist |
+| **1** | Partial card failures or stale render inputs | `status`, `stale`, individual card errors |
+| **2** | Input, setup, build or global failure | `error.kind`, `error.message`, stderr |
+
+Healthy cards survive sibling failures. `stale-model` means inputs or JVM policy
+changed: stabilize/save inputs and retry, rather than bypassing receipts.
+`previewManifestPlaceholders` lists Preview-only fallback keys, not production
+configuration; see [KMP resource packaging](docs/compatibility.md#kmp-resource-packaging).
+
+### Clean up owned runs
+
+```sh
+# Inspect candidates first; deletion is opt-in.
+compose-preview cache prune --dry-run --older-than 86400 --json
+compose-preview cache prune --apply --older-than 86400 \
+  --keep /absolute/cache/runs/RUN_ID --json
+```
+
+Use the same `--cache-dir` for both calls when nondefault. Pruning handles only
+marked inactive runs, not model/launcher caches, project outputs or shared Gradle
+caches. Cancellation affects owned work, never shared Gradle/Kotlin daemons.
+
+## Emacs
+
+Install both CLIs, then the Elisp frontends:
 
 ```elisp
 (use-package android-project
@@ -83,104 +183,13 @@ The two CLIs share a library; neither starts the other.
 ```
 
 Run `M-x compose-preview` or `M-x compose-preview-refresh` from Kotlin source.
-Set `compose-preview-cli-program` if the executable is not discoverable through
-PATH or the checkout's `bin/` entry point. Kotlin tree-sitter is needed only for
-optional source folding.
-
-## Agent skill
-
-The model-invoked [compose-preview skill](skills/compose-preview/SKILL.md) teaches agents
-to use the installed CLI with exact target identity, JVM diagnostics and result
-validation. Keep the whole skill directory, including any references. From this
-repository checkout, choose your agent's skill root and copy into a new directory:
-
-```sh
-SKILL_ROOT=/path/to/your/agent/skills
-mkdir -p "$SKILL_ROOT"
-# Stop if installed; review/update the existing skill separately.
-test ! -e "$SKILL_ROOT/compose-preview" && cp -R skills/compose-preview "$SKILL_ROOT/"
-```
-
-Reload skill discovery, then ask the agent to use `compose-preview` for the task.
-This installs instructions only; install the CLI separately. A skill installed
-from this branch expects the CLI 0.1.5 interface.
-
-## CLI
-
-```sh
-# Discover previews; may compile the module, but does not render images.
-compose-preview list --project /work/app --module :app --variant debug --json
-
-# Render a source file to an empty output directory.
-compose-preview render --project /work/app --module :app --variant debug \
-  --file /work/app/app/src/main/kotlin/example/Home.kt \
-  --out /tmp/home-preview --json
-
-# Inspect cleanup before explicitly applying it.
-compose-preview cache prune --dry-run --older-than 86400 --json
-compose-preview cache prune --apply --keep /cache/runs/RUN_ID --json
-```
-
-Variant defaults to `debug`; Emacs passes the selected target. Target identity
-includes sync entry (`--project`), owning `--build-root`, build-local `--module`,
-variant and component. For included builds, pass `--build-root` and explicit
-`--module`; execution uses the entry wrapper distribution with the owning build
-as project directory. Optional `--module-root` cross-checks relocated modules.
-
-Only `--component main` is currently supported (`--component-name` defaults to the
-variant). Test components fail explicitly, not by rendering main instead. Old
-compiled models/results without complete target identity require a rebuild and
-an updated CLI; the frontend rejects incomplete or mismatched responses.
-The CLI renders saved files, and the frontend rejects relevant unsaved buffers.
-
-| Option | Behavior |
-|---|---|
-| `--reuse` | Reuse a validated compiled model; build if stale |
-| `--no-build` | Require a fresh model; never silently build |
-| `--model FILE` | Use an exact compiled model with its validation receipt |
-| `--preview-id ID` / `--method FQN` | Select previews returned by discovery |
-| `--overrides FILE` | Apply temporary device/size settings without editing source |
-| `--timeout SECONDS` / `--build-timeout SECONDS` | Bound rendering / building |
-| `--no-daemon` | Use the Gradle-client subprocess instead of Tooling API |
-| `--result-file FILE` | Atomically write the result JSON |
-
-`--json` produces one schemaVersion=1 object on stdout; logs go to stderr.
-Render results include target/model/output paths, declarations, per-card results
-and errors. PNG paths are absolute; healthy cards survive sibling failures.
-
-| Exit | Meaning |
-|---|---|
-| 0 | Success, including no Preview declarations |
-| 1 | Partial card failures or inputs changed during rendering |
-| 2 | Input, setup, build or global failure |
-
-Failures contain `status: "failed"` and `error.kind`/`error.message`.
-`doctor` checks installed resources and versions, not whether a project can build.
-
-<details>
-<summary>Temporary device/size overrides</summary>
-
-Use an annotation ID from `list` and copy its exact `configuration` into
-`baseline`. A changed source baseline invalidates the override.
-
-```json
-{
-  "example.HomeKt.Home_HASH": {
-    "baseline": {"device": null, "widthDp": null, "heightDp": null, "showSystemUi": null},
-    "values": {"widthDp": 360, "heightDp": 640, "showSystemUi": false}
-  }
-}
-```
-
-Allowed fields: `device` (Studio `id:`/`spec:`), `widthDp`, `heightDp`,
-`showSystemUi`. Disable system decorations for size overrides to take effect.
-
-</details>
-
-## Preview panel
+The frontend uses Android Project for sync/target selection; the two CLIs share
+core but neither starts the other. It never installs the CLI automatically.
+Set `compose-preview-cli-program` when executable discovery needs an explicit path.
+Kotlin tree-sitter is needed only for optional source folding.
 
 | Key | Action |
-|---|---|
+| --- | --- |
 | `g` / `l` | Refresh / build-render log |
 | `v`, `n`, `p` | Grid/Focus and card/section navigation |
 | `TAB`, `S-TAB` | Fold section / toggle all |
@@ -191,94 +200,27 @@ Allowed fields: `device` (Studio `id:`/`spec:`), `widthDp`, `heightDp`,
 | `w` | Copy original PNG; Linux needs `wl-copy` or `xclip` |
 | `q` | Close, cancel owned work and stop monitoring |
 
-Per-file sessions preserve images, focus, zoom, folds and filters.
-Opening results restores only the current source session, not another file's
-last images. The old variable alias `compose-preview-use-android-mode-flavors`
-and unstructured image-list APIs have been removed. Switching
-files does not cancel the in-flight request or display its result on another
-file. Fresh cached results avoid rebuilding/rendering. Enable
-`compose-preview-auto-refresh-mode` for debounced save refresh.
+Per-file sessions retain images, focus, zoom, folds and filters. Background
+results stay associated with their source file. Enable
+`compose-preview-auto-refresh-mode` for debounced save refresh. Filtering,
+layout, folding and zoom redraw only; device/size changes render without a build
+when compiled state is fresh. Relevant unsaved buffers block rendering.
 
-Filtering, layout, folding and zoom only redraw. Device/size changes render
-without building when the compiled model is fresh.
+## Agent skill
 
-## Cache, cancellation and limits
+Copy the whole [compose-preview skill](skills/compose-preview/SKILL.md) directory
+(including references) into your agent's skill root. From this checkout:
 
-- Preview requests the active target's dependency graph asynchronously. Ready
-  graphs allow known unrelated module source saves to leave other sessions alone.
-  Build scripts, unknown ownership, stale/partial/missing graphs retain broad
-  invalidation over discovered builds. Only the visible session is monitored.
-  CLI baseline signatures remain conservative across the entry/owning build;
-  this does not claim fully incremental compilation or eliminate every rebuild.
-- Scoped project notifications separate metadata, variant selection and exact
-  dependency updates. Graph completion does not discard images or restart an
-  in-flight render when its input roots were already protected. Expanded root
-  coverage invalidates the matching target; variant selection affects only its
-  module. Metadata refresh remains conservatively project-wide.
-- stderr `preview-cache` explains model/image reuse or rebuild reasons;
-  `preview-timing` reports model preparation, Gradle build, declaration selection,
-  launcher preparation, renderer process and final freshness checks. The frontend
-  log adds project-model wait, display and total request time. Renderer process
-  time includes JVM startup/render/cleanup, not separately measurable phases.
-  `prepare-model` includes `gradle-build`; timings are nested, not additive.
-- `--input-root DIR` adds dependency-build inputs to CLI identity, receipts and
-  render-time revalidation; it never removes entry/owning-build baseline roots.
-  The frontend forwards graph roots plus all discovered builds, including
-  convention/plugin builds not represented by source dependency edges. Standalone CLI callers must supply
-  external roots themselves; this is not full automatic dependency discovery.
-- Reuse validates source/resource inputs, compiled artifacts, environment, core
-  and renderer identity. Inputs changing during build/render cannot be reported
-  as fresh. External build inputs can still require a manual build.
-- Cache pruning removes only marked, inactive run directories. It skips symlinks,
-  preserves `--keep`, and never removes project outputs or shared Gradle caches.
-  Models/launchers are not auto-pruned yet.
-- Cancellation affects owned operations/processes, never shared Gradle/Kotlin
-  daemons. Renderer defaults: `-Xmx1536m`, 300-second timeout and bounded cleanup.
-- Renderer **0.0.1-alpha17**, layoutlib **17.0.4**, detector
-  **32.5.0-alpha05**. The CLI and renderer require **JDK 21+**. The internal
-  KMP adapter is gated to **AGP 9.3.x**. Android resource/parameter previews and
-  an independent AGP 9.3 KMP resource fixture were rendered on Java 21.
-- The KMP adapter enables host-test Android resources during this Preview
-  invocation, including an existing host compilation with resources disabled.
-  It preserves that compilation's other options and source sets; if absent,
-  it creates a temporary host test. User build files and ordinary invocations
-  are unchanged. Resource artifact validation and the AGP 9.3.x gate remain.
-  Preview still borrows host-test resource packaging, but does not execute tests.
-- KMP Manifest packaging uses host placeholders first, then main-variant values,
-  then `compose-preview` defaults for missing dependency-AAR placeholders (except
-  AGP's `applicationId`). This applies to existing and temporary host tests only
-  during Preview builds. Logs and `previewManifestPlaceholders` in model/list/render
-  JSON identify fallback keys without exposing configured values. These stand-ins
-  are not production configuration or proof of login/deeplink behavior. Invalid
-  values still fail Manifest/resource validation. The lazy merge requires Gradle's
-  MapProperty replacement capability and fails explicitly if unavailable.
-- Gradle JVM policy: supported Daemon JVM criteria, explicit
-  `--gradle-java-home DIR` (Emacs `compose-preview-gradle-java-home`), user/project
-  `org.gradle.java.home`, linked IDE Gradle JDK, then `JAVA_HOME`/CLI runtime.
-  Criteria retains Gradle's precedence even over an explicit home. IDE
-  `#JAVA_HOME` and `#GRADLE_LOCAL_JAVA_HOME` are supported; the latter reads
-  `.gradle/config.properties` only when selected in `.idea/gradle.xml`. Named
-  IDE SDKs require an explicit home; no guessing or SDK-table lookup occurs.
-  Tooling API and `--no-daemon` builds use this policy; the renderer still uses
-  the CLI JDK. No project toolchain/target/configuration is rewritten.
-  `doctor --project DIR` reports requested policy without starting Gradle
-  (`gradleJvmActual: not-probed`); build/render JSON reports actual `gradleJvm`.
-  Policy files, user properties and JDK identities participate in freshness.
-  This code does not provision JDKs; Gradle may provision if the project
-  already enables it. The independent Project CLI/core retain Java 17 support.
-- Static callbacks run through alpha17's renderer. The adapter refreshes project
-  classes before each top-level screenshot using the public API: otherwise a
-  failed composition can contaminate the next card or hide a missing-class
-  error. A LaunchedEffect probe matched the settled reference image; this does
-  not guarantee arbitrary animations or asynchronous network data settle.
-- Warm renderer reuse, component-tree extraction, inflate-only and
-  Interactive/Animation Preview are not enabled. Each invocation remains a cold
-  owned process. Inspection requires compatible metadata; merely finding tree
-  classes in alpha17 is not an extraction guarantee.
+```sh
+SKILL_ROOT=/path/to/your/agent/skills
+mkdir -p "$SKILL_ROOT"
+# Stop if installed; review/update the existing skill separately.
+test ! -e "$SKILL_ROOT/compose-preview" && cp -R skills/compose-preview "$SKILL_ROOT/"
+```
 
-See [TODO.md](TODO.md) for official renderer CLI replacement gates and deferred
-features. The current Java adapter uses the published renderer, not private
-Android Studio patches.
+Reload skill discovery and ask the agent to use `compose-preview`. This installs
+instructions only, not the executable. Use a matching CLI: the latest skill
+covers the Manifest fallback diagnostics introduced in **0.1.7**.
 
 ## Development
 
@@ -287,21 +229,35 @@ cli/        Kotlin orchestration and backend tests
 renderer/   Java renderer adapter
 gradle/     Invocation-local Preview scripts and KMP adapter
 lisp/       Emacs frontend and ERT
+skills/     Portable agent workflow
 ```
 
-Both CLIs embed `android-project-core`; Tooling API and shared IO/JSON/hash
-implementations live in the [android-project repository](https://github.com/cat-emacs/android-project).
-Preview keeps its own rendering, resource-input and cache policies.
+Both CLIs embed published **`org.cat-emacs:android-project-core:0.1.7`**.
+Tooling API and shared IO/JSON/hash live in the
+[Android Project repository](https://github.com/cat-emacs/android-project);
+Preview owns rendering, resource inputs and cache policy. CLI and core versions
+are independent.
+
+GitHub Packages requires authentication even for public Maven packages. **Source
+builds only** need `GITHUB_ACTOR` and `GITHUB_TOKEN` (classic PAT with
+`read:packages`, or an authorized Actions token). Supply credentials securely;
+never commit them. Installed Release distributions do not need them.
 
 ```sh
-# GitHub Packages credentials supplied securely in the environment.
 ./gradlew :cli:test :cli:installDist :cli:distZip
+# Run the checkout CLI without installing:
+./bin/compose-preview doctor --json
+
+# Optional local installation under ~/.local; PREFIX can override it:
+make install-local
+
+# Emacs frontend checks:
 make install-deps
 make lint build test
 ```
 
-For local core development, publish from an explicit checkout and select the
-file repository instead of GitHub Packages:
+For local core development, publish from an explicit checkout and use a file
+repository instead of Packages:
 
 ```sh
 make project-core ANDROID_PROJECT_DIR=/path/to/android-project
@@ -309,6 +265,9 @@ make cli-test PROJECT_CORE_REPOSITORY="$PWD/.test-deps/project-core-repository"
 ```
 
 Gradle accepts the same override as `-PandroidProjectRepository=PATH_OR_URL`.
-CI uses `packages:read`; `PACKAGES_READ_TOKEN` can override the Actions token if
-cross-repository access is unavailable. Real render smoke tests require an
-Android SDK and representative projects.
+CI uses `packages:read`; `PACKAGES_READ_TOKEN` can override the Actions token.
+Real render smoke tests require an Android SDK and representative projects.
+
+See [compatibility and internals](docs/compatibility.md) for renderer pins,
+resource packaging, cache invalidation and capability limits; [TODO.md](TODO.md)
+tracks deferred work and official renderer-CLI replacement gates.
