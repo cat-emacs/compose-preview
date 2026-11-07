@@ -87,7 +87,7 @@
   :type 'string
   :group 'compose-preview)
 
-(defcustom compose-preview-detector-version "32.5.0-alpha05"
+(defcustom compose-preview-detector-version "32.5.1"
   "Version of Android Studio's Compose preview detector."
   :type 'string
   :group 'compose-preview)

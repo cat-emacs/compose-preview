@@ -8,10 +8,13 @@
 | --- | --- |
 | Standalone renderer | `0.0.1-alpha17` |
 | Layoutlib | `17.0.4` |
-| Preview detector | `32.5.0-alpha05` |
+| Preview detector | `32.5.1` |
 | CLI / renderer JDK | 21+ |
 | Internal Android KMP artifact adapter | AGP 9.3.x only |
 | Preview component | main only |
+
+Detector and layoutlib use stable releases. The standalone renderer has no stable
+release yet; it remains pinned to alpha17 rather than an unreleased Studio build.
 
 The Java adapter uses the published renderer, not private Studio patches. It
 refreshes project classes before each top-level screenshot through alpha17's

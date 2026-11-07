@@ -37,7 +37,7 @@ internal val projectCoreVersion: String by lazy {
 }
 
 internal const val OWNER = "cat-emacs-compose-preview-v1"
-internal val versions = mapOf("renderer" to "0.0.1-alpha17", "layoutlib" to "17.0.4", "detector" to "32.5.0-alpha05")
+internal val versions = mapOf("renderer" to "0.0.1-alpha17", "layoutlib" to "17.0.4", "detector" to "32.5.1")
 internal val skipped = setOf(".git", ".gradle", ".idea", "build", "node_modules", "__pycache__")
 internal val suffixes = setOf("kt", "kts", "java", "groovy", "xml", "properties", "toml", "gradle", "jar", "aar", "png", "webp", "jpg", "jpeg", "svg", "ttf", "otf", "json")
 internal class Failure(message: String, val kind: String = "error") : RuntimeException(message)

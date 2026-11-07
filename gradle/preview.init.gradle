@@ -43,7 +43,7 @@ def targetVariant = System.getenv("COMPOSE_PREVIEW_VARIANT") ?: "debug"
 def modelFilePath = System.getenv("COMPOSE_PREVIEW_MODEL_FILE")
 
 initscript {
-    def version = System.getenv("COMPOSE_PREVIEW_DETECTOR_VERSION") ?: "32.5.0-alpha05"
+    def version = System.getenv("COMPOSE_PREVIEW_DETECTOR_VERSION") ?: "32.5.1"
     repositories {
         google()
         mavenCentral()
