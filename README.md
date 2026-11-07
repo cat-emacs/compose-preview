@@ -8,7 +8,11 @@ Supports Android and Android-targeted KMP, resources, MultiPreview and
 PreviewParameter. It does not generate screenshot tests or rewrite project build
 files. Discovery and rendering do execute the project's Gradle build.
 
-[Quick start](#quick-start) · [Install](#install) · [Java selection](#java-selection) ·
+Google's Android CLI now also provides headless Preview commands. See
+[Official Android CLI](#official-android-cli) for the verified differences before
+choosing a backend.
+
+[Quick start](#quick-start) · [Official Android CLI](#official-android-cli) · [Install](#install) · [Java selection](#java-selection) ·
 [CLI](#cli) · [Emacs](#emacs) · [Agent skill](#agent-skill) ·
 [Compatibility and internals](docs/compatibility.md) · [Development](#development)
 
@@ -32,6 +36,40 @@ compose-preview render --project /work/app --module :app --variant debug \
 The render response contains absolute PNG paths in `results[].imagePath`.
 Check the overall status and each card's error: a successful build alone is not
 proof of a successful render. An empty result can mean no matching declarations.
+
+## Official Android CLI
+
+Android CLI 1.1.16717390 (October 2026) adds:
+
+```sh
+android preview list :app --format=json
+android preview render :app --fqn=com.example.HomeKt.HomePreview --format=json
+```
+
+These commands do not require Android Studio or a device. They overlap with this
+CLI's build, discovery and PNG rendering, and also expose daemon and
+component-tree options that this project intentionally keeps disabled. This CLI
+does not wrap Android CLI yet.
+
+| | This CLI | Android CLI 1.1 |
+| --- | --- | --- |
+| Android application/library | Verified | Verified |
+| Direct KMP `androidMain` target | Verified | Not supported in 1.1.16717390; its Gradle plugin only handles application/library plugins |
+| KMP Preview through an Android host | Not the default target model | Verified when the host can build the dependency |
+| Emacs panel, sessions, zoom and navigation | Included | Not included |
+| Stable per-card identity | Separate IDs for configuration instances | Tested MultiPreview instances shared one `previewId` |
+| Freshness and stale rejection | Explicit target/input/JVM receipts | Not equivalent in the tested JSON result |
+
+A real AGP 9.3 KMP project verified this boundary without project changes:
+direct `androidMain` failed before rendering, while its Android application host
+successfully rendered the same three Preview configurations and component trees.
+Do not silently retarget a KMP module to a host: resources, dependencies and
+Manifest configuration can differ.
+
+Use Android CLI when its host/application target and output contract fit the
+workflow. Use this CLI when direct KMP targets, Emacs integration or strict
+result freshness are required. Android CLI's newer capabilities do not by
+themselves prove support for every project.
 
 ## Install
 
