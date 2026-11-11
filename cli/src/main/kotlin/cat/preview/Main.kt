@@ -40,7 +40,12 @@ internal const val OWNER = "cat-emacs-compose-preview-v1"
 internal val versions = mapOf("renderer" to "0.0.1-alpha17", "layoutlib" to "17.0.4", "detector" to "32.5.1")
 internal val skipped = setOf(".git", ".gradle", ".idea", "build", "node_modules", "__pycache__")
 internal val suffixes = setOf("kt", "kts", "java", "groovy", "xml", "properties", "toml", "gradle", "jar", "aar", "png", "webp", "jpg", "jpeg", "svg", "ttf", "otf", "json")
-internal class Failure(message: String, val kind: String = "error") : RuntimeException(message)
+internal class Failure(
+    message: String,
+    val kind: String = "error",
+    val code: String? = null,
+    val details: Map<String, List<String>> = emptyMap(),
+) : RuntimeException(message)
 internal fun ownedRun(directory: Path): Boolean = try {
     readJson(directory.resolve(".compose-preview-run.json")).text("owner") == OWNER
 } catch (_: Exception) { false }
@@ -108,8 +113,8 @@ internal class Options(arguments: List<String>) {
         json = "--json" in arguments
         command = args.firstOrNull() ?: "help"
         action = if (command == "cache") args.getOrNull(1) else null
-        val booleans = setOf("no-build", "reuse", "no-daemon", "clean", "dry-run", "apply", "help")
-        val known = booleans + setOf("project", "module", "variant", "gradle-java-home", "model", "file", "method", "preview-id", "out", "overrides", "result-file", "previous-result", "cache-dir", "input-root", "build-root", "module-root", "component", "component-name", "timeout", "build-timeout", "renderer-version", "layoutlib-version", "detector-version", "java-option", "older-than", "keep")
+        val booleans = setOf("no-build", "reuse", "no-daemon", "clean", "dry-run", "apply", "help", "require-previews")
+        val known = booleans + setOf("project", "module", "variant", "gradle-java-home", "model", "file", "method", "preview-id", "out", "overrides", "result-file", "previous-result", "cache-dir", "input-root", "build-root", "module-root", "component", "component-name", "timeout", "build-timeout", "renderer-version", "layoutlib-version", "detector-version", "java-option", "older-than", "keep", "expect-ids")
         var index = if (command == "cache") 2 else 1
         while (index < args.size) {
             val argument = args[index++]
@@ -362,6 +367,8 @@ internal class Engine(val options: Options, val assets: Path, val processes: Pro
         val environmentBefore = environment(PreviewTarget.fromModel(model).buildRoot)
         val previews = timed("declaration-selection") { declarations(model, options.path("file"), options.get("method")) }
         val overrides = options.path("overrides")?.let { readJson(it) } ?: JsonObject()
+        val previewIds = discoveredPreviewIds(previews, options.get("preview-id"))
+        val previewCheck = previewContract(options, previewIds)
         val compiledArtifacts = artifactSignature(model)
             ?: throw Failure("Compiled artifacts disappeared before render", "stale-model")
         val backend = rendererEnvironment(model, assets)
@@ -385,6 +392,7 @@ internal class Engine(val options: Options, val assets: Path, val processes: Pro
                         decision("images","fresh-image-hit")
                         old.addProperty("reusedImages",true)
                         old.addProperty("reusedModel",compiled.reused)
+                        if (previewCheck != null) old.add("previewCheck", previewCheck)
                         return old to 0
                     }
                 } catch (_: Exception) { /* A bad UI image reference is never authoritative. */ }
@@ -441,6 +449,7 @@ internal class Engine(val options: Options, val assets: Path, val processes: Pro
                 "modelPath" to compiled.path.toString(), "outputDirectory" to directory.toString(), "reusedModel" to compiled.reused,
                 "requestIdentity" to requestIdentity, "reusedImages" to false,
                 "stale" to stale, "declarations" to previews, "results" to rows, "globalError" to global)
+            if (previewCheck != null) result.add("previewCheck", previewCheck)
             atomicJson(directory.resolve("result.json"), result)
             options.path("result-file")?.let { atomicJson(it,result) }
             result to if (global != null) 2 else if (status != 0 || stale) 1 else 0
@@ -475,6 +484,50 @@ internal class Engine(val options: Options, val assets: Path, val processes: Pro
 }
 
 internal fun previewId(preview: JsonObject, annotation: JsonObject, index: Int) = preview.text("methodFQN")!! + "_" + hash(listOf(preview.text("methodFQN"), preview.array("methodParams"), preview.get("previewWrapperFQN"), annotation, index)).take(20)
+internal fun discoveredPreviewIds(previews: List<JsonObject>, selected: String? = null): List<String> {
+    val ids = previews.flatMap { preview ->
+        preview.array("annotations").mapIndexedNotNull { index, value ->
+            val annotation = if (value.isJsonNull) JsonObject() else value.asJsonObject
+            val id = previewId(preview, annotation, index)
+            if (selected == null || selected == id) id else null
+        }
+    }.distinct().sorted()
+    if (selected != null && ids.isEmpty()) throw Failure("Unknown Preview ID", "input")
+    return ids
+}
+internal fun expectedPreviewIds(options: Options): Set<String>? {
+    val specs = options.all("expect-ids")
+    if (specs.isEmpty()) return null
+    val ids = specs.flatMap { spec ->
+        if (spec.startsWith("@")) {
+            val path = Path.of(spec.removePrefix("@")).toAbsolutePath().normalize()
+            if (!Files.isRegularFile(path)) throw Failure("Expected preview ID file does not exist: $path", "input")
+            Files.readAllLines(path).map { it.trim() }.filter { it.isNotEmpty() && !it.startsWith("#") }
+        } else spec.split(',').map { it.trim() }.filter { it.isNotEmpty() }
+    }
+    if (ids.isEmpty()) throw Failure("--expect-ids did not contain any preview IDs", "input")
+    return ids.toSet()
+}
+internal fun previewContract(options: Options, actualIds: List<String>): JsonObject? {
+    val expected = expectedPreviewIds(options)
+    if (expected == null && !options.flag("require-previews")) return null
+    val actual = actualIds.distinct().sorted()
+    if (expected != null) {
+        val actualSet = actual.toSet()
+        val missing = expected.minus(actualSet).sorted()
+        val unexpected = actualSet.minus(expected).sorted()
+        if (missing.isNotEmpty() || unexpected.isNotEmpty()) throw Failure(
+            "Preview IDs do not match the expected set",
+            "preview-check",
+            "preview-set-mismatch",
+            mapOf("actualIds" to actual, "missingIds" to missing, "unexpectedIds" to unexpected))
+    } else if (actual.isEmpty()) throw Failure(
+        "No previews matched the request",
+        "preview-check",
+        "no-previews",
+        mapOf("actualIds" to emptyList(), "missingIds" to emptyList(), "unexpectedIds" to emptyList()))
+    return obj("code" to "ok", "actualIds" to actual)
+}
 internal fun baseline(annotation: JsonObject): JsonObject = obj(*listOf("device", "widthDp", "heightDp", "showSystemUi").map { it to annotation.get(it) }.toTypedArray())
 internal fun declarations(model: JsonObject, file: Path?, method: String?): List<JsonObject> {
     val pkg = file?.readText()?.let { Regex("(?m)^\\s*package\\s+([\\w.]+)").find(it)?.groupValues?.get(1) }
@@ -538,8 +591,10 @@ Input options: --input-root DIR (repeat for dependency builds; always extends ba
 Model options: --reuse --no-build --no-daemon --clean --cache-dir DIR
 Render options: --preview-id ID --overrides JSON --method FQN --result-file FILE
                --timeout SECONDS --build-timeout SECONDS --java-option=-Xmx1536m
+Preview checks: --require-previews --expect-ids id1,id2 --expect-ids @ids.txt
 stdout is one schemaVersion=1 JSON object with --json; build/render logs use stderr.
-Exit codes: 0 success, 1 partial/stale, 2 global/input error; signals cancel owned work.
+Exit codes: 0 success, including zero previews unless a preview check is enabled;
+            1 partial/stale/preview-check, 2 global/input error; signals cancel owned work.
 """
 fun main(arguments: Array<String>) {
     if (arguments.isEmpty() || arguments.any { it in setOf("--help", "-h") }) { println(help); return }
@@ -576,18 +631,28 @@ fun main(arguments: Array<String>) {
                     val annotation = if(a.isJsonNull) JsonObject() else a.asJsonObject
                     obj("previewId" to previewId(p,annotation,i),"methodFQN" to p.text("methodFQN"),"annotation" to annotation,"configuration" to baseline(annotation))
                 } }
-                obj("schemaVersion" to 1,"status" to "ready","modelPath" to compiled.path.toString(),"reusedModel" to compiled.reused,"gradleJvm" to compiled.model.get("gradleJvm"),
+                val previewIds = previews.map { it.text("previewId")!! }
+                val previewCheck = previewContract(options, previewIds)
+                val listed = obj("schemaVersion" to 1,"status" to "ready","modelPath" to compiled.path.toString(),"reusedModel" to compiled.reused,"gradleJvm" to compiled.model.get("gradleJvm"),
                     "previewManifestPlaceholders" to compiled.model.get("previewManifestPlaceholders"),
                     "gradleJvmSelection" to selectGradleJvm(PreviewTarget.fromModel(compiled.model).buildRoot,engine.gradleJavaHome()),
                     "declarations" to rows,"previews" to previews)
+                if (previewCheck != null) listed.add("previewCheck", previewCheck)
+                listed
             }
             "render" -> engine.render().let { code=it.second; it.first }
             "cache" -> engine.prune()
             else -> throw Failure("Unknown command ${options.command}","input")
         }
     } catch (error: Exception) {
-        code=2
-        obj("schemaVersion" to 1,"status" to "failed","error" to obj("kind" to ((error as? Failure)?.kind ?: (error as? ProjectFailure)?.kind ?: "error"),"message" to (error.message ?: error.javaClass.simpleName)))
+        val failure = error as? Failure
+        code = if (failure?.kind == "preview-check") 1 else 2
+        val fields = mutableListOf<Pair<String, Any?>>(
+            "kind" to (failure?.kind ?: (error as? ProjectFailure)?.kind ?: "error"),
+            "message" to (error.message ?: error.javaClass.simpleName))
+        failure?.code?.let { fields += "code" to it }
+        failure?.details?.forEach { (key, values) -> fields += key to values }
+        obj("schemaVersion" to 1,"status" to "failed","error" to obj(*fields.toTypedArray()))
     } finally { processes?.close() }
     val emitted = try {
         options?.path("result-file")?.let { atomicJson(it,result) }

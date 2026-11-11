@@ -36,6 +36,9 @@ compose-preview render --project /work/app --module :app --variant debug \
 The render response contains absolute PNG paths in `results[].imagePath`.
 Check the overall status and each card's error: a successful build alone is not
 proof of a successful render. An empty result can mean no matching declarations.
+Exit 0 does not prove that a filter found the intended previews; add
+[`--require-previews` or `--expect-ids`](#require-expected-previews) when an
+empty or changed set must fail.
 
 ## Official Android CLI
 
@@ -185,9 +188,38 @@ and timings go to stderr. Keep the streams separate when collecting evidence.
 
 | Exit | Meaning | What to check |
 | --- | --- | --- |
-| **0** | Operation succeeded, possibly with zero declarations | Expected cards and PNGs exist |
-| **1** | Partial card failures or stale render inputs | `status`, `stale`, individual card errors |
+| **0** | Operation succeeded, including zero declarations by default | Expected cards and PNGs exist; enable a preview check when emptiness must fail |
+| **1** | Partial card failures, stale inputs, or a failed preview check | `status`, `stale`, card errors, or `error.code` |
 | **2** | Input, setup, build or global failure | `error.kind`, `error.message`, stderr |
+
+### Require expected previews
+
+Discovery of zero previews is successful by default, so a changed filter can
+hide a missing screen without a failing command. The checks are opt-in and apply
+to both `list` and `render`, before any renderer process starts:
+
+```sh
+# Fail when the selected file or method has no preview instances.
+compose-preview list --project /work/app --module :app --variant debug \
+  --file /work/app/app/src/main/kotlin/example/Home.kt \
+  --require-previews --json
+
+# Exact previewId set. A comma list or an @file can be repeated.
+compose-preview render --project /work/app --module :app --variant debug \
+  --file /work/app/app/src/main/kotlin/example/Home.kt \
+  --expect-ids @/work/app/expected-preview-ids.txt --json
+```
+
+The ID file contains one preview ID per line. Blank lines and `#` comments are
+ignored. This is an exact set comparison: missing and unexpected IDs both fail.
+Obtain the IDs from an unchecked `list` result; do not invent MultiPreview or
+parameter-provider IDs.
+
+A failure uses exit **1** and `error.kind: preview-check`. `error.code` is
+`no-previews` or `preview-set-mismatch`. The mismatch object includes
+`actualIds`, `missingIds`, and `unexpectedIds`. A passing check adds
+`previewCheck.code: ok`. An unreadable or empty ID file remains an input error
+with exit **2**.
 
 Healthy cards survive sibling failures. `stale-model` means inputs or JVM policy
 changed: stabilize/save inputs and retry, rather than bypassing receipts.
