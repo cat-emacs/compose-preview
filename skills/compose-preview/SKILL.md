@@ -5,7 +5,9 @@ description: >-
   to PNG with the compose-preview CLI; inspect per-card errors, use fresh render
   caches, apply temporary device/size overrides or prune owned preview runs.
   Use for headless Compose Preview and render/JDK diagnosis. For project metadata,
-  variant/source ownership or dependency graphs, use android-project.
+  variant/source ownership or dependency graphs, use android-project. Do not treat
+  exit 0 as proof that a filter found the intended previews; use --require-previews
+  or --expect-ids.
 ---
 
 # Compose Preview
@@ -57,11 +59,12 @@ non-composite target. Add the identity options above for composite/metadata use.
 
 ```sh
 compose-preview list --project "$ROOT" --module "$MODULE" --variant "$VARIANT" \
-  --file "$SOURCE" --build-timeout 600 --json \
+  --file "$SOURCE" --build-timeout 600 --require-previews --json \
   > "$WORK/previews.json" 2> "$WORK/list.log"
 
 compose-preview render --project "$ROOT" --module "$MODULE" --variant "$VARIANT" \
   --file "$SOURCE" --out "$WORK/images" --build-timeout 600 --timeout 300 \
+  --expect-ids "@$WORK/expected-preview-ids.txt" \
   --result-file "$WORK/result.json" --json \
   > "$WORK/render.json" 2> "$WORK/render.log"
 ```
@@ -69,8 +72,15 @@ compose-preview render --project "$ROOT" --module "$MODULE" --variant "$VARIANT"
 `--out` must be absent/nonexistent or empty; use a new output directory rather
 than deleting existing images. `--method FQN` or `--preview-id ID` selects an
 entry returned by discovery. Do not fabricate IDs, especially for MultiPreview
-or parameter-provider instances. An exit-0 result with no declarations/images
-is not evidence that the requested function rendered: confirm expected discovery.
+or parameter-provider instances. Exit 0 with no declarations is the default
+success path and does **not** prove that the requested interface was found.
+When the source is expected to contain previews, pass `--require-previews`.
+When the card set is known, write one discovered preview ID per line and pass
+`--expect-ids @FILE` (or a comma-separated list). These checks are exact and run
+before rendering. Exit 1 with `error.kind: preview-check` means the contract
+failed: read `error.code` (`no-previews` or `preview-set-mismatch`) and report
+`missingIds` and `unexpectedIds`. Do not ignore that failure or rerun without
+the check to obtain exit 0. A passing check has `previewCheck.code: ok`.
 
 Inspect `status`, `stale`, `target`, `globalError`, top-level `error`, and every
 `results[]` entry's error and nonempty `imagePath`. Healthy PNGs can coexist with

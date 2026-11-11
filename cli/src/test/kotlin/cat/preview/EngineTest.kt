@@ -522,6 +522,74 @@ class EngineTest {
         assertFailsWith<Failure> { Options(listOf("render","--invalid")) }
         assertFailsWith<Failure> { options("--timeout","-1").seconds("timeout",300) }
     }
+    @Test fun `strict preview checks fail closed without changing the default`() {
+        val (emptyPath, emptyModel) = fixture()
+        val emptyCopy = root.resolve("build/empty-model.json")
+        Files.copy(emptyPath, emptyCopy)
+        Files.copy(emptyPath.resolveSibling("model.receipt.json"), emptyCopy.resolveSibling("empty-model.receipt.json"))
+        val first = obj("name" to "One", "widthDp" to 100)
+        val second = obj("name" to "Two", "widthDp" to 200)
+        val preview = obj("methodFQN" to "demo.AKt.Card", "sourceFile" to "A.kt", "annotations" to listOf(first, second))
+        emptyModel.add("previews", com.google.gson.JsonArray().apply { add(preview) })
+        atomicJson(emptyPath, emptyModel)
+        atomicJson(emptyPath.resolveSibling("model.receipt.json"), obj(
+            "environment" to hash(listOf(buildEnvironment(), cat.android.project.gradleJvmSignature(root))),
+            "modelHash" to hash(emptyModel), "inputs" to targetInputs(PreviewTarget.fromModel(emptyModel), assets()),
+            "artifacts" to artifactSignature(emptyModel)))
+        val ids = listOf(previewId(preview, first, 0), previewId(preview, second, 1)).sorted()
+        val expectedFile = root.resolve("expected-ids.txt")
+        expectedFile.writeText("# comment\n\n${ids[0]}\n${ids[1]}\n")
+        val blank = root.resolve("blank-ids.txt"); blank.writeText("# none\n\n")
+        assertEquals("input", assertFailsWith<Failure> { expectedPreviewIds(Options(listOf("list", "--expect-ids", "@$blank"))) }.kind)
+        val evidence = Path.of("/tmp/preview-contract-evidence")
+        evidence.toFile().deleteRecursively(); Files.createDirectories(evidence)
+        val cases = listOf(
+            "default-empty" to listOf("list", "--model", emptyCopy.toString(), "--no-build", "--json"),
+            "require-empty" to listOf("list", "--model", emptyCopy.toString(), "--no-build", "--require-previews", "--json"),
+            "missing" to listOf("list", "--model", emptyPath.toString(), "--no-build", "--expect-ids", "${ids[0]},missing-id", "--json"),
+            "match" to listOf("list", "--model", emptyPath.toString(), "--no-build", "--require-previews", "--expect-ids", "@${expectedFile}", "--json"),
+            "render-missing" to listOf("render", "--model", emptyPath.toString(), "--no-build", "--expect-ids", "missing-only", "--json"))
+        cases.forEach { (name, args) ->
+            val (exit, json) = runCli(*args.toTypedArray())
+            Files.writeString(evidence.resolve("$name.json"), com.google.gson.GsonBuilder().setPrettyPrinting().create().toJson(json))
+            Files.writeString(evidence.resolve("$name.exit"), exit.toString())
+            when (name) {
+                "default-empty" -> {
+                    assertEquals(0, exit); assertEquals("ready", json.text("status")); assertFalse(json.has("previewCheck"))
+                }
+                "require-empty" -> {
+                    assertEquals(1, exit); assertEquals("no-previews", json.getAsJsonObject("error").text("code"))
+                    assertEquals("preview-check", json.getAsJsonObject("error").text("kind"))
+                }
+                "missing" -> {
+                    assertEquals(1, exit)
+                    val error = json.getAsJsonObject("error")
+                    assertEquals("preview-set-mismatch", error.text("code"))
+                    assertEquals(listOf("missing-id"), error.strings("missingIds"))
+                    assertEquals(listOf(ids[1]), error.strings("unexpectedIds"))
+                    assertEquals(ids, error.strings("actualIds"))
+                }
+                "match" -> {
+                    assertEquals(0, exit); assertEquals("ok", json.getAsJsonObject("previewCheck").text("code"))
+                    assertEquals(ids, json.getAsJsonObject("previewCheck").strings("actualIds"))
+                }
+                "render-missing" -> {
+                    assertEquals(1, exit); assertEquals("preview-set-mismatch", json.getAsJsonObject("error").text("code"))
+                    assertEquals(listOf("missing-only"), json.getAsJsonObject("error").strings("missingIds"))
+                }
+            }
+        }
+    }
+    private fun runCli(vararg args: String): Pair<Int, com.google.gson.JsonObject> {
+        val command = listOf(
+            Path.of(System.getProperty("java.home"), "bin", if (isWindows) "java.exe" else "java").toString(),
+            "-Dcompose.preview.home=${assets()}", "-cp", System.getProperty("preview.test.classpath"), "cat.preview.MainKt")
+        val process = ProcessBuilder(command + args).redirectError(root.resolve("contract.log").toFile()).start()
+        val output = process.inputStream.bufferedReader().use { it.readText() }
+        val exit = process.waitFor()
+        assertTrue(output.contains('{'), output)
+        return exit to com.google.gson.JsonParser.parseString(output.substring(output.indexOf('{'))).asJsonObject
+    }
     @Test fun `process timeout releases owned child`() {
         val processes=Processes()
         try {
