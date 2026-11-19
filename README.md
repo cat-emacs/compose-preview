@@ -141,7 +141,20 @@ Otherwise selection considers the explicit home, user/project
 - `doctor --project DIR` reports **requested policy**, with actual JVM `not-probed`.
 - `list` / `render` report `gradleJvm`: the **actual runtime that built the model**,
   which may be reused from validated compiled state.
-- Emacs uses `compose-preview-gradle-java-home` for the optional build-JDK override.
+- Emacs uses `compose-preview-cli-java-home` to set `JAVA_HOME` for the Preview
+  subprocess only. Leave it `nil` to inherit the environment. Use
+  `compose-preview-gradle-java-home` for a separate build JDK when needed.
+
+If the Emacs log reports `UnsupportedClassVersionError` for `cat.preview.MainKt`
+(class file 65 on a runtime that supports only 61), the launcher picked Java 17
+before Gradle could start. Set the Preview JDK without changing Emacs's global
+`JAVA_HOME`:
+
+```elisp
+(setq compose-preview-cli-java-home "/path/to/jdk21")
+;; If Gradle would otherwise fall back to the Preview JDK:
+;; (setq compose-preview-gradle-java-home "/path/to/jdk17")
+```
 
 See [JVM policy](docs/compatibility.md#jvm-policy) for IDE macros and limitations.
 
