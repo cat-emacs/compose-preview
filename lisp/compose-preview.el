@@ -67,6 +67,14 @@
   :type '(choice (const :tag "Discover automatically" nil) file)
   :group 'compose-preview)
 
+(defcustom compose-preview-cli-java-home nil
+  "Optional JDK 21+ home for the CLI and renderer.
+Set JAVA_HOME for the Preview subprocess only.  Nil inherits the current
+environment.  Gradle uses its own JVM policy, which may fall back to this
+JAVA_HOME; set `compose-preview-gradle-java-home' if Gradle needs another JDK."
+  :type '(choice (const :tag "Inherit environment" nil) directory)
+  :group 'compose-preview)
+
 (defcustom compose-preview-default-variant "debug"
   "Android build variant used for preview rendering."
   :type 'string
@@ -3362,9 +3370,12 @@ running; only the newest waiting file request is retained."
     (setq compose-preview--model-wait-started-at nil)
     (condition-case err
         (progn
-          (setq process (make-process :name "compose-preview-cli" :buffer nil :stderr log
-                                      :noquery t :connection-type 'pipe :command command :sentinel #'ignore)
-                compose-preview--process process)
+          (let ((process-environment (copy-sequence process-environment)))
+            (when compose-preview-cli-java-home
+              (setenv "JAVA_HOME" (directory-file-name (expand-file-name compose-preview-cli-java-home))))
+            (setq process (make-process :name "compose-preview-cli" :buffer nil :stderr log
+                                        :noquery t :connection-type 'pipe :command command :sentinel #'ignore)
+                  compose-preview--process process))
           (process-put process 'compose-preview-context context)
           (set-process-sentinel process #'compose-preview--cli-sentinel)
           (dolist (dir input-roots) (compose-preview--track-inputs dir))
